@@ -47,7 +47,7 @@ Every public operation is one function that runs top to bottom under the entity'
 
 ## D9. Package layout
 
-- `/` (package `state`): the public API, node, entity operations, maintenance.
+- `/` (package `garden`): the public API, node, entity operations, maintenance.
 - `internal/head`: strict codecs and invariants for namespace, birth and head JSON.
 - `internal/engine`: the SQLite connection, authorizer scope, capture, the LTX adapter and restore.
 - `internal/store`: the private storage interface and the S3 adapter.

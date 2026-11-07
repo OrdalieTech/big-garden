@@ -1,4 +1,4 @@
-module github.com/OrdalieTech/state
+module github.com/OrdalieTech/big-garden
 
 go 1.27.3
 

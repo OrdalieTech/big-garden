@@ -1,4 +1,4 @@
-// Package state stores durable SQLite entities in S3.
+// Package garden stores durable SQLite entities in S3.
 //
 // Each entity is one SQLite database identified by a caller-chosen key. A
 // mutation runs a caller callback in a local SQLite transaction, uploads the
@@ -21,4 +21,4 @@
 // Errors are *Error values with a stable Code. CodeOutcomeUnknown means the
 // mutation may have committed: retry with the identical Request, never with
 // a new ID.
-package state
+package garden

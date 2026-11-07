@@ -1,4 +1,4 @@
-package state
+package garden
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/OrdalieTech/state/internal/head"
+	"github.com/OrdalieTech/big-garden/internal/head"
 )
 
 // Limits bounds the resources of one Node. A zero field selects its

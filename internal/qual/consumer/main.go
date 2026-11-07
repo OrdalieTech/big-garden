@@ -10,12 +10,12 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/OrdalieTech/state"
+	garden "github.com/OrdalieTech/big-garden"
 )
 
 func main() {
 	ctx := context.Background()
-	n, err := state.Open(ctx, state.Config{
+	n, err := garden.Open(ctx, garden.Config{
 		S3:       s3.New(s3.Options{Region: os.Getenv("AWS_REGION")}),
 		Bucket:   os.Getenv("STATE_BUCKET"),
 		Prefix:   os.Getenv("STATE_PREFIX"),
@@ -27,7 +27,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer n.Close(ctx)
-	ref, res, err := n.Create(ctx, "counter", state.Request{Schema: 1}, func(tx *state.Tx) ([]byte, error) {
+	ref, res, err := n.Create(ctx, "counter", garden.Request{Schema: 1}, func(tx *garden.Tx) ([]byte, error) {
 		_, err := tx.Exec(ctx, "CREATE TABLE counter(n INTEGER NOT NULL)")
 		return nil, err
 	})

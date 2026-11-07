@@ -1,11 +1,11 @@
-package state
+package garden
 
 import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 
-	"github.com/OrdalieTech/state/internal/head"
+	"github.com/OrdalieTech/big-garden/internal/head"
 )
 
 // Preferred returns the rendezvous-preferred NodeID for key: the node whose
