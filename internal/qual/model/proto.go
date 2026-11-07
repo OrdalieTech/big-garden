@@ -725,6 +725,7 @@ func (x *px) dropStale(cur Head) {
 }
 
 func (x *px) activate(h Head, ret uint8) {
+	x.p.Res, x.p.Code, x.p.Pend, x.p.PendSeq = 0, 0, 0, 0 // read by the caller already
 	if x.m.HasImg && x.m.Img == h.Img {
 		x.m.HasH, x.m.H = true, h
 		x.p.Cur = Head{}

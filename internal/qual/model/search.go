@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"sync"
@@ -36,6 +37,7 @@ type Result struct {
 	Trace      []Tr     `json:"-"`
 	Note       string   `json:"note,omitempty"`
 	Seconds    float64  `json:"seconds"`
+	Collision  float64  `json:"fingerprint_collision_bound,omitempty"`
 	Lines      []string `json:"trace,omitempty"`
 	Kinds      []Kind   `json:"violation_kinds,omitempty"` // random: every distinct violation
 }
@@ -85,26 +87,35 @@ type dfs struct {
 	c      *Case
 	v      Variant
 	k      *canon
-	seen   map[[2]uint64]uint8
+	fps    *fpset           // full reachability: each state once
+	depth  map[uint64]uint8 // depth-bounded: minimal depth seen
 	limit  int
 	budget Budget
 	start  time.Time
 	res    *Result
 	stack  []Tr
+	frames []*State
+	bufs   [][]Tr
 	stop   bool
 }
 
 func (d *dfs) walk(s *State, depth int) {
-	var buf [96]Tr
 	if depth > d.res.MaxDepth {
 		d.res.MaxDepth = depth
 	}
-	for _, t := range Enabled(d.c, s, buf[:0]) {
+	for len(d.frames) <= depth+1 {
+		d.frames = append(d.frames, new(State))
+		d.bufs = append(d.bufs, make([]Tr, 0, 96))
+	}
+	ns := d.frames[depth+1]
+	trs := Enabled(d.c, s, d.bufs[depth][:0])
+	d.bufs[depth] = trs
+	for _, t := range trs {
 		if d.stop {
 			return
 		}
-		ns := *s
-		ok, viol := Step(d.c, d.v, &ns, t)
+		*ns = *s
+		ok, viol := Step(d.c, d.v, ns, t)
 		d.res.Steps++
 		if !ok {
 			d.res.Bounded++
@@ -120,12 +131,24 @@ func (d *dfs) walk(s *State, depth int) {
 			d.res.DepthCut++
 			continue
 		}
-		h := d.k.Hash(d.c, &ns)
-		if old, ok := d.seen[h]; ok && (d.limit == 0 || int(old) <= depth+1) {
-			d.res.Duplicates++
-			continue
+		h := d.k.Hash(d.c, ns)
+		if d.limit == 0 {
+			if !d.fps.add(h) {
+				if d.fps.full {
+					d.res.Status, d.stop = Inconclusive, true
+					d.res.Note = fmt.Sprintf("state table full after %d states", d.res.States)
+					return
+				}
+				d.res.Duplicates++
+				continue
+			}
+		} else {
+			if old, ok := d.depth[h]; ok && int(old) <= depth+1 {
+				d.res.Duplicates++
+				continue
+			}
+			d.depth[h] = uint8(min(depth+1, 255))
 		}
-		d.seen[h] = uint8(min(depth+1, 255))
 		d.res.States++
 		if d.budget.Progress != nil && d.res.States%5_000_000 == 0 {
 			fmt.Fprintf(d.budget.Progress, "  %s %s: %d states, %d duplicates, %d bounded, path %d, %.0fs\n", d.c.Name, d.v,
@@ -137,7 +160,7 @@ func (d *dfs) walk(s *State, depth int) {
 			return
 		}
 		d.stack = append(d.stack, t)
-		d.walk(&ns, depth+1)
+		d.walk(ns, depth+1)
 		d.stack = d.stack[:len(d.stack)-1]
 	}
 }
@@ -157,12 +180,19 @@ func Exhaustive(c *Case, v Variant, b Budget) Result {
 // is complete within that bound.
 func search(c *Case, v Variant, limit int, b Budget) Result {
 	res := Result{Case: c.Name, Variant: v.String(), Mode: "exhaustive", Status: Pass, Depth: limit}
-	d := &dfs{c: c, v: v, k: newCanon(), seen: map[[2]uint64]uint8{}, limit: limit, budget: b, start: time.Now(), res: &res}
+	d := &dfs{c: c, v: v, k: newCanon(), limit: limit, budget: b, start: time.Now(), res: &res}
 	s := c.Init
-	d.seen[d.k.Hash(c, &s)] = 0
+	if limit == 0 {
+		d.fps = newFPSet(b.States)
+		d.fps.add(d.k.Hash(c, &s))
+	} else {
+		d.depth = map[uint64]uint8{d.k.Hash(c, &s): 0}
+	}
 	res.States = 1
 	d.walk(&s, 0)
 	res.Seconds = time.Since(d.start).Seconds()
+	n := float64(res.States)
+	res.Collision = n * n / math.Exp2(65) // hash compaction omission bound
 	switch {
 	case res.Status == Pass && res.DepthCut > 0:
 		res.Note = fmt.Sprintf("complete up to depth %d; %d successors lie beyond it", limit, res.DepthCut)

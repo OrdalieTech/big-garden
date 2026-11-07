@@ -105,7 +105,7 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 			buf = append(buf, Tr{tRestart, uint8(n), 0})
 		}
 		if int(s.Jumps) < c.Jumps {
-			for v := int8(0); v <= c.ClockMax; v++ {
+			for _, v := range c.Clocks {
 				if v != s.Nodes[n].Clock {
 					buf = append(buf, Tr{tClock, uint8(n), uint8(v)})
 				}

@@ -11,13 +11,13 @@ type Case struct {
 	Msgs        int // storage requests in flight
 	Active      int // concurrent operations
 	Depth       int
-	Restarts    int // node crash/restart events (cache loss, new session)
-	Jumps       int // arbitrary clock changes
-	Losses      int // administrative head deletions (G6)
-	Hedges      int // duplicate CAS sends (D3)
-	ClockMax    int8
-	Retention   int8 // ReceiptRetention in clock units
-	Age         int8 // age threshold of the age-only GC control
+	Restarts    int    // node crash/restart events (cache loss, new session)
+	Jumps       int    // arbitrary clock changes
+	Losses      int    // administrative head deletions (G6)
+	Hedges      int    // duplicate CAS sends (D3)
+	Clocks      []int8 // values a clock jump may set
+	Retention   int8   // ReceiptRetention in clock units
+	Age         int8   // age threshold of the age-only GC control
 	// Split delivers replies as separate transitions. Bounded cases deliver a
 	// reply at its request's apply point instead, with per-request client
 	// abandonment and orphans that may still apply later. That is complete: a
@@ -58,7 +58,7 @@ func genesisReq(ts int8) Req { return Req{Kind: kCreate, ID: 1, Hash: 1, TS: ts,
 // P: two nodes, one entity, two mutations, one takeover, four messages, depth 32.
 func caseP() *Case {
 	c := &Case{Name: "P", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 32,
-		Restarts: 1, Hedges: 1, ClockMax: 1, Retention: 8, Age: 1}
+		Restarts: 1, Hedges: 1, Retention: 8, Age: 1}
 	c.Reqs = []Req{
 		genesisReq(1),
 		{Kind: kUpdate, Nodes: 3, Tries: 2, ID: 2, Hash: 1, TS: 1, Schema: 1},
@@ -74,7 +74,7 @@ func caseP() *Case {
 // O: three nodes, one entity, three mutations, two takeovers, eight messages, depth 64.
 func caseO() *Case {
 	c := &Case{Name: "O", Nodes: 3, Ents: 1, Msgs: 8, Active: 3, Depth: 64,
-		Restarts: 1, Hedges: 1, ClockMax: 1, Retention: 8, Age: 1}
+		Restarts: 1, Hedges: 1, Retention: 8, Age: 1}
 	c.Reqs = []Req{
 		genesisReq(1),
 		{Kind: kUpdate, Nodes: all, Tries: 2, ID: 2, Hash: 1, TS: 1, Schema: 1},
@@ -95,7 +95,7 @@ func caseO() *Case {
 // is also what can defeat the compaction's CAS.
 func caseG() *Case {
 	c := &Case{Name: "G", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 64,
-		Hedges: 1, ClockMax: 1, Retention: 8, Age: 1}
+		Hedges: 1, Retention: 8, Age: 1}
 	c.Reqs = []Req{
 		genesisReq(1),
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
@@ -110,11 +110,13 @@ func caseG() *Case {
 	return c
 }
 
-// I: two IDs, one floor advancement and a delayed retry. Clocks may jump to any
-// value in 0..4 twice; retention is 2.
+// I: two IDs, one floor advancement and a delayed retry. Retention is 2 and
+// the request timestamps are 1 and 3, so clock values fall in two classes,
+// {0,1,2} (nothing expires) and {3,4} (timestamp 1 expires, the floor reaches
+// it); clocks start at 1 and may jump twice between 1 and 3.
 func caseI() *Case {
 	c := &Case{Name: "I", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 32,
-		Jumps: 2, ClockMax: 4, Retention: 2, Age: 1}
+		Jumps: 2, Clocks: []int8{1, 3}, Retention: 2, Age: 1}
 	c.Reqs = []Req{
 		genesisReq(3),
 		{Kind: kUpdate, Nodes: 3, Tries: 2, ID: 2, Hash: 1, TS: 1, Schema: 1},
@@ -131,7 +133,7 @@ func caseI() *Case {
 // artifacts.
 func caseC() *Case {
 	c := &Case{Name: "C", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 40,
-		Restarts: 1, Losses: 1, Hedges: 1, ClockMax: 1, Retention: 8, Age: 1}
+		Restarts: 1, Losses: 1, Hedges: 1, Retention: 8, Age: 1}
 	c.Reqs = []Req{
 		{Kind: kCreate, Nodes: 3, Tries: 2, ID: 1, Hash: 1, TS: 1, Schema: 1},
 		{Kind: kCreate, Nodes: 3, Tries: 1, ID: 2, Hash: 1, TS: 1, Schema: 1},
@@ -153,7 +155,7 @@ func caseC0() *Case {
 // root, entity 1 does not; every operation kind is in the pool.
 func CaseR(nodes, ents, active int) *Case {
 	c := &Case{Name: fmt.Sprintf("R%d%d%d", nodes, ents, active), Nodes: nodes, Ents: ents, Msgs: maxMsgs, Active: active, Depth: 150,
-		Restarts: 2, Jumps: 2, Losses: 1, Hedges: 2, ClockMax: 4, Retention: 2, Age: 1, Split: true}
+		Restarts: 2, Jumps: 2, Losses: 1, Hedges: 2, Clocks: []int8{0, 1, 2, 3, 4}, Retention: 2, Age: 1, Split: true}
 	c.Reqs = []Req{
 		genesisReq(3),
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 3, Schema: 1},
