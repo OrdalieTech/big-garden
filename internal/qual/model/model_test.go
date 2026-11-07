@@ -6,18 +6,17 @@ import (
 	"time"
 )
 
-// withinContract are the cases without an administrative head deletion, where
-// the correct protocol must show no violation (finding F1 covers deletion).
+// withinContract are the cases where the correct protocol must show no
+// violation: no administrative head deletion, or one within DECISIONS D14's
+// scope (no create of the key in flight). Case C is finding F1.
 func withinContract() []*Case {
 	var cs []*Case
 	for _, c := range append(Cases(), CaseR(3, 2, 3)) {
-		if c.Losses == 0 {
+		if c.Losses == 0 || c.LossAtRest {
 			cs = append(cs, c)
 		}
 	}
-	r := CaseR(3, 2, 3)
-	r.Losses = 0
-	return append(cs, r)
+	return cs
 }
 
 // TestCorrectRandom: the correct protocol shows no violation on random schedules
