@@ -2,8 +2,11 @@ package storetest
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"strconv"
@@ -14,7 +17,9 @@ import (
 
 // Handler serves the path-style S3 subset the adapter uses (GetObject,
 // conditional PutObject, ListObjectsV2, DeleteObject) from m, for adapter
-// tests without a real S3 server. It does not check signatures.
+// tests without a real S3 server. Like S3 it verifies a PUT's
+// x-amz-checksum-crc32 and returns it to a checksum-mode GET; it does not
+// check signatures.
 func Handler(m *Mem) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, key, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
@@ -55,12 +60,20 @@ func Handler(m *Mem) http.Handler {
 			}
 			w.Header().Set("ETag", o.ETag)
 			w.Header().Set("Content-Length", strconv.Itoa(len(o.Body)))
+			if r.Header.Get("X-Amz-Checksum-Mode") == "ENABLED" {
+				w.Header().Set("X-Amz-Checksum-Crc32", crc(o.Body))
+			}
 			w.Write(o.Body)
 		case r.Method == http.MethodPut:
 			body, err := io.ReadAll(r.Body)
 			cond := r.Header.Get("If-Match")
 			if err != nil || r.Header.Get("Content-Encoding") != "" || (cond == "") != (r.Header.Get("If-None-Match") == "*") {
 				s3Error(w, &store.Error{Outcome: store.Failed, Err: fmt.Errorf("unsupported request")})
+				return
+			}
+			if c := r.Header.Get("X-Amz-Checksum-Crc32"); c != "" && c != crc(body) {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, "<Error><Code>BadDigest</Code></Error>")
 				return
 			}
 			etag, err := m.PutCAS(ctx, key, body, cond)
@@ -95,4 +108,8 @@ func s3Error(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
 	fmt.Fprintf(w, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>%s</Code><Message>%s</Message></Error>", code, code)
+}
+
+func crc(b []byte) string {
+	return base64.StdEncoding.EncodeToString(binary.BigEndian.AppendUint32(nil, crc32.ChecksumIEEE(b)))
 }

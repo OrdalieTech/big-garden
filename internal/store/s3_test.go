@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,7 +24,6 @@ const attempt = 2 * time.Second
 type rig struct {
 	s     *store.S3
 	proxy *storetest.Proxy
-	minio bool
 }
 
 func upstreams(t *testing.T, f func(t *testing.T, newRig func(opts ...func(*s3.Options)) *rig)) {
@@ -46,7 +44,7 @@ func upstreams(t *testing.T, f func(t *testing.T, newRig func(opts ...func(*s3.O
 				}
 				t.Cleanup(p.Close)
 				c := s3.New(ep.Client(p.HTTPClient()).Options(), opts...)
-				return &rig{s: store.NewS3(c, ep.Bucket, ep.Prefix, attempt), proxy: p, minio: kind == "minio"}
+				return &rig{s: store.NewS3(c, ep.Bucket, ep.Prefix, attempt), proxy: p}
 			})
 		})
 	}
@@ -270,27 +268,21 @@ func TestS3TransportFaults(t *testing.T) {
 		_, err = r.s.Get(c, "h", "", 100)
 		want(t, err, store.Unknown)
 
-		// A corrupted body is caught by the SDK's response checksum when the
-		// provider returns one; otherwise only content hashes can catch it.
+		// A corrupted body is caught by the SDK's response checksum (both
+		// upstreams store the PUT's CRC32 and return it).
 		r.proxy.SetPlan(func(storetest.Request) storetest.Fault { return storetest.Fault{Corrupt: true} })
-		o, err = r.s.Get(c, "h", "", 100)
-		if r.minio {
-			want(t, err, store.Unknown)
-		} else if err != nil || bytes.Equal(o.Body, []byte("v4")) {
-			t.Fatalf("corruption without checksum: %q %v", o.Body, err)
-		}
+		_, err = r.s.Get(c, "h", "", 100)
+		want(t, err, store.Unknown)
 
-		// A request body altered after signing is rejected by a real server
-		// (payload hash/checksum) and never applied.
-		if r.minio {
-			r.proxy.SetPlan(func(storetest.Request) storetest.Fault { return storetest.Fault{CorruptRequest: true} })
-			_, err = r.s.PutCAS(c, "h", []byte("v5"), cur.ETag)
-			want(t, err, store.Failed)
-			r.proxy.SetPlan(nil)
-			o, err = r.s.Get(c, "h", "", 100)
-			if err != nil || string(o.Body) != "v4" {
-				t.Fatalf("corrupted request applied: %q %v", o.Body, err)
-			}
+		// A request body altered after signing is rejected (payload hash or
+		// CRC32) and never applied.
+		r.proxy.SetPlan(func(storetest.Request) storetest.Fault { return storetest.Fault{CorruptRequest: true} })
+		_, err = r.s.PutCAS(c, "h", []byte("v5"), cur.ETag)
+		want(t, err, store.Failed)
+		r.proxy.SetPlan(nil)
+		o, err = r.s.Get(c, "h", "", 100)
+		if err != nil || string(o.Body) != "v4" {
+			t.Fatalf("corrupted request applied: %q %v", o.Body, err)
 		}
 	})
 }

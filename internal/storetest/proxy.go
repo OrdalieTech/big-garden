@@ -24,7 +24,7 @@ type Fault struct {
 	// Hold delays forwarding until it is closed, even after the client gave
 	// up: the upstream request then runs and applies with nobody waiting.
 	Hold <-chan struct{}
-	// CorruptRequest flips the last byte of the request body after signing.
+	// CorruptRequest flips the middle byte of the request body after signing.
 	CorruptRequest bool
 	// Delay holds the upstream reply this long before relaying it.
 	Delay time.Duration
@@ -32,7 +32,7 @@ type Fault struct {
 	Drop bool
 	// Truncate relays the full Content-Length but only half of the body.
 	Truncate bool
-	// Corrupt flips the last byte of the relayed body.
+	// Corrupt flips the middle byte of the relayed body.
 	Corrupt bool
 }
 
@@ -164,7 +164,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.CorruptRequest && len(body) > 0 {
-		body[len(body)-1] ^= 0xff
+		body[len(body)/2] ^= 0xff
 	}
 	type reply struct {
 		resp *http.Response
@@ -233,7 +233,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b = b[:len(b)/2]
 	case f.Corrupt && len(b) > 0:
 		b = bytes.Clone(b)
-		b[len(b)-1] ^= 0xff
+		b[len(b)/2] ^= 0xff
 	}
 	w.WriteHeader(rep.resp.StatusCode)
 	w.Write(b)
