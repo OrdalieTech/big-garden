@@ -198,12 +198,25 @@ func (d *DB) inTx(fn func() error) error {
 		return err
 	}
 	if err := fn(); err != nil {
-		return errors.Join(err, d.exec("ROLLBACK"))
+		return errors.Join(err, d.rollback())
 	}
 	if err := d.exec("COMMIT"); err != nil {
-		return errors.Join(err, d.exec("ROLLBACK"))
+		return errors.Join(err, d.rollback())
 	}
 	return nil
+}
+
+// rollback ends the library transaction. SQLite may already have rolled it
+// back by itself (SQLITE_FULL, interrupt), which is the wanted state too:
+// a failed ROLLBACK is accepted when an empty transaction can then start.
+func (d *DB) rollback() error {
+	if d.exec("ROLLBACK") == nil {
+		return nil
+	}
+	if err := d.exec("BEGIN"); err != nil {
+		return err
+	}
+	return d.exec("ROLLBACK")
 }
 
 // Meta reads the library metadata row.
@@ -270,7 +283,7 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 	committed := false
 	defer func() { // also runs on a callback panic
 		if !committed {
-			err = withCleanup(err, d.setMode(library), d.exec("ROLLBACK"))
+			err = withCleanup(err, d.setMode(library), d.rollback())
 		}
 	}()
 	m, err := d.Meta()
@@ -323,7 +336,7 @@ func (d *DB) Read(fn func(*View) ([]byte, error)) (result []byte, err error) {
 	if err := d.exec("BEGIN"); err != nil {
 		return nil, err
 	}
-	defer func() { err = withCleanup(err, d.setMode(library), d.exec("ROLLBACK")) }()
+	defer func() { err = withCleanup(err, d.setMode(library), d.rollback()) }()
 	if err := d.setMode(read); err != nil {
 		return nil, err
 	}

@@ -150,7 +150,7 @@ func (d *DB) readTx(fn func(Meta, uint32) error) (err error) {
 	if err := d.exec("BEGIN"); err != nil {
 		return err
 	}
-	defer func() { err = withCleanup(err, d.exec("ROLLBACK")) }()
+	defer func() { err = withCleanup(err, d.rollback()) }()
 	m, err := d.Meta()
 	if err != nil {
 		return err

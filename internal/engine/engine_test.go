@@ -351,26 +351,31 @@ func TestAutoRollbackCannotCommit(t *testing.T) {
 		},
 	}
 	for name, fail := range cases {
-		f.n++
-		var later error
-		_, _, err := f.d.Mutate(commit(f.n), func(tx *Tx) ([]byte, error) {
-			if err := fail(tx); err == nil {
-				t.Errorf("%s: statement succeeded", name)
-			} else {
-				t.Logf("%s: %v", name, err)
+		for _, abort := range []error{nil, errors.New("abort")} {
+			f.n++
+			var later error
+			_, _, err := f.d.Mutate(commit(f.n), func(tx *Tx) ([]byte, error) {
+				if err := fail(tx); err == nil {
+					t.Errorf("%s: statement succeeded", name)
+				} else {
+					t.Logf("%s: %v", name, err)
+				}
+				_, later = tx.Exec(bg, "INSERT INTO t VALUES (x'01')")
+				return nil, abort
+			})
+			t.Logf("%s: write after the rollback: %v; mutation: %v", name, later, err)
+			if err == nil || later == nil {
+				t.Errorf("%s: committed after SQLite rolled the transaction back", name)
 			}
-			_, later = tx.Exec(bg, "INSERT INTO t VALUES (x'01')")
-			return nil, nil
-		})
-		t.Logf("%s: write after the rollback: %v; mutation: %v", name, later, err)
-		if err == nil || later == nil {
-			t.Errorf("%s: committed after SQLite rolled the transaction back", name)
-		}
-		if m, _ := f.d.Meta(); m.Sequence != 1 {
-			t.Fatalf("%s: sequence %d", name, m.Sequence)
-		}
-		if got := scalar(t, f.d.conn, "SELECT count(*) FROM t"); got != "0" {
-			t.Fatalf("%s: %s rows escaped the rolled-back transaction", name, got)
+			if abort != nil && err != abort { // the rollback already happened: not a cleanup failure
+				t.Errorf("%s: callback error changed to %v", name, err)
+			}
+			if m, _ := f.d.Meta(); m.Sequence != 1 {
+				t.Fatalf("%s: sequence %d", name, m.Sequence)
+			}
+			if got := scalar(t, f.d.conn, "SELECT count(*) FROM t"); got != "0" {
+				t.Fatalf("%s: %s rows escaped the rolled-back transaction", name, got)
+			}
 		}
 	}
 	// The WAL holds nothing committed beyond the published image.
