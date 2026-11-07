@@ -72,7 +72,7 @@ func TestMemFaults(t *testing.T) {
 	ctx := context.Background()
 	m := NewMem()
 	hold := make(chan struct{})
-	m.Plan = func(a Attempt) MemFault {
+	m.SetPlan(func(a Attempt) MemFault {
 		switch a.Seq {
 		case 0:
 			return MemFault{Reject: store.Unknown} // 5xx, not applied
@@ -88,7 +88,7 @@ func TestMemFaults(t *testing.T) {
 			return MemFault{Body: func(b []byte) []byte { return b[:len(b)/2] }}
 		}
 		return MemFault{}
-	}
+	})
 	for _, o := range []store.Outcome{store.Unknown, store.Failed, store.PreconditionFailed} {
 		_, err := m.PutCAS(ctx, "h", []byte("x"), "")
 		want(t, err, o)

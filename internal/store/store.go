@@ -10,6 +10,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Outcome classifies a storage call. Every error a Store returns is an
@@ -70,6 +71,58 @@ func OutcomeOf(err error) Outcome {
 		return e.Outcome
 	}
 	return Unknown
+}
+
+// Hedge sends put, and sends it once more if the first request has not
+// returned after delay (D3; no hedge when delay <= 0). Both requests carry the
+// same body and the same condition, so at most one can apply. Hedge returns at
+// the first OK, after canceling the other request, or once every request has
+// returned. errs holds each request's own result in send order; err is nil
+// after an OK, else the first Unknown, else the first error.
+func Hedge(ctx context.Context, delay time.Duration, put func(context.Context) (string, error)) (etag string, errs []error, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type reply struct {
+		i    int
+		etag string
+		err  error
+	}
+	replies := make(chan reply, 2)
+	send := func(i int) {
+		errs = append(errs, nil)
+		go func() { e, err := put(ctx); replies <- reply{i, e, err} }()
+	}
+	var timer <-chan time.Time
+	if delay > 0 {
+		t := time.NewTimer(delay)
+		defer t.Stop()
+		timer = t.C
+	}
+	send(0)
+	ok := false
+	for pending := 1; pending > 0; {
+		select {
+		case <-timer:
+			send(1)
+			pending++
+		case r := <-replies:
+			pending--
+			errs[r.i] = r.err
+			if r.err == nil && !ok {
+				ok, etag = true, r.etag
+				cancel()
+			}
+		}
+	}
+	if ok {
+		return etag, errs, nil
+	}
+	for _, e := range errs {
+		if OutcomeOf(e) == Unknown {
+			return "", errs, e
+		}
+	}
+	return "", errs, errs[0]
 }
 
 // Object is a whole object body and its opaque ETag.

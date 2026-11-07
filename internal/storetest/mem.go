@@ -46,11 +46,10 @@ type Attempt struct {
 }
 
 // Mem is a linearizable in-memory Store: every call applies atomically at one
-// instant under a mutex. ETags are opaque, quoted, and unique per write. Plan
-// chooses each attempt's fault; the journal records every attempt.
+// instant under a mutex. ETags are opaque, quoted, and unique per write. A
+// plan chooses each attempt's fault; the journal records every attempt.
 type Mem struct {
-	Plan func(Attempt) MemFault // nil: no faults; set before use; runs under the lock, must not call Mem
-
+	plan    func(Attempt) MemFault
 	mu      sync.Mutex
 	objects map[string]memObject
 	writes  int
@@ -63,6 +62,14 @@ type memObject struct {
 }
 
 func NewMem() *Mem { return &Mem{objects: map[string]memObject{}} }
+
+// SetPlan makes plan choose the fault of every later attempt (nil: none).
+// plan runs under the store's lock and must not call the store.
+func (m *Mem) SetPlan(plan func(Attempt) MemFault) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.plan = plan
+}
 
 // Journal returns a copy of every attempt so far, in arrival order.
 func (m *Mem) Journal() []Attempt {
@@ -91,8 +98,8 @@ func (m *Mem) call(ctx context.Context, a Attempt, max int64, limit int) memRepl
 	m.mu.Lock()
 	a.Seq = len(m.journal)
 	a.Body = bytes.Clone(a.Body)
-	if m.Plan != nil {
-		a.Fault = m.Plan(a)
+	if m.plan != nil {
+		a.Fault = m.plan(a)
 	}
 	m.journal = append(m.journal, a)
 	m.mu.Unlock()
