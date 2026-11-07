@@ -24,7 +24,7 @@ func model(args []string) error {
 	ents := fs.Int("entities", 2, "entities in the random-trace configuration (1-2)")
 	conc := fs.Int("concurrent-operations", 3, "concurrent operations in the random-trace configuration")
 	exhaustive := fs.Bool("exhaustive-bounded", false, "explore the bounded cases exhaustively")
-	cases := fs.String("cases", "P,O,G,I,C", "bounded cases to explore")
+	cases := fs.String("cases", "P,O,G,I,C,C0", "bounded cases to explore")
 	traces := fs.Uint64("random-traces", 0, "seeded random traces of the random configuration")
 	seed := fs.Uint64("seed", 20261107, "random seed")
 	negatives := fs.String("negative-controls", "", `"all", or a comma-separated list of broken variants`)
@@ -79,6 +79,9 @@ func model(args []string) error {
 		results = append(results, r)
 		fmt.Printf("%-10s %-28s %-12s %-12s states=%d dup=%d bounded=%d depth-cut=%d traces=%d transitions=%d %.1fs %s\n",
 			r.Mode, r.Variant, r.Case, r.Status, r.States, r.Duplicates, r.Bounded, r.DepthCut, r.Traces, r.Steps, r.Seconds, r.Note)
+		if len(r.BoundBy) > 0 {
+			fmt.Printf("    bounded by %v; fingerprint collision bound %.2g\n", r.BoundBy, r.Collision)
+		}
 		for _, k := range r.Kinds {
 			fmt.Printf("    %d traces (first %d): %s\n", k.Count, k.First, k.Violation)
 		}

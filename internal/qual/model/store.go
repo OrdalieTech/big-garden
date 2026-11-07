@@ -96,7 +96,7 @@ func (w *world) putObj(en *Ent, o Obj) uint8 {
 		}
 	}
 	if en.NObj == maxObjs {
-		w.blocked = true
+		w.bound(boundObjs)
 		return rOK
 	}
 	en.Objs[en.NObj] = o
@@ -129,7 +129,7 @@ func (w *world) list(m *Msg, p *Proc) {
 			}
 			if o.Present && ok {
 				if p.NDel == maxDel {
-					w.blocked = true
+					w.bound(boundDel)
 					return
 				}
 				p.Del[p.NDel] = o.Att
@@ -192,7 +192,7 @@ func (w *world) see(p *Proc, img Image) {
 		return
 	}
 	if p.NSeen == maxSeen {
-		w.blocked = true
+		w.bound(boundSeen)
 		return
 	}
 	p.Seen[p.NSeen] = img

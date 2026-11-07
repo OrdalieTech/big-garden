@@ -34,7 +34,7 @@ func (x *px) report(o out) {
 			x.fail("definite failure: %s returned %s although its candidate #%d committed", x.name(), codeNames[o.code], p.CID)
 		}
 		if g.NFailed == maxFailed {
-			x.blocked = true
+			x.bound(boundFailed)
 		} else {
 			g.Failed[g.NFailed] = p.CID
 			g.NFailed++

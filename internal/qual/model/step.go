@@ -120,10 +120,10 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 	return buf
 }
 
-// Step applies t to s in place. ok is false when the transition exceeds a model
-// bound (message slots, objects, ghost capacity): the caller discards s. viol is
-// the first invariant violation, if any.
-func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
+// Step applies t to s in place. A nonzero bound names the model bound the
+// transition exceeded (message slots, objects, ghost capacity): the caller
+// discards s. viol is the first invariant violation, if any.
+func Step(c *Case, v Variant, s *State, t Tr) (bound uint8, viol string) {
 	w := &world{c: c, v: v, s: s}
 	switch t.K {
 	case tInvoke:
@@ -141,7 +141,7 @@ func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
 		m := &s.Msgs[t.A]
 		waited := m.Waited
 		w.apply(int(t.A))
-		if waited && !c.Split && !w.blocked {
+		if waited && !c.Split && w.blocked == 0 {
 			w.deliver(int(t.A))
 		}
 	case tDeliver:
@@ -199,8 +199,8 @@ func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
 		en.HasHead, en.Head = false, Head{}
 		s.Losses++
 	}
-	if w.blocked {
-		return false, ""
+	if w.blocked != 0 {
+		return w.blocked, ""
 	}
 	if w.viol == "" {
 		w.checkState()
@@ -208,7 +208,7 @@ func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
 	if v == Correct {
 		w.sweep()
 	}
-	return true, w.viol
+	return 0, w.viol
 }
 
 // deliver hands message i's reply to its waiting process; a hedged twin still

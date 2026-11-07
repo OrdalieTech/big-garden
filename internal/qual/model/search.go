@@ -20,26 +20,27 @@ const (
 
 // Result reports one search.
 type Result struct {
-	Case       string   `json:"case"`
-	Variant    string   `json:"variant"`
-	Mode       string   `json:"mode"`
-	Status     string   `json:"status"`
-	States     uint64   `json:"states"`      // distinct canonical states expanded
-	Duplicates uint64   `json:"duplicates"`  // successors pruned as already seen
-	Bounded    uint64   `json:"bounded"`     // successors discarded by a model bound
-	DepthCut   uint64   `json:"depth_cut"`   // successors not expanded at the depth limit
-	Steps      uint64   `json:"transitions"` // transitions executed
-	Traces     uint64   `json:"traces,omitempty"`
-	Depth      int      `json:"depth"`
-	MaxDepth   int      `json:"max_depth_reached"`
-	Seed       uint64   `json:"seed,omitempty"`
-	Violation  string   `json:"violation,omitempty"`
-	Trace      []Tr     `json:"-"`
-	Note       string   `json:"note,omitempty"`
-	Seconds    float64  `json:"seconds"`
-	Collision  float64  `json:"fingerprint_collision_bound,omitempty"`
-	Lines      []string `json:"trace,omitempty"`
-	Kinds      []Kind   `json:"violation_kinds,omitempty"` // random: every distinct violation
+	Case       string            `json:"case"`
+	Variant    string            `json:"variant"`
+	Mode       string            `json:"mode"`
+	Status     string            `json:"status"`
+	States     uint64            `json:"states"`     // distinct canonical states expanded
+	Duplicates uint64            `json:"duplicates"` // successors pruned as already seen
+	Bounded    uint64            `json:"bounded"`    // successors discarded by a model bound
+	BoundBy    map[string]uint64 `json:"bounded_by,omitempty"`
+	DepthCut   uint64            `json:"depth_cut"`   // successors not expanded at the depth limit
+	Steps      uint64            `json:"transitions"` // transitions executed
+	Traces     uint64            `json:"traces,omitempty"`
+	Depth      int               `json:"depth"`
+	MaxDepth   int               `json:"max_depth_reached"`
+	Seed       uint64            `json:"seed,omitempty"`
+	Violation  string            `json:"violation,omitempty"`
+	Trace      []Tr              `json:"-"`
+	Note       string            `json:"note,omitempty"`
+	Seconds    float64           `json:"seconds"`
+	Collision  float64           `json:"fingerprint_collision_bound,omitempty"`
+	Lines      []string          `json:"trace,omitempty"`
+	Kinds      []Kind            `json:"violation_kinds,omitempty"` // random: every distinct violation
 }
 
 // Kind groups random-trace violations by their message with numbers and
@@ -115,10 +116,10 @@ func (d *dfs) walk(s *State, depth int) {
 			return
 		}
 		*ns = *s
-		ok, viol := Step(d.c, d.v, ns, t)
+		b, viol := Step(d.c, d.v, ns, t)
 		d.res.Steps++
-		if !ok {
-			d.res.Bounded++
+		if b != 0 {
+			d.res.bounded(b)
 			continue
 		}
 		if viol != "" {
@@ -233,7 +234,7 @@ func Shortest(c *Case, v Variant, maxDepth int, b Budget) Result {
 func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 	start := time.Now()
 	res := Result{Case: c.Name, Variant: v.String(), Mode: "random", Status: Pass, Depth: c.Depth, Seed: seed}
-	var next, steps, bounded atomic.Uint64
+	var next, steps atomic.Uint64
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	maxDepth := 0
@@ -249,8 +250,12 @@ func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 				}
 				trace, viol, depth, st, bd := randomTrace(c, v, seed, i, buf[:0])
 				steps.Add(st)
-				bounded.Add(bd)
 				mu.Lock()
+				for b, n := range bd {
+					for ; n > 0; n-- {
+						res.bounded(uint8(b))
+					}
+				}
 				if depth > maxDepth {
 					maxDepth = depth
 				}
@@ -269,9 +274,17 @@ func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 		res.Status, res.Violation, res.Trace = Violation, k.Violation, k.Trace
 		res.Note = fmt.Sprintf("%d violation kinds; first in trace %d", len(res.Kinds), k.First)
 	}
-	res.Steps, res.Bounded, res.MaxDepth = steps.Load(), bounded.Load(), maxDepth
+	res.Steps, res.MaxDepth = steps.Load(), maxDepth
 	res.Seconds = time.Since(start).Seconds()
 	return res
+}
+
+func (r *Result) bounded(b uint8) {
+	r.Bounded++
+	if r.BoundBy == nil {
+		r.BoundBy = map[string]uint64{}
+	}
+	r.BoundBy[boundNames[b]]++
 }
 
 func (r *Result) addKind(viol string, i uint64, trace []Tr) {
@@ -288,7 +301,7 @@ func (r *Result) addKind(viol string, i uint64, trace []Tr) {
 	r.Kinds = append(r.Kinds, Kind{Signature: sig, Count: 1, First: i, Violation: viol, Trace: trace})
 }
 
-func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr) (trace []Tr, viol string, depth int, steps, bounded uint64) {
+func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr) (trace []Tr, viol string, depth int, steps uint64, bounded [numBounds]uint64) {
 	rng := rand.New(rand.NewPCG(seed, i))
 	s := c.Init
 	var picked []Tr
@@ -301,10 +314,10 @@ func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr) (trace []Tr, viol
 		for tries := 0; tries < len(trs) && !moved; tries++ {
 			t := trs[rng.IntN(len(trs))]
 			ns := s
-			ok, vi := Step(c, v, &ns, t)
+			b, vi := Step(c, v, &ns, t)
 			steps++
-			if !ok {
-				bounded++
+			if b != 0 {
+				bounded[b]++
 				continue
 			}
 			picked = append(picked, t)
@@ -336,8 +349,8 @@ func Replay(c *Case, v Variant, trace []Tr) (lines []string, viol string, err er
 			return lines, "", fmt.Errorf("step %d (%v) is not enabled", i, t)
 		}
 		lines = append(lines, fmt.Sprintf("%2d. %s", i+1, Describe(c, &s, t)))
-		ok, vi := Step(c, v, &s, t)
-		if !ok {
+		b, vi := Step(c, v, &s, t)
+		if b != 0 {
 			return lines, "", fmt.Errorf("step %d exceeds a model bound", i)
 		}
 		if vi != "" {

@@ -8,7 +8,27 @@ type world struct {
 	v       Variant
 	s       *State
 	viol    string // first invariant violation
-	blocked bool   // the transition exceeded a model bound and is discarded
+	blocked uint8  // nonzero: the transition exceeded this model bound and is discarded
+}
+
+// Model bounds. Messages in flight is a case parameter (PLAN §14); the others
+// are capacities of the model's fixed arrays.
+const (
+	boundMsgs uint8 = iota + 1
+	boundObjs
+	boundDel
+	boundSeen
+	boundFailed
+	boundOps
+	numBounds
+)
+
+var boundNames = [numBounds]string{"", "messages_in_flight", "objects", "collect_batch", "seen_images", "failed_candidates", "ledger"}
+
+func (w *world) bound(b uint8) {
+	if w.blocked == 0 {
+		w.blocked = b
+	}
 }
 
 func (w *world) fail(f string, a ...any) {
@@ -164,7 +184,7 @@ func (x *px) send(m Msg) int8 {
 			return int8(i + 1)
 		}
 	}
-	x.blocked = true
+	x.bound(boundMsgs)
 	return 0
 }
 
@@ -877,7 +897,7 @@ func (x *px) admit() {
 		return
 	}
 	if img.Seq == maxOps {
-		x.blocked = true
+		x.bound(boundOps)
 		return
 	}
 	ni := img
