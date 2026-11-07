@@ -7,9 +7,13 @@ type world struct {
 	c       *Case
 	v       Variant
 	s       *State
-	viol    string // first invariant violation
-	blocked uint8  // nonzero: the transition exceeded this model bound and is discarded
+	viol    string   // first invariant violation
+	blocked uint8    // nonzero: the transition exceeded this model bound and is discarded
+	fin     [2]uint8 // kind and code of the operation that finished in this step
 }
+
+// coverage counts client outcomes by operation kind and code (random traces).
+type coverage [kCollect + 1][cSkip + 1]uint64
 
 // Model bounds. Messages in flight is a case parameter (PLAN §14); the others
 // are capacities of the model's fixed arrays.

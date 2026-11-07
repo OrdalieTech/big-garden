@@ -124,6 +124,10 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 // transition exceeded (message slots, objects, ghost capacity): the caller
 // discards s. viol is the first invariant violation, if any.
 func Step(c *Case, v Variant, s *State, t Tr) (bound uint8, viol string) {
+	return step(c, v, s, t, nil)
+}
+
+func step(c *Case, v Variant, s *State, t Tr, cov *coverage) (bound uint8, viol string) {
 	w := &world{c: c, v: v, s: s}
 	switch t.K {
 	case tInvoke:
@@ -207,6 +211,9 @@ func Step(c *Case, v Variant, s *State, t Tr) (bound uint8, viol string) {
 	}
 	if v == Correct {
 		w.sweep()
+	}
+	if cov != nil && w.fin[0] != 0 {
+		cov[w.fin[0]][w.fin[1]]++
 	}
 	return 0, w.viol
 }

@@ -41,6 +41,7 @@ type Result struct {
 	Collision  float64           `json:"fingerprint_collision_bound,omitempty"`
 	Lines      []string          `json:"trace,omitempty"`
 	Kinds      []Kind            `json:"violation_kinds,omitempty"` // random: every distinct violation
+	Outcomes   map[string]uint64 `json:"outcomes,omitempty"`        // random: client outcomes by kind/code
 }
 
 // Kind groups random-trace violations by their message with numbers and
@@ -243,12 +244,27 @@ func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 		go func() {
 			defer wg.Done()
 			var buf [96]Tr
+			var cov coverage
+			defer func() {
+				mu.Lock()
+				defer mu.Unlock()
+				for k := range cov {
+					for code, n := range cov[k] {
+						if n > 0 {
+							if res.Outcomes == nil {
+								res.Outcomes = map[string]uint64{}
+							}
+							res.Outcomes[kindNames[k]+"/"+codeNames[code]] += n
+						}
+					}
+				}
+			}()
 			for {
 				i := next.Add(1) - 1
 				if i >= n {
 					return
 				}
-				trace, viol, depth, st, bd := randomTrace(c, v, seed, i, buf[:0])
+				trace, viol, depth, st, bd := randomTrace(c, v, seed, i, buf[:0], &cov)
 				steps.Add(st)
 				mu.Lock()
 				for b, n := range bd {
@@ -301,7 +317,22 @@ func (r *Result) addKind(viol string, i uint64, trace []Tr) {
 	r.Kinds = append(r.Kinds, Kind{Signature: sig, Count: 1, First: i, Violation: viol, Trace: trace})
 }
 
-func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr) (trace []Tr, viol string, depth int, steps uint64, bounded [numBounds]uint64) {
+// weight biases random schedules towards progress so that faults stay a few
+// per trace instead of ending most traces early; every transition remains
+// possible.
+var weight = [...]int{tInvoke: 32, tApply: 32, tDeliver: 32, tDrop: 2, tTimeout: 2, tHedge: 2,
+	tDeadline: 2, tRestart: 1, tClock: 1, tLoss: 1}
+
+func pick(trs []Tr, r int) Tr {
+	for _, t := range trs {
+		if r -= weight[t.K]; r < 0 {
+			return t
+		}
+	}
+	return trs[len(trs)-1]
+}
+
+func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr, cov *coverage) (trace []Tr, viol string, depth int, steps uint64, bounded [numBounds]uint64) {
 	rng := rand.New(rand.NewPCG(seed, i))
 	s := c.Init
 	var picked []Tr
@@ -310,11 +341,15 @@ func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr) (trace []Tr, viol
 		if len(trs) == 0 {
 			break
 		}
+		total := 0
+		for _, t := range trs {
+			total += weight[t.K]
+		}
 		moved := false
 		for tries := 0; tries < len(trs) && !moved; tries++ {
-			t := trs[rng.IntN(len(trs))]
+			t := pick(trs, rng.IntN(total))
 			ns := s
-			b, vi := Step(c, v, &ns, t)
+			b, vi := step(c, v, &ns, t, cov)
 			steps++
 			if b != 0 {
 				bounded[b]++

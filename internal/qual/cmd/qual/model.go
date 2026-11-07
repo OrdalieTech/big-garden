@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ func model(args []string) error {
 	exhaustive := fs.Bool("exhaustive-bounded", false, "explore the bounded cases exhaustively")
 	cases := fs.String("cases", "P,O,G,I,C,C0", "bounded cases to explore")
 	traces := fs.Uint64("random-traces", 0, "seeded random traces of the random configuration")
+	deletion := fs.Bool("head-deletion", true, "random configuration may delete a head administratively (G6; see finding F1)")
 	seed := fs.Uint64("seed", 20261107, "random seed")
 	negatives := fs.String("negative-controls", "", `"all", or a comma-separated list of broken variants`)
 	out := fs.String("out", "", "output directory (model.json and counterexamples/)")
@@ -82,6 +84,18 @@ func model(args []string) error {
 		if len(r.BoundBy) > 0 {
 			fmt.Printf("    bounded by %v; fingerprint collision bound %.2g\n", r.BoundBy, r.Collision)
 		}
+		if len(r.Outcomes) > 0 {
+			keys := make([]string, 0, len(r.Outcomes))
+			for k := range r.Outcomes {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			fmt.Printf("    outcomes:")
+			for _, k := range keys {
+				fmt.Printf(" %s=%d", k, r.Outcomes[k])
+			}
+			fmt.Println()
+		}
 		for _, k := range r.Kinds {
 			fmt.Printf("    %d traces (first %d): %s\n", k.Count, k.First, k.Violation)
 		}
@@ -104,6 +118,9 @@ func model(args []string) error {
 	}
 	if *traces > 0 {
 		c := pm.CaseR(*nodes, *ents, *conc)
+		if !*deletion {
+			c.Losses = 0
+		}
 		r := pm.Random(c, pm.Correct, *seed, *traces, *workers)
 		record(r, c, pm.Correct)
 		if r.Status != pm.Pass || r.Traces != *traces {

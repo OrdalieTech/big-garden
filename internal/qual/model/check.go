@@ -7,6 +7,7 @@ import (
 
 // finish returns an operation's outcome to its client and frees the process.
 func (x *px) finish(o out) {
+	x.fin = [2]uint8{x.r.Kind, o.code}
 	x.report(o)
 	for _, w := range x.p.W {
 		if w != 0 {
