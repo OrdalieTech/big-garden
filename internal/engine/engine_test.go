@@ -337,6 +337,9 @@ func TestAutoRollbackCannotCommit(t *testing.T) {
 	cases := map[string]func(*Tx) error{
 		"full": func(tx *Tx) error {
 			_, err := tx.Exec(bg, "INSERT INTO t VALUES (zeroblob(500000))")
+			if !Full(err) {
+				t.Errorf("page limit error %v is not Full", err)
+			}
 			return err
 		},
 		"interrupt": func(tx *Tx) error {

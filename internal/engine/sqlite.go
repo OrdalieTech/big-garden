@@ -387,6 +387,13 @@ func (d *DB) close() error {
 	return errors.Join(errs...)
 }
 
+// Full reports whether err is SQLite's SQLITE_FULL: the database reached
+// its page limit (a capacity outcome, nothing committed).
+func Full(err error) bool {
+	var se *sqlite.Error
+	return errors.As(err, &se) && se.Code()&0xff == sqlite3.SQLITE_FULL
+}
+
 // withCleanup returns err itself when every cleanup succeeded, so a callback
 // error passes through unchanged.
 func withCleanup(err error, cleanup ...error) error {

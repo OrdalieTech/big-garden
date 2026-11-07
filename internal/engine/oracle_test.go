@@ -187,9 +187,9 @@ func (o *oracle) mutation() bool {
 		o.commits++
 		return true
 	}
-	// Only the callback's own abort and SQLite's own rollback (SQLITE_FULL)
-	// are expected; anything else (I/O errors) invalidates the run.
-	if err.Error() != "abort" && !strings.Contains(err.Error(), "rolled back during the callback") {
+	// Only the callback's own abort, SQLite's own rollback and the page
+	// limit are expected; anything else (I/O errors) invalidates the run.
+	if err.Error() != "abort" && !strings.Contains(err.Error(), "rolled back during the callback") && !Full(err) {
 		o.t.Fatalf("mutation %d: %v", o.f.n, err)
 	}
 	o.failed++
