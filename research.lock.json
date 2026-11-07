@@ -1,0 +1,149 @@
+{
+  "format": 1,
+  "milestone": "M0",
+  "recorded": "2026-11-07",
+  "toolchain": {
+    "go": "go1.27.3",
+    "GOTOOLCHAIN": "local",
+    "CGO_ENABLED": "0 (race lane only: 1)",
+    "goroot": "/usr/local/go",
+    "goroot_version_file": "go1.27.3 time 2026-10-19T22:20:36Z",
+    "goroot_bin_go_sha256": "5f5eb6d0b2fb6aa0bb5d5f8c5f1c944e0de955c925f0111af92a9d8f79680b5b",
+    "official_archives_sha256": {
+      "go1.27.3.linux-amd64.tar.gz": "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40",
+      "go1.27.3.linux-arm64.tar.gz": "a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
+    },
+    "note": "Archive hashes are the go.dev/dl published values; the local install was not re-downloaded and compared against them."
+  },
+  "modules": {
+    "production_direct": [
+      {
+        "path": "modernc.org/sqlite",
+        "version": "v1.61.1",
+        "sum": "h1:TBEE49wz7VlxS+qXRXMQiPUZYOXHJ4ku83daYv1fe04=",
+        "gomod_sum": "h1:f4gr5tbpx2umklaT/QVtbi/50hNdM+4ng+2zMo8KXJ0=",
+        "origin": "https://gitlab.com/cznic/sqlite tag v1.61.1",
+        "license": "BSD-3-Clause (LICENSE); embedded SQLite public domain (LICENSE-SQLITE); LICENSE-3RD-PARTY.md",
+        "requires_exact": "modernc.org/libc v1.79.0 (downstream go.mod must pin the same libc, cznic/sqlite#177)",
+        "decision": "Keep the plan pin. v1.62.0 was published 2026-11-07T09:13Z (hours before this lock): same SQLite 3.54.1, re-vendored lib/, libc bumped to v1.80.1, opt-in fdatasync (irrelevant: D1 runs synchronous=OFF), illumos port, Limit() through wrapped connectors (unused). Nothing we need; a same-day release with a libc bump is fresh risk. v1.61.1 carries the per-connection authorizer (v1.61.0) and the fixes for context-aware Rows.Next/Close and Tx.Commit waits."
+      },
+      {
+        "path": "github.com/superfly/ltx",
+        "version": "v0.5.3",
+        "sum": "h1:fl2YH4xlLcOaS+On4yzex9V05ZGeOmcm3iFcLALqkQY=",
+        "gomod_sum": "h1:0OtLSLHHHPa3qDrAmwkLW5pUBfj365JS+bR9FEJDrM4=",
+        "origin": "https://github.com/superfly/ltx tag v0.5.3 commit f299ac5b951cdb69ed7a99e957b4ed66cba32560 (2026-09-10)",
+        "license": "Apache-2.0",
+        "decision": "Upgrade from the plan's v0.5.2. v0.5.3 is strictly stricter where we decode untrusted bytes: Decoder.Close streams and validates the page index against the decoded pages (count and page-number sequence) instead of io.ReadAll of the tail, rejects any byte after the trailer, and checks the index size field; Encoder aborts on any partial write instead of allowing a structurally incomplete file; compactor inputs no longer build page-index maps. Format bytes are unchanged for our range: the only checksum change excludes the SQLite lock page (pgno 262145 at 4 KiB pages, i.e. beyond the 1 GiB PENDING_BYTE), unreachable under the 256 MiB ceiling. Its encoder.go blob equals the main-branch encoder the plan inspected [S12]. Same go.mod and LZ4 dependency as v0.5.2."
+      },
+      {
+        "path": "github.com/aws/aws-sdk-go-v2/service/s3",
+        "version": "v1.114.9",
+        "sum": "h1:MLHGyNy4melTyk9e63s+9QgLKCHPDJrP+1NfJhtU1g4=",
+        "gomod_sum": "h1:zfUkiNK2JiYlR1/SnU8aJ8Gj1nMFLkPZ69rVLv6jWPo=",
+        "origin": "https://github.com/aws/aws-sdk-go-v2 tag service/s3/v1.114.9 commit a65f5fcc2d243407861572a3be3ed78fab4a4454 (2026-11-06)",
+        "license": "Apache-2.0",
+        "decision": "Latest release, pinned together with the core module of the same SDK release commit."
+      },
+      {
+        "path": "github.com/aws/aws-sdk-go-v2",
+        "version": "v1.47.8",
+        "sum": "h1:fuClo7Un+Bi0EDTnSIPWxVEoJcze+wkGzNA4Vo3jRcQ=",
+        "gomod_sum": "h1:I8lFSH4MGrZiw2m7miCrRYHsgpC1+HW8uiVGOiPYPcw=",
+        "origin": "https://github.com/aws/aws-sdk-go-v2 tag v1.47.8 commit a65f5fcc2d243407861572a3be3ed78fab4a4454",
+        "license": "Apache-2.0",
+        "decision": "Pinned with service/s3 from the same release commit. Currently '// indirect' in go.mod because no package imports it yet; the S3 adapter (aws.String, retry config) will make it direct."
+      }
+    ],
+    "not_direct": [
+      {
+        "path": "github.com/aws/smithy-go",
+        "version": "v1.28.8",
+        "sum": "h1:aEmdAq7gVCoGCnvf1NnELlu3I6D/nhqrC321FyFiQkQ=",
+        "license": "Apache-2.0",
+        "decision": "Transitive only (selected by service/s3 v1.114.9). Count it as direct only if the S3 adapter imports it for typed error inspection (PLAN §1.3)."
+      },
+      {
+        "path": "modernc.org/libc",
+        "version": "v1.79.0",
+        "sum": "h1:9Dvvv++bAMSkSuBzuOFAatbTV5OIoq6Y6FohmD3e7q8=",
+        "license": "BSD-3-Clause"
+      },
+      {
+        "path": "github.com/pierrec/lz4/v4",
+        "version": "v4.1.23",
+        "sum": "h1:oJE7T90aYBGtFNrI8+KbETnPymobAhzRrR8Mu8n1yfU=",
+        "license": "BSD-3-Clause"
+      }
+    ],
+    "test_only": [
+      {
+        "path": "github.com/anishathalye/porcupine",
+        "version": "v1.3.1",
+        "sum": "h1:fBZ4/NGNPnIDdd6xNtrNk9/GiEQ0L4FO5+scINN+t0E=",
+        "gomod_sum": "h1:WM0SsFjWNl2Y4BqHr/E/ll2yY1GY1jqn+W7Z/84Zoog=",
+        "origin": "https://github.com/anishathalye/porcupine tag v1.3.1 commit 97cd067defd99df172053ba7f4ca5bbae57fe446",
+        "license": "MIT",
+        "decision": "Latest release; imported only by internal/qual tests (TestPorcupineOracle shows it rejects a stale read)."
+      }
+    ],
+    "runtime_closure_projection": {
+      "command": "go list -deps -f '{{.Module.Path}}' ./internal/qual/consumer modernc.org/sqlite github.com/superfly/ltx",
+      "modules": 22,
+      "budget": 30,
+      "licenses": "Apache-2.0: aws-sdk-go-v2 (10 modules), smithy-go, ltx. BSD-3-Clause: modernc sqlite/libc/mathutil/memory, lz4, google/uuid, bigfft, x/sys. MIT: dustin/go-humanize. (porcupine MIT, test-only.)",
+      "cgo_files_in_closure": "none (go list CgoFiles empty for consumer and m0 test deps with CGO_ENABLED=0)"
+    }
+  },
+  "sqlite": {
+    "sqlite_version": "3.54.1",
+    "wal_reset_fix": "3.54.1 >= 3.51.3, the fixed release named by sqlite.org/wal.html (asserted by TestSQLiteBuild)",
+    "compile_options": "ATOMIC_INTRINSICS=1,COMPILER=gcc-12.2.0,DEFAULT_AUTOVACUUM,DEFAULT_CACHE_SIZE=-2000,DEFAULT_FILE_FORMAT=4,DEFAULT_JOURNAL_SIZE_LIMIT=-1,DEFAULT_MEMSTATUS=0,DEFAULT_MMAP_SIZE=0,DEFAULT_PAGE_SIZE=4096,DEFAULT_PCACHE_INITSZ=20,DEFAULT_RECURSIVE_TRIGGERS,DEFAULT_SECTOR_SIZE=4096,DEFAULT_SYNCHRONOUS=2,DEFAULT_WAL_AUTOCHECKPOINT=1000,DEFAULT_WAL_SYNCHRONOUS=2,DEFAULT_WORKER_THREADS=0,DIRECT_OVERFLOW_READ,DISABLE_INTRINSIC,ENABLE_COLUMN_METADATA,ENABLE_DBPAGE_VTAB,ENABLE_DBSTAT_VTAB,ENABLE_FTS5,ENABLE_GEOPOLY,ENABLE_MATH_FUNCTIONS,ENABLE_MEMORY_MANAGEMENT,ENABLE_OFFSET_SQL_FUNC,ENABLE_PREUPDATE_HOOK,ENABLE_RBU,ENABLE_RTREE,ENABLE_SESSION,ENABLE_SNAPSHOT,ENABLE_STAT4,ENABLE_UNLOCK_NOTIFY,LIKE_DOESNT_MATCH_BLOBS,MALLOC_SOFT_LIMIT=1024,MAX_ATTACHED=10,MAX_COLUMN=2000,MAX_COMPOUND_SELECT=500,MAX_DEFAULT_PAGE_SIZE=8192,MAX_EXPR_DEPTH=1000,MAX_FUNCTION_ARG=1000,MAX_LENGTH=1000000000,MAX_LIKE_PATTERN_LENGTH=50000,MAX_MMAP_SIZE=0x7fff0000,MAX_PAGE_COUNT=0xfffffffe,MAX_PAGE_SIZE=65536,MAX_SCHEMA=10000000,MAX_SQL_LENGTH=1000000000,MAX_TRIGGER_DEPTH=1000,MAX_VARIABLE_NUMBER=32766,MAX_VDBE_OP=250000000,MAX_WORKER_THREADS=8,MUTEX_PTHREADS,SOUNDEX,SYSTEM_MALLOC,TEMP_STORE=1,THREADSAFE=1",
+    "source": "TestSQLiteBuild in internal/qual/m0 (go test -v), linux/amd64"
+  },
+  "inspected_sources": [
+    {"module": "modernc.org/sqlite@v1.61.1", "path": "authorizer.go", "git_blob": "7401a38419990630dd1f646ba00f655c012212a0", "matches_plan": "S19"},
+    {"module": "modernc.org/sqlite@v1.61.1", "path": "go.mod", "git_blob": "8570e77e9af13763051f97fc55e8f600b7c3ac8f", "matches_plan": "S18"},
+    {"module": "modernc.org/sqlite@v1.61.1", "path": "conn.go", "note": "interrupt/IsValid handling; no public SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"},
+    {"module": "modernc.org/sqlite@v1.62.0", "path": "CHANGELOG.md, fdatasync.go, connector.go", "note": "read to decide against the upgrade"},
+    {"module": "github.com/superfly/ltx@v0.5.2", "path": "ltx.go", "git_blob": "57d9aa41863a6126b3142da084b66631424aada7", "matches_plan": "S10"},
+    {"module": "github.com/superfly/ltx@v0.5.2", "path": "compactor.go", "git_blob": "2bdbda76845a89263c0797faa49a9f30cec8259c", "matches_plan": "S12"},
+    {"module": "github.com/superfly/ltx@v0.5.2", "path": "go.mod", "git_blob": "f78d963480bd526d319492d3b9956933af32a0f8", "matches_plan": "S11"},
+    {"module": "github.com/superfly/ltx@v0.5.3", "path": "ltx.go", "git_blob": "ee4882e8f4e578f9120a62eb18c39219765a6b70"},
+    {"module": "github.com/superfly/ltx@v0.5.3", "path": "encoder.go", "git_blob": "dc652d382fca0974896dd01f2c5326a663370108", "matches_plan": "S12 (main-branch encoder)"},
+    {"module": "github.com/superfly/ltx@v0.5.3", "path": "decoder.go", "git_blob": "88a03e802e7756b9a78ae8e4b8153c62d160da1d"},
+    {"module": "github.com/superfly/ltx@v0.5.3", "path": "compactor.go", "git_blob": "21155f73b2cefb9c44642f0becc2b4f9fb4adc1b"},
+    {"module": "github.com/superfly/ltx@v0.5.3", "path": "checksum.go", "git_blob": "67e8d868a074fc2964af9120dbab93154771ff27"},
+    {"module": "github.com/superfly/ltx@v0.5.3", "path": "go.mod", "git_blob": "f78d963480bd526d319492d3b9956933af32a0f8"},
+    {"module": "github.com/anishathalye/porcupine@v1.3.1", "path": "model.go, porcupine.go", "note": "Model/Operation API"}
+  ],
+  "minio_fixture": {
+    "image": "cgr.dev/chainguard/minio",
+    "digest": "sha256:869ca3178831d9f521ea02258a0f0d4fbc1e9f84302e707514e1f861b860865d",
+    "digest_kind": "OCI image index (amd64 + arm64)",
+    "platform_manifests": {
+      "linux/amd64": "sha256:e8bfe3456721ee96befba0ae28d0a65a620b810b60cca731f0863e8c70f2d703",
+      "linux/arm64": "sha256:e72844bb5637be53857bc47dc72871e43346da6716167f0743ecba22421209ec"
+    },
+    "minio_version": "RELEASE.2026-10-23T20-06-51Z (commit-id=76c06ff1d2cc844050fdeb1d54bf8fa70db72278), built with go1.27.3",
+    "image_created": "2026-11-07T03:27:39Z",
+    "license": "AGPL-3.0 (test fixture only, never linked)",
+    "pull": "podman pull cgr.dev/chainguard/minio@sha256:869ca3178831d9f521ea02258a0f0d4fbc1e9f84302e707514e1f861b860865d (rootless podman 5.8.9, done 2026-11-07)",
+    "why_not_upstream": "quay.io/minio/minio and docker.io/minio/minio refuse anonymous pulls as of 2026-11-07; Chainguard builds MinIO from upstream source. Conditional-write behavior is NOT yet qualified: the doctor probe must run against this exact digest (PLAN §15.1)."
+  },
+  "reusable_code_inventory": [
+    "modernc.org/sqlite: database/sql driver, per-connection AuthorizerRegisterer via sql.Conn.Raw, sqlite_dbpage (ENABLE_DBPAGE_VTAB), context interrupts, Backup API for an independent snapshot oracle.",
+    "github.com/superfly/ltx v0.5.3: Encoder/Decoder (format 3, LZ4 blocks, CRC64 file checksum), ChecksumReader/ChecksumPage rolling database checksum, Compactor (AllowNonContiguousTXIDs=false).",
+    "aws-sdk-go-v2/service/s3: PutObject IfMatch/IfNoneMatch, GetObject IfNoneMatch, ListObjectsV2, DeleteObject; retryer must be overridden to one attempt for head writes.",
+    "No Litestream WAL-reader extraction: DECISIONS D2 replaces it with frame-header page numbers + sqlite_dbpage reads (proved by TestDBPageCapture)."
+  ],
+  "m0_findings": [
+    "Closing the last connection checkpoints committed-but-unpublished WAL frames into the main file even with wal_autocheckpoint=0 (TestCloseCheckpointsWAL), and modernc v1.61.1 exposes no SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE. D2's 'close, delete -wal/-shm, reopen' discard is therefore unsafe; DECISIONS D10 makes discard delete the whole cache file and rehydrate.",
+    "The authorizer passes the table of CREATE TRIGGER/CREATE INDEX as arg2: the policy must test arg1 and arg2 against the reserved prefix, or an application trigger on a _state_ table would run inside library-mode statements. Views/triggers that read reserved tables are created but denied when used (TestAuthorizerPerConnection).",
+    "Authorizer mode switches must re-register the callback (expires prepared statements per modernc docs) rather than flip a variable read by a fixed callback.",
+    "Context deadline interrupts an unbounded recursive query in ~200 ms; the error satisfies errors.Is(context.DeadlineExceeded) and the pinned connection stays usable (TestContextInterruptsQuery).",
+    "D2 capture equals SQLite's own TRUNCATE checkpoint byte for byte across growth past 1000 pages, a spilled rolled-back transaction and VACUUM shrink; pages from rolled-back frames read back unchanged; pages above page_count are dropped (TestDBPageCapture).",
+    "ltx v0.5.3 accepts NoChecksum files at the codec level: the adapter must reject HeaderFlagNoChecksum itself. The compactor rejects TXID gaps but does not check pre/post checksum chains between inputs: the adapter must (TestLTXRejects).",
+    "ltx v0.5.3 DecodePage allocates the declared compressed frame size (up to 4 GiB) before reading it (TestLTXDeclaredSizeAllocation, 64 MiB shown): decode only bytes already matched to a head's SHA-256/length, and bound frame sizes before decoding untrusted input such as Import archives."
+  ]
+}

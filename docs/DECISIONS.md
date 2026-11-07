@@ -55,3 +55,19 @@ Every public operation is one function that runs top to bottom under the entity'
 - `internal/qual/...`: the model checker, the `qual` command and the minimal consumer.
 
 The layout lets parallel workstreams compile and test independently. The production LOC budget in PLAN §12.1 still covers everything outside `internal/storetest` and `internal/qual`.
+
+## D10. Speculative local state is discarded with the whole cache file
+
+M0 (`TestCloseCheckpointsWAL`) shows that closing the last SQLite connection checkpoints committed WAL frames into the main file even with `wal_autocheckpoint=0`, and modernc v1.61.1 exposes no `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`. The second paragraph of D2 ("close, delete `-wal`/`-shm`, reopen") would therefore install unpublished pages into the main file. Discarding speculative state (any publication that is not proven committed, quarantine, a bad connection) closes the connection and deletes the database, `-wal` and `-shm` files; the next access rehydrates from the current head. `Evict` also deletes the files: a closed cache is never reopened (PLAN §9.3 would require revalidating it anyway). This is D8's close-and-rehydrate.
+
+## D11. Create runs the callback before writing birth.json
+
+PLAN §6.3 writes `birth.json` first and runs the callback after. A callback that fails deterministically would then leave a birth without a head, which D5 lets only the identical request resume: the key would answer `state_missing` forever. Create therefore builds the genesis image locally first (speculative, never published), writes `birth.json` only after the callback succeeded, and publishes only if it won that conditional create. "Only the birth winner publishes genesis" still holds.
+
+## D12. The D3 fence re-proposes the candidate with a fresh nonce
+
+When `resolve` finds the head still at the candidate's base, it sends the same proposed head again with a new nonce and the same `If-Match` (or `If-None-Match: *` for genesis). All proposals of one candidate share one condition, so at most one applies; resolution accepts any of their nonces. A winning re-proposal both fences the earlier ambiguous request and commits the intended effect, so an ambiguous mutation ends committed instead of rolled back. Proposals are capped at three per candidate.
+
+## D13. LTX is pinned at v0.5.3
+
+PLAN §1.3 names v0.5.2 as the candidate pin. v0.5.3 rejects bytes after the trailer, validates the page index against the decoded pages while streaming it instead of reading the whole tail into memory, and aborts the encoder on partial writes. The only format-relevant change excludes the SQLite lock page from checksums, and that page (262145 at 4 KiB) lies beyond the 256 MiB ceiling. Its `encoder.go` is the main-branch blob the plan inspected [S12]. Details in `research.lock.json`.

@@ -1,0 +1,112 @@
+const CodeAbsentAtVersion Code = "absent_at_version"
+const CodeCapacity Code = "capacity"
+const CodeClosed Code = "closed"
+const CodeCorrupt Code = "corrupt"
+const CodeIDConflict Code = "id_conflict"
+const CodeIDExpired Code = "id_expired"
+const CodeIncarnationMismatch Code = "incarnation_mismatch"
+const CodeInvalidArgument Code = "invalid_argument"
+const CodeNotFound Code = "not_found"
+const CodeNotOwner Code = "not_owner"
+const CodeOutcomeUnknown Code = "outcome_unknown"
+const CodeRouteChanged Code = "route_changed"
+const CodeSchemaMismatch Code = "schema_mismatch"
+const CodeStateMissing Code = "state_missing"
+const CodeUnavailable Code = "unavailable"
+const CodeUnsupported Code = "unsupported"
+func (*Node) Close(context.Context) error
+func (*Node) Collect(context.Context, Ref) error
+func (*Node) Create(context.Context, string, Request, func(*Tx) ([]byte, error)) (Ref, Result, error)
+func (*Node) Evict(context.Context, Ref) error
+func (*Node) Export(context.Context, Ref, io.Writer) (Version, error)
+func (*Node) Import(context.Context, string, Request, io.Reader) (Ref, Result, error)
+func (*Node) Lookup(context.Context, Ref, MutationID) (Result, error)
+func (*Node) Migrate(context.Context, Ref, Request, uint32, func(*Tx) error) (Result, error)
+func (*Node) Owner() Owner
+func (*Node) Read(context.Context, Ref, uint32, func(*View) ([]byte, error)) (Result, error)
+func (*Node) Release(context.Context, Ref) error
+func (*Node) Resolve(context.Context, string) (Route, error)
+func (*Node) Stats() Stats
+func (*Node) Takeover(context.Context, Route) (Route, error)
+func (*Node) Update(context.Context, Ref, Request, func(*Tx) ([]byte, error)) (Result, error)
+func (*Tx) Exec(context.Context, string, ...any) (sql.Result, error)
+func (*Tx) Query(context.Context, string, []any, func(*sql.Rows) error) error
+func (*View) Query(context.Context, string, []any, func(*sql.Rows) error) error
+func (e *Error) Error() string
+func (e *Error) Unwrap() error
+func NewMutationID(t time.Time) (MutationID, error)
+func Open(ctx context.Context, cfg Config) (*Node, error)
+func Preferred(key string, nodeIDs []string) (string, error)
+type Code string
+type Config struct {
+	S3		*s3.Client
+	Bucket		string
+	Prefix		string
+	NodeID		string
+	CacheDir	string
+	Limits		Limits
+	Logger		*slog.Logger
+}
+type Error struct {
+	Code		Code
+	Operation	MutationID
+	Route		*Route
+	At		Version
+	RetryAfter	time.Duration
+	Message		string
+}
+type Limits struct {
+	EntityBytes, CacheBytes					int64
+	ResultBytes, ResidentEntities, InflightStorage		int
+	PendingPerEntity, Recoveries, BatchMax			int
+	BatchDelay, StorageAttemptTimeout, CommitTimeout	time.Duration
+	IdleTimeout, ReceiptRetention				time.Duration
+}
+type MutationID [24]byte
+type Node struct{}
+type Owner struct {
+	NodeID	string
+	Session	[16]byte
+}
+type Ref struct {
+	Key		string
+	Incarnation	[16]byte
+}
+type Request struct {
+	ID	MutationID
+	Hash	[32]byte
+	Schema	uint32
+}
+type Result struct {
+	Value		[]byte
+	Version		Version
+	Replayed	bool
+}
+type Route struct {
+	Ref		Ref
+	Owner		Owner
+	Epoch		uint64
+	Revision	uint64
+}
+type Stats struct {
+	Reads, Mutations, Commits, Replays, Expired, Conflicts		uint64
+	ReadRejections, MutationRejections, UnknownOutcomes		uint64
+	OwnerChanges, Activations, ActivationFailures, Corruptions	uint64
+	CASAttempts, CASConflicts, AmbiguousPuts			uint64
+	Snapshots, Compactions, Collections, CollectedObjects		uint64
+	SnapshotBytes, CompactionInputBytes, CompactionOutputBytes	uint64
+	CollectedBytes, UploadedBytes, DownloadedBytes			uint64
+	ResidentEntities, QueuedRequests, InflightStorage		int64
+	CacheBytes, StagingBytes					int64
+	OldestUnresolved						time.Duration
+	Storage								[4]struct {
+		Attempts, Failures		uint64
+		UploadedBytes, DownloadedBytes	uint64
+	}
+}
+type Tx struct{}
+type Version struct {
+	Incarnation	[16]byte
+	Sequence	uint64
+}
+type View struct{}
