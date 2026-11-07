@@ -1,0 +1,15 @@
+{
+  "case": "P",
+  "variant": "premature-ack",
+  "violation": "G1: update r1 at n0 acknowledged at sequence 2 but the current head [r0] schema=1 floor=0 does not contain it",
+  "steps": [
+    {
+      "t": [
+        1,
+        1,
+        0
+      ],
+      "desc": " 1. client invokes r1 update on n0 (entity 0, id 2 hash 1 ts 1)"
+    }
+  ]
+}

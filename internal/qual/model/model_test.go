@@ -50,6 +50,26 @@ func join(lines []string) string {
 	return s
 }
 
+// TestCounterexampleFixtures: every broken variant has a permanent minimal
+// counterexample (written by qual model --negative-controls=all) that still
+// ends in the same violation, at its last step and not before.
+func TestCounterexampleFixtures(t *testing.T) {
+	for _, v := range Negatives() {
+		path := filepath.Join("testdata", "counterexamples", v.String()+".json")
+		f, err := ReadFixture(path)
+		if err != nil {
+			t.Errorf("%s: %v", v, err)
+			continue
+		}
+		if f.Variant != v.String() {
+			t.Errorf("%s: fixture is for %s", path, f.Variant)
+		}
+		if err := f.Check(); err != nil {
+			t.Errorf("%s: %v", path, err)
+		}
+	}
+}
+
 // TestFindingF1 keeps protocol finding F1 (.work/model-findings.md) visible: a
 // genesis CAS that outlives an administrative head deletion republishes
 // genesis over acknowledged data (G6). Delete this test, and the fixture, only

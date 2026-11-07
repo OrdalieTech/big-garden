@@ -15,6 +15,21 @@
 // instead of 8 and the delta cap is 4 instead of 32; clocks are small integers
 // and ReceiptRetention is a case parameter; pruning deletes at most one receipt
 // per transaction instead of 1000.
+//
+// Invariants: every head write is checked as a transition (G1 lineage, G3
+// authority, G5 one effect per ID, G6 genesis and chain, G7 monotonicity, G8
+// no resurrection); every state is checked for G1 (acknowledged effects in the
+// current head) and G8 (referenced objects exist); every client response is
+// checked against the history (G2/G4: a state-dependent answer comes from an
+// image that was the head during the call; acknowledgments are durable and
+// unique; a definite failure of an operation with an ID never commits).
+//
+// Search: Exhaustive expands the complete reachable graph of a bounded case
+// once per canonical state (64-bit fingerprints, omission bound reported);
+// Shortest finds minimal counterexamples by iterative deepening; Random runs
+// seeded traces with every reply split. Bounded cases deliver a reply at its
+// request's apply point (see Case.Split) and drop abandoned requests that can no
+// longer take effect (world.sweep); both are exact for the correct protocol.
 package model
 
 // ID is a fresh unique identifier: nonce, upload attempt, session, incarnation

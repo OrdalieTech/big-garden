@@ -1,0 +1,95 @@
+{
+  "case": "I",
+  "variant": "floorless-receipt-pruning",
+  "violation": "G5: operation ID 2 applied twice (sequences 2 and 4)",
+  "steps": [
+    {
+      "t": [
+        1,
+        1,
+        0
+      ],
+      "desc": " 1. client invokes r1 update on n0 (entity 0, id 2 hash 1 ts 1)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 2. store applies m0 PUT object #7 base 1 seq 2..2 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 3. store applies m0 CAS head rev 2 nonce #8 owner n0 epoch 1 [r0 r1] schema=1 floor=0, If-Match #6 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        9,
+        0,
+        3
+      ],
+      "desc": " 4. n0 clock jumps to 3"
+    },
+    {
+      "t": [
+        1,
+        2,
+        0
+      ],
+      "desc": " 5. client invokes r2 update on n0 (entity 0, id 3 hash 1 ts 3)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 6. store applies m0 PUT object #10 base 2 seq 3..3 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 7. store applies m0 CAS head rev 3 nonce #11 owner n0 epoch 1 [r0 r1- r2] schema=1 floor=0, If-Match #8 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        9,
+        0,
+        1
+      ],
+      "desc": " 8. n0 clock jumps to 1"
+    },
+    {
+      "t": [
+        1,
+        1,
+        0
+      ],
+      "desc": " 9. client invokes r1 update on n0 (entity 0, id 2 hash 1 ts 1)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "10. store applies m0 PUT object #13 base 3 seq 4..4 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "11. store applies m0 CAS head rev 4 nonce #14 owner n0 epoch 1 [r0 r1- r2 r1] schema=1 floor=0, If-Match #11 from n0 (reply delivered)"
+    }
+  ]
+}
