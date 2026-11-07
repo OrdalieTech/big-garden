@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,7 +129,9 @@ func (o *oracle) mutation() bool {
 	full := o.pageCount() > o.p.target
 	abort := r.IntN(12) == 0
 	o.f.n++
-	_, _, err := o.f.d.Mutate(commit(o.f.n), func(tx *Tx) ([]byte, error) {
+	c := commit(o.f.n) // its ID's timestamp is n: keep about 1000 receipts
+	c.FloorMs = max(o.f.n, 1000) - 1000
+	_, _, err := o.f.d.Mutate(c, func(tx *Tx) ([]byte, error) {
 		ex := func(q string, args ...any) error { _, err := tx.Exec(bg, q, args...); return err }
 		if err := ex("UPDATE counter SET n = n + 1"); err != nil {
 			return nil, err
@@ -183,6 +186,11 @@ func (o *oracle) mutation() bool {
 	if err == nil {
 		o.commits++
 		return true
+	}
+	// Only the callback's own abort and SQLite's own rollback (SQLITE_FULL)
+	// are expected; anything else (I/O errors) invalidates the run.
+	if err.Error() != "abort" && !strings.Contains(err.Error(), "rolled back during the callback") {
+		o.t.Fatalf("mutation %d: %v", o.f.n, err)
 	}
 	o.failed++
 	return false
@@ -243,8 +251,9 @@ func (o *oracle) compact(i, j int) {
 // resetReplay rebuilds the replay file from the chain's snapshot alone.
 func (o *oracle) resetReplay() {
 	f, t := o.f, o.t
-	if o.replay != nil {
+	if o.replay != nil { // tmpfs pages count against the test's memory limit
 		o.replay.Close()
+		os.Remove(o.replay.Name())
 	}
 	var err error
 	o.replay, err = os.CreateTemp(t.TempDir(), "replay")
