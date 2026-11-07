@@ -14,21 +14,13 @@ const (
 	tApply                     // A message slot
 	tDeliver                   // A message slot
 	tDrop                      // A orphaned unapplied message slot: lost for ever
-	tTimeout                   // A node, B entity*2+lane: give up waiting on a write
+	tTimeout                   // A message slot: the client gives up on this write
 	tHedge                     // A node, B entity*2+lane: identical duplicate CAS (D3)
 	tDeadline                  // A node, B entity*2+lane: CommitTimeout, outcome_unknown
 	tRestart                   // A node: crash, cache loss, new session
 	tClock                     // A node, B value
 	tLoss                      // A entity: administrative deletion of head.json
 )
-
-func writeWait(pc uint8) bool {
-	switch pc {
-	case pcPubCas, pcResCas, pcUpdPut, pcCmpPut, pcCrPutBirth, pcCrPutObj, pcColDel:
-		return true
-	}
-	return false
-}
 
 func deadlinePC(pc uint8) bool {
 	switch pc {
@@ -87,6 +79,9 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 		case m.Waited:
 			buf = append(buf, Tr{tDeliver, uint8(i), 0})
 		}
+		if m.Kind >= mPutBirth && m.Waited {
+			buf = append(buf, Tr{tTimeout, uint8(i), 0})
+		}
 	}
 	for n := 0; n < c.Nodes; n++ {
 		for e := 0; e < c.Ents; e++ {
@@ -96,9 +91,6 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 					continue
 				}
 				b := uint8(e*2 + l)
-				if writeWait(p.PC) {
-					buf = append(buf, Tr{tTimeout, uint8(n), b})
-				}
 				if (p.PC == pcPubCas || p.PC == pcResCas) && p.W[1] == 0 && !p.Hedged && int(s.Hedges) < c.Hedges {
 					buf = append(buf, Tr{tHedge, uint8(n), b})
 				}
@@ -147,16 +139,29 @@ func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
 		x.run(evStart, 0)
 	case tApply:
 		m := &s.Msgs[t.A]
-		read := m.Kind <= mList && m.Waited
+		waited := m.Waited
 		w.apply(int(t.A))
-		if read && !c.SplitReads && !w.blocked {
+		if waited && !c.Split && !w.blocked {
 			w.deliver(int(t.A))
 		}
 	case tDeliver:
 		w.deliver(int(t.A))
 	case tDrop:
 		s.Msgs[t.A] = Msg{}
-	case tTimeout, tDeadline:
+	case tTimeout:
+		m := &s.Msgs[t.A]
+		x := w.px(int(m.Node), int(m.Ent), int(m.Lane))
+		w.orphan(int(t.A))
+		switch slot := int8(t.A) + 1; {
+		case x.p.W[1] == slot:
+			x.p.W[1] = 0
+		case x.p.W[1] != 0: // still waiting on the hedged twin
+			x.p.W = [2]int8{x.p.W[1], 0}
+		default:
+			x.p.W = [2]int8{}
+			x.run(evTimeout, 0)
+		}
+	case tDeadline:
 		x := w.px(int(t.A), int(t.B)/2, int(t.B)%2)
 		for _, sl := range x.p.W {
 			if sl != 0 {
@@ -164,11 +169,7 @@ func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
 			}
 		}
 		x.p.W = [2]int8{}
-		if t.K == tTimeout {
-			x.run(evTimeout, 0)
-		} else {
-			x.subret(sUnknown)
-		}
+		x.subret(sUnknown)
 	case tHedge:
 		x := w.px(int(t.A), int(t.B)/2, int(t.B)%2)
 		m := s.Msgs[x.p.W[0]-1]
@@ -239,12 +240,13 @@ func Describe(c *Case, s *State, t Tr) string {
 		if t.K == tDeliver {
 			d += " -> " + [...]string{"", "OK", "NotFound", "PreconditionFailed"}[m.Res]
 		}
-		if t.K == tApply && m.Kind <= mList && m.Waited && !c.SplitReads {
+		if t.K == tApply && m.Waited && !c.Split {
 			d += " (reply delivered)"
 		}
 		return d
 	case tTimeout:
-		return fmt.Sprintf("n%d entity %d gives up waiting on its write (it stays in flight)", t.A, t.B/2)
+		m := &s.Msgs[t.A]
+		return fmt.Sprintf("n%d gives up on m%d %s (the request stays in flight)", m.Node, t.A, msgString(m))
 	case tHedge:
 		return fmt.Sprintf("n%d entity %d sends an identical hedge of its CAS", t.A, t.B/2)
 	case tDeadline:

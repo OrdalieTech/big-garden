@@ -9,7 +9,7 @@ func controlCase(v Variant) *Case {
 	case AgeGC, RetargetCompaction:
 		return caseG()
 	case D5NoIdentity:
-		return caseC()
+		return caseC0()
 	}
 	return caseP()
 }

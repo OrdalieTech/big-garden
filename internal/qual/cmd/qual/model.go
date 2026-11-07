@@ -44,28 +44,45 @@ func model(args []string) error {
 	if err := os.MkdirAll(filepath.Join(*out, "counterexamples"), 0o755); err != nil {
 		return err
 	}
-	b := pm.Budget{States: *maxStates, Time: *budget}
+	b := pm.Budget{States: *maxStates, Time: *budget, Progress: os.Stderr}
 	var results []pm.Result
 	var failures []string
+	save := func(c *pm.Case, v pm.Variant, trace []pm.Tr, name string) []string {
+		f, err := pm.NewFixture(c, v, trace)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s %s: trace does not replay: %v", c.Name, v, err))
+			return nil
+		}
+		if err := pm.WriteFixture(filepath.Join(*out, "counterexamples", name), f); err != nil {
+			failures = append(failures, err.Error())
+		}
+		var lines []string
+		for _, s := range f.Steps {
+			lines = append(lines, s.Desc)
+		}
+		return lines
+	}
 	record := func(r pm.Result, c *pm.Case, v pm.Variant) {
-		if r.Trace != nil {
-			if f, err := pm.NewFixture(c, v, r.Trace); err == nil {
-				r.Lines = nil
-				for _, s := range f.Steps {
-					r.Lines = append(r.Lines, s.Desc)
+		switch {
+		case v != pm.Correct && r.Trace != nil:
+			r.Lines = save(c, v, r.Trace, v.String()+".json") // each control runs in one case
+		case len(r.Kinds) > 0:
+			for i, k := range r.Kinds {
+				lines := save(c, v, k.Trace, fmt.Sprintf("correct-%s-kind%d.json", c.Name, i))
+				if i == 0 {
+					r.Lines = lines
 				}
-				name := fmt.Sprintf("%s-%s.json", v, c.Name)
-				if err := pm.WriteFixture(filepath.Join(*out, "counterexamples", name), f); err != nil {
-					failures = append(failures, err.Error())
-				}
-			} else {
-				failures = append(failures, fmt.Sprintf("%s %s: trace does not replay: %v", c.Name, v, err))
 			}
+		case r.Trace != nil:
+			r.Lines = save(c, v, r.Trace, fmt.Sprintf("correct-%s.json", c.Name))
 		}
 		results = append(results, r)
 		fmt.Printf("%-10s %-28s %-12s %-12s states=%d dup=%d bounded=%d depth-cut=%d traces=%d transitions=%d %.1fs %s\n",
 			r.Mode, r.Variant, r.Case, r.Status, r.States, r.Duplicates, r.Bounded, r.DepthCut, r.Traces, r.Steps, r.Seconds, r.Note)
-		if r.Violation != "" {
+		for _, k := range r.Kinds {
+			fmt.Printf("    %d traces (first %d): %s\n", k.Count, k.First, k.Violation)
+		}
+		if r.Violation != "" && len(r.Kinds) == 0 {
 			fmt.Printf("    %s\n", r.Violation)
 		}
 	}

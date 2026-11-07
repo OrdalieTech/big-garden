@@ -2,7 +2,9 @@ package model
 
 import (
 	"fmt"
+	"io"
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,12 +37,48 @@ type Result struct {
 	Note       string   `json:"note,omitempty"`
 	Seconds    float64  `json:"seconds"`
 	Lines      []string `json:"trace,omitempty"`
+	Kinds      []Kind   `json:"violation_kinds,omitempty"` // random: every distinct violation
+}
+
+// Kind groups random-trace violations by their message with numbers and
+// images elided; it keeps the first trace of each.
+type Kind struct {
+	Signature string `json:"signature"`
+	Count     uint64 `json:"count"`
+	First     uint64 `json:"first_trace"`
+	Violation string `json:"violation"`
+	Trace     []Tr   `json:"-"`
+}
+
+func signature(v string) string {
+	var b []byte
+	depth := 0
+	for i := 0; i < len(v); i++ {
+		switch ch := v[i]; {
+		case ch == '[':
+			depth++
+		case ch == ']':
+			depth--
+			if depth == 0 {
+				b = append(b, "[..]"...)
+			}
+		case depth > 0:
+		case ch >= '0' && ch <= '9':
+			if len(b) == 0 || b[len(b)-1] != 'N' {
+				b = append(b, 'N')
+			}
+		default:
+			b = append(b, ch)
+		}
+	}
+	return string(b)
 }
 
 // Budget bounds an exhaustive search.
 type Budget struct {
-	States uint64
-	Time   time.Duration
+	States   uint64
+	Time     time.Duration
+	Progress io.Writer // optional: a line every 5M states
 }
 
 type dfs struct {
@@ -78,17 +116,21 @@ func (d *dfs) walk(s *State, depth int) {
 			d.stop = true
 			return
 		}
-		if depth+1 >= d.limit {
+		if d.limit > 0 && depth+1 >= d.limit {
 			d.res.DepthCut++
 			continue
 		}
 		h := d.k.Hash(d.c, &ns)
-		if old, ok := d.seen[h]; ok && int(old) <= depth+1 {
+		if old, ok := d.seen[h]; ok && (d.limit == 0 || int(old) <= depth+1) {
 			d.res.Duplicates++
 			continue
 		}
-		d.seen[h] = uint8(depth + 1)
+		d.seen[h] = uint8(min(depth+1, 255))
 		d.res.States++
+		if d.budget.Progress != nil && d.res.States%5_000_000 == 0 {
+			fmt.Fprintf(d.budget.Progress, "  %s %s: %d states, %d duplicates, %d bounded, path %d, %.0fs\n", d.c.Name, d.v,
+				d.res.States, d.res.Duplicates, d.res.Bounded, d.res.MaxDepth, time.Since(d.start).Seconds())
+		}
 		if d.res.States >= d.budget.States || (d.res.States%4096 == 0 && time.Since(d.start) > d.budget.Time) {
 			d.res.Status, d.stop = Inconclusive, true
 			d.res.Note = fmt.Sprintf("budget exhausted after %d states", d.res.States)
@@ -100,13 +142,19 @@ func (d *dfs) walk(s *State, depth int) {
 	}
 }
 
-// Exhaustive explores every schedule of c up to its depth with canonical-state
-// deduplication. A state reached again at a smaller depth is expanded again, so
-// the search is complete within the depth bound.
+// Exhaustive explores the complete reachable state graph of c: every canonical
+// state is expanded once, with no depth bound. Every budget of a case is finite
+// (invocations, restarts, clock jumps, hedges, three proposals per candidate,
+// message slots), and fresh IDs are canonicalised, so the graph is finite and
+// this covers every schedule of every length, which subsumes the plan's
+// schedule-depth bounds.
 func Exhaustive(c *Case, v Variant, b Budget) Result {
-	return search(c, v, c.Depth, b)
+	return search(c, v, 0, b)
 }
 
+// search is a depth-first search; limit > 0 bounds the schedule length, and a
+// state reached again at a smaller depth is then expanded again, so the search
+// is complete within that bound.
 func search(c *Case, v Variant, limit int, b Budget) Result {
 	res := Result{Case: c.Name, Variant: v.String(), Mode: "exhaustive", Status: Pass, Depth: limit}
 	d := &dfs{c: c, v: v, k: newCanon(), seen: map[[2]uint64]uint8{}, limit: limit, budget: b, start: time.Now(), res: &res}
@@ -115,10 +163,11 @@ func search(c *Case, v Variant, limit int, b Budget) Result {
 	res.States = 1
 	d.walk(&s, 0)
 	res.Seconds = time.Since(d.start).Seconds()
-	if res.Status == Pass && res.DepthCut > 0 {
+	switch {
+	case res.Status == Pass && res.DepthCut > 0:
 		res.Note = fmt.Sprintf("complete up to depth %d; %d successors lie beyond it", limit, res.DepthCut)
-	} else if res.Status == Pass {
-		res.Note = "complete: the reachable state graph closed within the depth bound"
+	case res.Status == Pass:
+		res.Note = fmt.Sprintf("complete: the whole reachable graph, longest DFS path %d", res.MaxDepth)
 	}
 	return res
 }
@@ -149,7 +198,8 @@ func Shortest(c *Case, v Variant, maxDepth int, b Budget) Result {
 }
 
 // Random runs n seeded random schedules of c, each up to c.Depth transitions.
-// Trace i uses the PCG stream (seed, i), so any violation is reproducible.
+// Trace i uses the PCG stream (seed, i), so any violation is reproducible. All n
+// traces run even after a violation; violations are grouped by kind.
 func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 	start := time.Now()
 	res := Result{Case: c.Name, Variant: v.String(), Mode: "random", Status: Pass, Depth: c.Depth, Seed: seed}
@@ -167,12 +217,6 @@ func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 				if i >= n {
 					return
 				}
-				mu.Lock()
-				done := res.Status != Pass
-				mu.Unlock()
-				if done {
-					return
-				}
 				trace, viol, depth, st, bd := randomTrace(c, v, seed, i, buf[:0])
 				steps.Add(st)
 				bounded.Add(bd)
@@ -180,9 +224,8 @@ func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 				if depth > maxDepth {
 					maxDepth = depth
 				}
-				if viol != "" && res.Status == Pass {
-					res.Status, res.Violation, res.Trace = Violation, viol, trace
-					res.Note = fmt.Sprintf("trace %d", i)
+				if viol != "" {
+					res.addKind(viol, i, trace)
 				}
 				mu.Unlock()
 			}
@@ -190,9 +233,29 @@ func Random(c *Case, v Variant, seed uint64, n uint64, workers int) Result {
 	}
 	wg.Wait()
 	res.Traces = min(next.Load(), n)
+	sort.Slice(res.Kinds, func(i, j int) bool { return res.Kinds[i].First < res.Kinds[j].First })
+	if len(res.Kinds) > 0 {
+		k := res.Kinds[0]
+		res.Status, res.Violation, res.Trace = Violation, k.Violation, k.Trace
+		res.Note = fmt.Sprintf("%d violation kinds; first in trace %d", len(res.Kinds), k.First)
+	}
 	res.Steps, res.Bounded, res.MaxDepth = steps.Load(), bounded.Load(), maxDepth
 	res.Seconds = time.Since(start).Seconds()
 	return res
+}
+
+func (r *Result) addKind(viol string, i uint64, trace []Tr) {
+	sig := signature(viol)
+	for k := range r.Kinds {
+		if r.Kinds[k].Signature == sig {
+			r.Kinds[k].Count++
+			if i < r.Kinds[k].First {
+				r.Kinds[k].First, r.Kinds[k].Violation, r.Kinds[k].Trace = i, viol, trace
+			}
+			return
+		}
+	}
+	r.Kinds = append(r.Kinds, Kind{Signature: sig, Count: 1, First: i, Violation: viol, Trace: trace})
 }
 
 func randomTrace(c *Case, v Variant, seed, i uint64, buf []Tr) (trace []Tr, viol string, depth int, steps, bounded uint64) {

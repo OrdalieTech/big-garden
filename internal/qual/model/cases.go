@@ -18,22 +18,25 @@ type Case struct {
 	ClockMax    int8
 	Retention   int8 // ReceiptRetention in clock units
 	Age         int8 // age threshold of the age-only GC control
-	// SplitReads delivers read replies (GET, LIST) as separate transitions.
-	// Bounded cases fuse a read's delivery into its apply: the delivery step
-	// reads nothing from the store (the result is fixed at apply), so moving it
-	// back to the apply point only makes the reader act earlier on the same
-	// information, and every later request it sends can still be delayed. Writes
-	// always keep independent apply, delivery, loss and late application.
-	SplitReads bool
-	Init       State
+	// Split delivers replies as separate transitions. Bounded cases deliver a
+	// reply at its request's apply point instead, with per-request client
+	// abandonment and orphans that may still apply later. That is complete: a
+	// delivery reads only the reply fixed at apply, so delaying it only delays
+	// the client's own local step, and "applied, reply delayed, then lost" is
+	// "abandoned, then applied as an orphan" (including an original CAS applying
+	// while its hedge answers 412). Fused traces are valid split traces, so no
+	// false alarm is possible; the random traces keep every reply split.
+	Split bool
+	Init  State
 }
 
 const all = 0xff
 
-// Cases returns the M1 bounded cases P, O, G, I (PLAN §14) and C, which covers
-// Create, the D5 resume and head loss.
+// Cases returns the M1 bounded cases P, O, G, I (PLAN §14), C, which covers
+// Create, the D5 resume and an administrative head deletion, and C0, which is
+// C without the deletion.
 func Cases() []*Case {
-	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC()}
+	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -138,11 +141,19 @@ func caseC() *Case {
 	return c
 }
 
+// C0 is C without the head deletion: creation, D5 and the races around them
+// within the store contract (see .work finding F1 for C itself).
+func caseC0() *Case {
+	c := caseC()
+	c.Name, c.Losses = "C0", 0
+	return c
+}
+
 // CaseR is the random-trace configuration: entity 0 exists with a two-delta
 // root, entity 1 does not; every operation kind is in the pool.
 func CaseR(nodes, ents, active int) *Case {
 	c := &Case{Name: fmt.Sprintf("R%d%d%d", nodes, ents, active), Nodes: nodes, Ents: ents, Msgs: maxMsgs, Active: active, Depth: 150,
-		Restarts: 2, Jumps: 2, Losses: 1, Hedges: 2, ClockMax: 4, Retention: 2, Age: 1, SplitReads: true}
+		Restarts: 2, Jumps: 2, Losses: 1, Hedges: 2, ClockMax: 4, Retention: 2, Age: 1, Split: true}
 	c.Reqs = []Req{
 		genesisReq(3),
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 3, Schema: 1},
