@@ -149,6 +149,26 @@ func TestCreateSettings(t *testing.T) {
 	if v, _ := sqlite.Limit(f.d.conn, sqlite3.SQLITE_LIMIT_ATTACHED, -1); v != 0 {
 		t.Errorf("attached limit %d", v)
 	}
+	// Defensive mode is on: even library SQL cannot make the schema writable.
+	if err := f.d.exec("PRAGMA writable_schema=ON"); err != nil || scalar(t, f.d.conn, "PRAGMA writable_schema") != "0" {
+		t.Errorf("defensive mode off: %v", err)
+	}
+	// URI metacharacters in the path reach the intended file.
+	odd := filepath.Join(f.dir, "a?b%c#d e&mode=rwc")
+	if err := os.Mkdir(odd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	od, err := Create(bg, filepath.Join(odd, "db?x"), 1000, head.ID{}, "k", head.ID{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(odd, "db?x")); err != nil {
+		t.Fatalf("odd path: %v", err)
+	}
+	od.Discard()
+	if entries, _ := os.ReadDir(odd); len(entries) != 0 {
+		t.Fatalf("odd path left %d files", len(entries))
+	}
 	st, err := os.Stat(f.d.path)
 	if err != nil || st.Mode().Perm() != 0o600 {
 		t.Fatalf("db file mode: %v %v", st.Mode(), err)
