@@ -35,6 +35,24 @@ func fixture() Head {
 	}
 }
 
+func tail(lo, hi uint64, pre, post Checksum, n int) *Tail {
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = byte(i*7 + int(lo))
+	}
+	return &Tail{SHA256: sha256.Sum256(data), Bytes: uint64(n), MinSequence: lo, MaxSequence: hi,
+		PreChecksum: pre, PostChecksum: post, Data: data}
+}
+
+// tailFixture: fixture plus an inline tail 14..15 of 100 bytes (revision 5).
+func tailFixture() Head {
+	h := fixture()
+	c5 := ChecksumFlag | 0x55
+	h.Tail = tail(14, 15, h.DatabaseChecksum, c5, 100)
+	h.Sequence, h.DatabaseChecksum = 15, c5
+	return h
+}
+
 func mustEncode(t *testing.T, h Head) []byte {
 	t.Helper()
 	b, err := h.Encode()
@@ -53,6 +71,13 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if b2 := mustEncode(t, got); !bytes.Equal(b, b2) {
 		t.Fatalf("re-encode differs:\n%s\n%s", b, b2)
+	}
+	if !bytes.HasSuffix(b, []byte(`],"tail":null}`)) {
+		t.Fatalf("absent tail not encoded as null: %s", b)
+	}
+	tb := mustEncode(t, tailFixture())
+	if got, err := Decode(tb); err != nil || !bytes.Equal(mustEncode(t, got), tb) {
+		t.Fatalf("tail head: %v\n%s", err, tb)
 	}
 	h.Owner = nil
 	if _, err := Decode(mustEncode(t, h)); err != nil {
@@ -80,9 +105,16 @@ func TestGolden(t *testing.T) {
 		`"codec":"ltx-v3","page_size":4096,"page_count":128,"database_checksum":"8000000000000011",` +
 		`"snapshot":{"key":"` + h.Snapshot.Key + `","sha256":"` + h.Snapshot.SHA256.String() + `","bytes":4097,` +
 		`"base_revision":0,"min_sequence":1,"max_sequence":10,"pre_checksum":"0000000000000000",` +
-		`"post_checksum":"8000000000000011","level":0},"deltas":[]}`
+		`"post_checksum":"8000000000000011","level":0},"deltas":[],"tail":null}`
 	if got := string(mustEncode(t, h)); got != want {
 		t.Fatalf("canonical encoding changed:\n got %s\nwant %s", got, want)
+	}
+	tf := tailFixture()
+	tf.Tail = tail(14, 15, ChecksumFlag|0x33, ChecksumFlag|0x55, 4)
+	want = `,"tail":{"sha256":"` + tf.Tail.SHA256.String() + `","bytes":4,"min_sequence":14,"max_sequence":15,` +
+		`"pre_checksum":"8000000000000033","post_checksum":"8000000000000055","data":"DhUcIw=="}}`
+	if got := string(mustEncode(t, tf)); !strings.HasSuffix(got, want) {
+		t.Fatalf("canonical tail encoding changed:\n got %s\nwant suffix %s", got, want)
 	}
 }
 
@@ -133,6 +165,44 @@ func TestDecodeRejectsNonCanonical(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			b := edit(good)
 			if b == good {
+				t.Fatal("edit did not change the input")
+			}
+			if _, err := Decode([]byte(b)); err == nil {
+				t.Fatalf("accepted:\n%s", b)
+			}
+		})
+	}
+}
+
+func TestDecodeRejectsNonCanonicalTail(t *testing.T) {
+	good := string(mustEncode(t, tailFixture()))
+	plain := string(mustEncode(t, fixture()))
+	data := func(s string) (int, int) { // bounds of the base64 text
+		i := strings.Index(s, `"data":"`) + 8
+		return i, i + strings.IndexByte(s[i:], '"')
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	for name, b := range map[string]string{
+		"missing tail":   strings.Replace(plain, `,"tail":null`, ``, 1),
+		"empty tail":     strings.Replace(plain, `"tail":null`, `"tail":{}`, 1),
+		"tail unknown":   strings.Replace(good, `"data":`, `"level":0,"data":`, 1),
+		"tail duplicate": strings.Replace(good, `"bytes":100,`, `"bytes":100,"bytes":100,`, 1),
+		"data null":      func() string { i, j := data(good); return good[:i-1] + "null" + good[j+1:] }(),
+		"data unpadded":  strings.Replace(good, `=="}}`, `"}}`, 1),
+		"data newline":   func() string { i, _ := data(good); return good[:i+4] + `\n` + good[i+4:] }(),
+		"data url-safe": func() string {
+			i, j := data(good)
+			return good[:i] + strings.NewReplacer("+", "-", "/", "_").Replace(good[i:j]) + good[j:]
+		}(),
+		"data padding bits": func() string { // same bytes under non-strict base64
+			_, j := data(good)
+			k := j - 3 // last significant character before "=="
+			c := alphabet[strings.IndexByte(alphabet, good[k])^1]
+			return good[:k] + string(c) + good[k+1:]
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if b == good || b == plain {
 				t.Fatal("edit did not change the input")
 			}
 			if _, err := Decode([]byte(b)); err == nil {
@@ -203,9 +273,55 @@ func TestValidateRejects(t *testing.T) {
 		"absolute key":     func(h *Head) { h.Deltas[0].Key = "/" + h.Deltas[0].Key },
 		"duplicate object": func(h *Head) { h.Deltas[1].Key = h.Deltas[0].Key },
 	}
+	tailCases := map[string]func(h *Head){
+		"tail on genesis-only head": func(h *Head) {
+			h.Deltas = nil
+			h.Snapshot = ref(h.Key, h.Incarnation, 0, 1, 13, 0, h.Tail.PreChecksum, 0)
+		},
+		"tail on base-0 refs only": func(h *Head) {
+			h.Deltas = h.Deltas[1:]
+			h.Snapshot = ref(h.Key, h.Incarnation, 0, 1, 12, 0, h.Deltas[0].PreChecksum, 0)
+			h.Deltas[0] = ref(h.Key, h.Incarnation, 0, 13, 13, h.Deltas[0].PreChecksum, h.Deltas[0].PostChecksum, 0)
+		},
+		"tail gap":            func(h *Head) { h.Tail = tail(15, 15, h.Tail.PreChecksum, h.DatabaseChecksum, 100) },
+		"tail overlap":        func(h *Head) { h.Tail = tail(13, 15, h.Tail.PreChecksum, h.DatabaseChecksum, 100) },
+		"tail pre checksum":   func(h *Head) { h.Tail = tail(14, 15, ChecksumFlag|0x99, h.DatabaseChecksum, 100) },
+		"tail zero pre":       func(h *Head) { h.Tail = tail(14, 15, 0, h.DatabaseChecksum, 100) },
+		"tail short of head":  func(h *Head) { h.Sequence = 16 },
+		"tail past head":      func(h *Head) { h.Tail = tail(14, 16, h.Tail.PreChecksum, h.DatabaseChecksum, 100) },
+		"tail post checksum":  func(h *Head) { h.DatabaseChecksum = ChecksumFlag | 0x66 },
+		"tail post flag":      func(h *Head) { h.Tail.PostChecksum, h.DatabaseChecksum = 0x55, 0x55 },
+		"tail reversed range": func(h *Head) { h.Tail.MinSequence, h.Tail.MaxSequence = 15, 14 },
+		"tail bytes":          func(h *Head) { h.Tail.Bytes++ },
+		"tail sha":            func(h *Head) { h.Tail.SHA256[0] ^= 1 },
+		"tail data":           func(h *Head) { h.Tail.Data[0] ^= 1 },
+		"tail empty":          func(h *Head) { h.Tail = tail(14, 15, h.Tail.PreChecksum, h.DatabaseChecksum, 0) },
+		"tail nil data":       func(h *Head) { h.Tail.Data, h.Tail.Bytes = nil, 0 },
+		"tail over inline": func(h *Head) {
+			h.Tail = tail(14, 15, h.Tail.PreChecksum, h.DatabaseChecksum, InlineBytes+1)
+		},
+		"tail duplicates delta": func(h *Head) {
+			h.Tail = tail(13, 13, h.Deltas[0].PostChecksum, h.Deltas[1].PostChecksum, 100)
+			h.Sequence, h.DatabaseChecksum = 13, h.Deltas[1].PostChecksum
+		},
+	}
+	h := tailFixture()
+	if err := h.Validate(); err != nil {
+		t.Fatalf("tail fixture: %v", err)
+	}
+	h.Tail = tail(14, 15, h.Tail.PreChecksum, h.DatabaseChecksum, InlineBytes)
+	if _, err := h.Encode(); err != nil {
+		t.Fatalf("tail of InlineBytes rejected: %v", err)
+	}
+	for name, mutate := range tailCases {
+		cases[name] = mutate
+	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			h := fixture()
+			if strings.HasPrefix(name, "tail") {
+				h = tailFixture()
+			}
 			mutate(&h)
 			if err := h.Validate(); err == nil {
 				t.Fatal("accepted")
@@ -299,7 +415,7 @@ func TestNamespaceAndBirth(t *testing.T) {
 
 func TestMaxHeadFits(t *testing.T) {
 	// The largest valid head (512-byte key of control characters, 32 deltas
-	// at maximal integers) must fit the 64 KiB format limit.
+	// at maximal integers, a tail of InlineBytes) must fit the 64 KiB limit.
 	h := fixture()
 	h.Key = strings.Repeat("\x01", MaxKeyBytes)
 	h.Owner.Node = strings.Repeat("\x01", MaxNodeBytes)
@@ -309,10 +425,12 @@ func TestMaxHeadFits(t *testing.T) {
 	h.Snapshot.Bytes = MaxObjectBytes
 	h.Deltas = nil
 	for i := uint64(0); i < MaxDeltas; i++ {
-		r := ref(h.Key, h.Incarnation, MaxInt-1, MaxInt-MaxDeltas+1+i, MaxInt-MaxDeltas+1+i, c, c, MaxLevel)
+		r := ref(h.Key, h.Incarnation, MaxInt-1, MaxInt-MaxDeltas+i, MaxInt-MaxDeltas+i, c, c, MaxLevel)
 		r.Bytes = MaxObjectBytes
 		h.Deltas = append(h.Deltas, r)
 	}
+	h.Snapshot.MaxSequence = MaxInt - MaxDeltas - 1
+	h.Tail = tail(MaxInt, MaxInt, c, c, InlineBytes)
 	h.Sequence, h.DatabaseChecksum = MaxInt, c
 	b := mustEncode(t, h)
 	if _, err := Decode(b); err != nil {
@@ -361,6 +479,72 @@ func TestSuccessor(t *testing.T) {
 		}
 		if err := Successor(&prev, &n); err != nil {
 			t.Errorf("%s: rejected: %v", name, err)
+		}
+	}
+
+	// D16: prev carries tail 14..15; every same-sequence successor keeps it
+	// byte-identical, except a snapshot, which empties it.
+	tprev := tailFixture()
+	c6 := ChecksumFlag | 0x66
+	carry := func(f func(n *Head)) func() Head {
+		return func() Head { n := tailFixture(); n.Revision, n.Nonce = 6, id(5); f(&n); return n }
+	}
+	inline := carry(func(n *Head) { // compact(tail, delta 16) stays inline
+		n.Tail = tail(14, 16, n.Tail.PreChecksum, c6, 200)
+		n.Sequence, n.DatabaseChecksum = 16, c6
+	})
+	tailOK := map[string]func() Head{
+		"inline mutation": inline,
+		"flush to delta": carry(func(n *Head) {
+			n.Deltas = append(n.Deltas, ref(n.Key, n.Incarnation, 5, 14, 16, n.Tail.PreChecksum, c6, 0))
+			n.Tail, n.Sequence, n.DatabaseChecksum = nil, 16, c6
+		}),
+		"takeover": carry(func(n *Head) { n.Epoch, n.Owner = 3, &Owner{Node: "node-c", Session: id(6)} }),
+		"release":  carry(func(n *Head) { n.Epoch, n.Owner = 3, nil }),
+		"fence":    carry(func(n *Head) {}),
+		"compaction": carry(func(n *Head) {
+			n.Deltas = []Ref{ref(n.Key, n.Incarnation, 5, 11, 13, n.Snapshot.PostChecksum, n.Tail.PreChecksum, 1)}
+		}),
+		"snapshot": carry(func(n *Head) {
+			n.Snapshot = ref(n.Key, n.Incarnation, 5, 1, 15, 0, n.DatabaseChecksum, 0)
+			n.Deltas, n.Tail = nil, nil
+		}),
+	}
+	for name, mk := range tailOK {
+		n := mk()
+		if err := n.Validate(); err != nil {
+			t.Fatalf("tail %s: invalid fixture: %v", name, err)
+		}
+		if err := Successor(&tprev, &n); err != nil {
+			t.Errorf("tail %s: rejected: %v", name, err)
+		}
+	}
+	tailBad := map[string]func() Head{
+		"takeover rewrites tail bytes": carry(func(n *Head) {
+			n.Epoch, n.Owner = 3, &Owner{Node: "node-c", Session: id(6)}
+			n.Tail = tail(14, 15, n.Tail.PreChecksum, n.Tail.PostChecksum, 101)
+		}),
+		"fence moves tail into a delta": carry(func(n *Head) {
+			n.Deltas = append(n.Deltas, ref(n.Key, n.Incarnation, 5, 14, 15, n.Tail.PreChecksum, n.Tail.PostChecksum, 0))
+			n.Tail = nil
+		}),
+		"compaction swallows tail": carry(func(n *Head) {
+			n.Deltas = []Ref{ref(n.Key, n.Incarnation, 5, 11, 15, n.Snapshot.PostChecksum, n.DatabaseChecksum, 1)}
+			n.Tail = nil
+		}),
+		"inline mutation by new owner": func() Head {
+			n := inline()
+			n.Epoch, n.Owner = 3, &Owner{Node: "node-c", Session: id(6)}
+			return n
+		},
+	}
+	for name, mk := range tailBad {
+		n := mk()
+		if err := n.Validate(); err != nil {
+			t.Fatalf("tail %s: invalid fixture: %v", name, err)
+		}
+		if err := Successor(&tprev, &n); err == nil {
+			t.Errorf("tail %s: accepted", name)
 		}
 	}
 	bad := map[string]func() Head{
@@ -416,6 +600,10 @@ func TestSuccessor(t *testing.T) {
 	if err := CheckGenesis(&prev); err == nil {
 		t.Error("non-genesis accepted")
 	}
+	g.Tail = tail(11, 11, g.DatabaseChecksum, g.DatabaseChecksum, 1)
+	if err := CheckGenesis(&g); err == nil {
+		t.Error("genesis with a tail accepted")
+	}
 }
 
 func FuzzHeadDecode(f *testing.F) {
@@ -424,6 +612,12 @@ func FuzzHeadDecode(f *testing.F) {
 	f.Add(b)
 	h.Owner, h.Deltas = nil, nil
 	h.Sequence, h.DatabaseChecksum = 10, h.Snapshot.PostChecksum
+	b, _ = h.Encode()
+	f.Add(b)
+	b, _ = tailFixture().Encode()
+	f.Add(b)
+	h = tailFixture()
+	h.Tail = tail(14, 15, h.Tail.PreChecksum, h.DatabaseChecksum, 1)
 	b, _ = h.Encode()
 	f.Add(b)
 	f.Add([]byte(`{"format":1}`))

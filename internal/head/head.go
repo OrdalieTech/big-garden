@@ -35,6 +35,7 @@ const (
 	MaxNodeBytes   = 128
 	MaxInt         = 1<<63 - 1                      // revisions, epochs, sequences
 	MaxObjectBytes = MaxPages*(PageSize+64) + 1<<20 // LTX frame overhead plus index
+	InlineBytes    = 31 << 10                       // largest inline tail (raw LTX bytes), D16
 	ChecksumFlag   = Checksum(1 << 63)              // set on every LTX database checksum
 	maxHeadBytes   = 64 << 10
 	maxBirthBytes  = 4 << 10
@@ -136,6 +137,7 @@ type Head struct {
 	DatabaseChecksum Checksum `json:"database_checksum"`
 	Snapshot         Ref      `json:"snapshot"`
 	Deltas           []Ref    `json:"deltas"`
+	Tail             *Tail    `json:"tail"`
 }
 
 // Owner identifies the session allowed to publish; nil in a Head means
@@ -156,6 +158,26 @@ type Ref struct {
 	PreChecksum  Checksum `json:"pre_checksum"`
 	PostChecksum Checksum `json:"post_checksum"`
 	Level        uint32   `json:"level"`
+}
+
+// Tail is one LTX delta stored inline in the head (D16): the last link of the
+// chain, after the delta refs, ending at the head's sequence. Data encodes as
+// standard padded base64; nil in a Head means no tail.
+type Tail struct {
+	SHA256       Digest   `json:"sha256"`
+	Bytes        uint64   `json:"bytes"`
+	MinSequence  uint64   `json:"min_sequence"`
+	MaxSequence  uint64   `json:"max_sequence"`
+	PreChecksum  Checksum `json:"pre_checksum"`
+	PostChecksum Checksum `json:"post_checksum"`
+	Data         []byte   `json:"data"`
+}
+
+// Ref returns the tail as a key-less Ref (no key, base revision or level) for
+// code that checks and applies an LTX by its hash, length, range and checksums.
+func (t *Tail) Ref() Ref {
+	return Ref{SHA256: t.SHA256, Bytes: t.Bytes, MinSequence: t.MinSequence, MaxSequence: t.MaxSequence,
+		PreChecksum: t.PreChecksum, PostChecksum: t.PostChecksum}
 }
 
 // DecodeNamespace strictly decodes and validates namespace.json.
@@ -297,9 +319,10 @@ func (h *Head) Validate() error {
 		}
 	}
 	prefix := ObjectPrefix(h.Key, h.Incarnation)
-	seen := make(map[string]bool, 1+len(h.Deltas))
-	next, chk := uint64(1), Checksum(0) // the snapshot starts at 1 from an empty database
-	for i, r := range append([]Ref{h.Snapshot}, h.Deltas...) {
+	refs := append([]Ref{h.Snapshot}, h.Deltas...)
+	seen := make(map[string]bool, len(refs))
+	uploaded := false // some ref at base >= 1: a used head always leaves an object (D16, D5)
+	for i, r := range refs {
 		if err := r.validate(prefix, h.Revision); err != nil {
 			return fmt.Errorf("ref %d: %w", i, err)
 		}
@@ -307,6 +330,21 @@ func (h *Head) Validate() error {
 			return fmt.Errorf("ref %d: duplicate object %s", i, r.Key)
 		}
 		seen[r.Key] = true
+		uploaded = uploaded || r.BaseRevision >= 1
+	}
+	if t := h.Tail; t != nil {
+		switch err := t.Ref().span(InlineBytes); {
+		case err != nil:
+			return fmt.Errorf("tail: %w", err)
+		case uint64(len(t.Data)) != t.Bytes || sha256.Sum256(t.Data) != t.SHA256:
+			return errors.New("tail: data disagrees with bytes or sha256")
+		case !uploaded:
+			return errors.New("tail without a ref at base revision >= 1")
+		}
+		refs = append(refs, t.Ref())
+	}
+	next, chk := uint64(1), Checksum(0) // the snapshot starts at 1 from an empty database
+	for i, r := range refs {
 		if r.MinSequence != next || r.PreChecksum != chk {
 			return fmt.Errorf("ref %d: breaks the chain at sequence %d", i, next)
 		}
@@ -327,22 +365,30 @@ func (r Ref) validate(prefix string, revision uint64) error {
 		return errors.New("key disagrees with base_revision or sha256")
 	case r.BaseRevision >= revision:
 		return fmt.Errorf("base revision %d not below head revision %d", r.BaseRevision, revision)
-	case r.Bytes == 0 || r.Bytes > MaxObjectBytes:
-		return fmt.Errorf("object size %d outside 1..%d", r.Bytes, MaxObjectBytes)
+	case r.Level > MaxLevel:
+		return fmt.Errorf("level %d exceeds %d", r.Level, MaxLevel)
+	}
+	return r.span(MaxObjectBytes)
+}
+
+// span checks the size, sequence range and checksum flags of one LTX.
+func (r Ref) span(maxBytes uint64) error {
+	switch {
+	case r.Bytes == 0 || r.Bytes > maxBytes:
+		return fmt.Errorf("object size %d outside 1..%d", r.Bytes, maxBytes)
 	case r.MinSequence == 0 || r.MinSequence > r.MaxSequence || r.MaxSequence > MaxInt:
 		return fmt.Errorf("bad sequence range %d..%d", r.MinSequence, r.MaxSequence)
 	case r.PostChecksum&ChecksumFlag == 0 || (r.PreChecksum != 0 && r.PreChecksum&ChecksumFlag == 0):
 		return errors.New("checksum lacks the LTX checksum flag")
-	case r.Level > MaxLevel:
-		return fmt.Errorf("level %d exceeds %d", r.Level, MaxLevel)
 	}
 	return nil
 }
 
 // CheckGenesis checks the extra invariants of a head created by Create or
-// Import: revision 1, epoch 1, an owner, no deltas, snapshot at base 0.
+// Import: revision 1, epoch 1, an owner, no deltas or tail, snapshot at base 0.
 func CheckGenesis(h *Head) error {
-	if h.Revision != 1 || h.Epoch != 1 || h.Owner == nil || len(h.Deltas) != 0 || h.Snapshot.BaseRevision != 0 {
+	if h.Revision != 1 || h.Epoch != 1 || h.Owner == nil || len(h.Deltas) != 0 || h.Tail != nil ||
+		h.Snapshot.BaseRevision != 0 {
 		return errors.New("not a genesis head")
 	}
 	return nil
@@ -350,12 +396,15 @@ func CheckGenesis(h *Head) error {
 
 // Successor checks that next is a legal replacement of prev (both already
 // valid): same identity, revision+1, fresh nonce, epoch+1 exactly when the
-// owner changes, data changes only by the unchanged owner, and the
-// no-resurrection rule: every ref is carried over unchanged from prev or was
-// produced under base revision prev.Revision.
+// owner changes, data changes only by the unchanged owner, the tail carried
+// byte-identical unless the data changes or a snapshot (no deltas) empties it,
+// and the no-resurrection rule: every ref is carried over unchanged from prev
+// or was produced under base revision prev.Revision.
 func Successor(prev, next *Head) error {
 	sameOwner := (prev.Owner == nil && next.Owner == nil) ||
 		(prev.Owner != nil && next.Owner != nil && *prev.Owner == *next.Owner)
+	sameTail := (prev.Tail == nil && next.Tail == nil) || (prev.Tail != nil && next.Tail != nil &&
+		prev.Tail.Ref() == next.Tail.Ref() && bytes.Equal(prev.Tail.Data, next.Tail.Data))
 	switch {
 	case next.Namespace != prev.Namespace || next.Key != prev.Key || next.Incarnation != prev.Incarnation:
 		return errors.New("identity changed")
@@ -368,6 +417,8 @@ func Successor(prev, next *Head) error {
 	case next.Sequence == prev.Sequence && (next.Schema != prev.Schema ||
 		next.DatabaseChecksum != prev.DatabaseChecksum || next.PageCount != prev.PageCount):
 		return errors.New("data changed without a new sequence")
+	case next.Sequence == prev.Sequence && !sameTail && !(next.Tail == nil && len(next.Deltas) == 0):
+		return errors.New("tail changed without a new sequence or a snapshot")
 	case next.Sequence > prev.Sequence && (!sameOwner || next.Owner == nil):
 		return errors.New("data changed by a non-owner")
 	}
