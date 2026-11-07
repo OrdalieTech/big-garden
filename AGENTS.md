@@ -4,6 +4,7 @@ Generic Go library: durable SQLite entities over S3. `docs/PLAN.md` is the contr
 
 ## Rules
 
+- **Ambitious within scope.** The owner wants everything in the plan done now: do not defer fixes, tests or in-scope features to "later" or to a follow-up; implement and verify them in your workstream. Only out-of-plan features stay out.
 - **Minimal code.** Reuse before adding, and never add speculative abstractions, registries, options frameworks or hooks. Every production line counts against the PLAN §12.1 budget.
 - **No implicit state machines.** Write straight-line functions under the entity mutex (DECISIONS D8). Prefer close-and-rehydrate over repair.
 - **Safety assertions are not negotiable.** Never weaken a test, widen an allowed outcome, raise a limit or skip a check to turn red into green. If a test is wrong, explain why against the contract in the commit message.
