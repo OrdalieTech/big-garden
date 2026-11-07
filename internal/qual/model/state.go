@@ -192,7 +192,6 @@ type Proc struct {
 	W                        [2]int8 // waited message slots + 1
 	Hedged, Redo, Applied    bool
 	Acked, Resume, Flag      bool
-	CurOK                    bool
 	Act                      ID // nonce of the head being activated
 	Put, Tk, Loops           int8
 	Seq                      int8 // result sequence of a committed candidate

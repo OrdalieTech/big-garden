@@ -121,7 +121,7 @@ func (k *canon) proc(p *Proc) {
 			k.i8(k.pos[w-1])
 		}
 	}
-	for _, f := range []bool{p.Hedged, p.Redo, p.Applied, p.Acked, p.Resume, p.Flag, p.CurOK} {
+	for _, f := range []bool{p.Hedged, p.Redo, p.Applied, p.Acked, p.Resume, p.Flag} {
 		k.bit(f)
 	}
 	k.b = append(k.b, uint8(p.Put), uint8(p.Tk), uint8(p.Loops), uint8(p.Seq), uint8(p.Pend), uint8(p.PendSeq), uint8(p.ObsOwner))

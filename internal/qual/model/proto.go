@@ -126,6 +126,7 @@ const (
 	pcColGot
 	pcColList
 	pcColDel
+	pcCrBegin
 	pcCrHead
 	pcCrBirthX
 	pcCrReplay
@@ -552,9 +553,12 @@ func (x *px) run(ev, res uint8) {
 		x.wait(pcColDel, Msg{Kind: mDel, Obj: Obj{Att: att}})
 
 	// §5 Create.
+	case pcCrBegin:
+		if x.settled() {
+			x.getHead(pcCrHead)
+		}
 	case pcCrHead:
 		if res == rOK {
-			p.CurOK = true
 			x.wait(pcCrBirthX, Msg{Kind: mGetBirth})
 			return
 		}
@@ -694,7 +698,7 @@ func (x *px) start() {
 			x.finish(out{code: cIDExpired, def: true})
 			return
 		}
-		x.getHead(pcCrHead)
+		x.settle(pcCrBegin) // §2 rule 5: an earlier unresolved candidate first
 	}
 }
 
