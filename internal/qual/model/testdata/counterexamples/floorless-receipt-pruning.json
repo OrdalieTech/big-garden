@@ -49,15 +49,7 @@
         0,
         0
       ],
-      "desc": " 6. store applies m0 PUT object #10 base 2 seq 3..3 from n0 (reply delivered)"
-    },
-    {
-      "t": [
-        2,
-        0,
-        0
-      ],
-      "desc": " 7. store applies m0 CAS head rev 3 nonce #11 owner n0 epoch 1 [r0 r1- r2] schema=1 floor=0, If-Match #8 from n0 (reply delivered)"
+      "desc": " 6. store applies m0 CAS head rev 3 nonce #10 owner n0 epoch 1 [r0 r1- r2] schema=1 floor=0, If-Match #8 from n0 (reply delivered)"
     },
     {
       "t": [
@@ -65,7 +57,7 @@
         0,
         1
       ],
-      "desc": " 8. n0 clock jumps to 1"
+      "desc": " 7. n0 clock jumps to 1"
     },
     {
       "t": [
@@ -73,7 +65,7 @@
         1,
         0
       ],
-      "desc": " 9. client invokes r1 update on n0 (entity 0, id 2 hash 1 ts 1)"
+      "desc": " 8. client invokes r1 update on n0 (entity 0, id 2 hash 1 ts 1)"
     },
     {
       "t": [
@@ -81,15 +73,7 @@
         0,
         0
       ],
-      "desc": "10. store applies m0 PUT object #13 base 3 seq 4..4 from n0 (reply delivered)"
-    },
-    {
-      "t": [
-        2,
-        0,
-        0
-      ],
-      "desc": "11. store applies m0 CAS head rev 4 nonce #14 owner n0 epoch 1 [r0 r1- r2 r1] schema=1 floor=0, If-Match #11 from n0 (reply delivered)"
+      "desc": " 9. store applies m0 CAS head rev 4 nonce #12 owner n0 epoch 1 [r0 r1- r2 r1] schema=1 floor=0, If-Match #10 from n0 (reply delivered)"
     }
   ]
 }

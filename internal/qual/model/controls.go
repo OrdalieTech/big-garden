@@ -10,6 +10,8 @@ func controlCase(v Variant) *Case {
 		return caseG()
 	case D5NoIdentity:
 		return caseC0()
+	case TailWithoutObject:
+		return caseCD()
 	}
 	return caseP()
 }

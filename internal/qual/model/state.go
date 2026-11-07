@@ -43,6 +43,7 @@ const (
 	maxObjs   = 16
 	maxDeltas = 4 // model delta cap (production 32)
 	fanout    = 2 // model compaction fanout (production 8)
+	tailCap   = 2 // sequences an inline tail may span (stands for InlineBytes, D16)
 	maxOps    = 8 // ledger capacity (Kept is a uint8 mask)
 	maxReqs   = 16
 	maxSeen   = 8
@@ -68,6 +69,13 @@ type Ref struct {
 	Min, Max, Level int8
 }
 
+// Tail is the D16 inline delta: the last link of the chain, carried inside the
+// head and never an object. Max == 0 means no tail.
+type Tail struct {
+	Min, Max  int8
+	Pre, Post Image
+}
+
 // Head is the CAS-replaced entity head. Its ETag is its nonce: the store's token
 // is content-derived, and the nonce makes every rewrite's content unique.
 type Head struct {
@@ -79,6 +87,7 @@ type Head struct {
 	Img              Image
 	Snap             Ref
 	Deltas           [maxDeltas]Ref
+	Tail             Tail
 }
 
 // Obj is an immutable LTX object: content is fixed by Att; Present tracks
@@ -263,13 +272,14 @@ const (
 	HedgeNoResolve
 	D5NoIdentity
 	RetargetCompaction
+	TailWithoutObject
 	numVariants
 )
 
 var variantNames = [...]string{
 	"correct", "unconditional-head-write", "owner-check-then-publish", "cached-strong-read",
 	"premature-ack", "floorless-receipt-pruning", "age-only-gc", "hedge-without-resolve",
-	"d5-resume-without-identity", "compaction-retargeted",
+	"d5-resume-without-identity", "compaction-retargeted", "inline-tail-without-object",
 }
 
 func (v Variant) String() string { return variantNames[v] }

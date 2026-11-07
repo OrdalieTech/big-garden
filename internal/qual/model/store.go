@@ -247,6 +247,8 @@ func (w *world) checkWrite(e int, nh Head, node int8, sess ID) {
 	switch {
 	case img.Seq == oi.Seq && *img != *oi:
 		w.fail("G7: data changed without a sequence advance (%s -> %s)", imgString(oi), imgString(img))
+	case img.Seq == oi.Seq && nh.Tail != old.Tail:
+		w.fail("G7: inline tail changed without a sequence advance")
 	case img.Seq != oi.Seq && img.Seq != oi.Seq+1:
 		w.fail("G1: sequence %d replaced by %d", oi.Seq, img.Seq)
 	case img.Seq == oi.Seq+1 && (!extends(img, oi) || img.Floor < oi.Floor):
@@ -316,6 +318,13 @@ func (w *world) checkChain(e int, h *Head) {
 			return
 		}
 		post, max = d.Post, d.Max
+	}
+	if t := h.Tail; t.Max != 0 { // D16: the inline tail is the last link
+		if t.Min != max+1 || t.Pre != post {
+			w.fail("G6: head revision %d names a tail that does not follow its refs", h.Rev)
+			return
+		}
+		post, max = t.Post, t.Max
 	}
 	if max != h.Img.Seq || post != h.Img {
 		w.fail("G6: head revision %d chain ends at %s, head says %s", h.Rev, imgString(&post), imgString(&h.Img))

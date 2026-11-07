@@ -73,6 +73,12 @@ func (k *canon) head(h *Head) {
 	for i := int8(0); i < h.ND; i++ { // refs beyond ND are always zero
 		k.ref(&h.Deltas[i])
 	}
+	k.i8(h.Tail.Max)
+	if h.Tail.Max != 0 {
+		k.i8(h.Tail.Min)
+		k.img(&h.Tail.Pre)
+		k.img(&h.Tail.Post)
+	}
 }
 
 func (k *canon) obj(o *Obj) {

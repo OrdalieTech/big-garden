@@ -374,18 +374,7 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cUnavailable, def: true})
 			return
 		}
-		h := x.m.H
-		next := h
-		next.Rev++
-		next.Nonce = x.fresh()
-		next.Img = x.m.Img
-		if p.O.Snap {
-			next.Snap, next.ND, next.Deltas = ref(p.O), 0, [maxDeltas]Ref{}
-		} else {
-			next.Deltas[next.ND] = ref(p.O)
-			next.ND++
-		}
-		x.publish(Cand{Kind: p.Kind, Req: p.Req + 1, Att: p.O.Att, Base: h, Next: next}, pcUpdDone)
+		x.publishUpdate(false)
 	case pcUpdDone, pcCrDone:
 		if p.Res == sCommitted {
 			x.finish(out{code: cOK, seq: p.Seq})
@@ -934,13 +923,62 @@ func (x *px) admit() {
 		p.Acked = true
 	}
 	h := x.m.H
-	o := Obj{Att: x.fresh(), Inc: h.Inc, Base: h.Rev, Min: ni.Seq, Max: ni.Seq, Stamp: x.clock(),
-		Present: true, Pre: img, Post: ni}
-	if h.ND == maxDeltas { // cap: publish a snapshot instead
-		o.Snap, o.Min, o.Pre = true, 1, Image{}
+	t := tailOf(&h, &ni)
+	switch {
+	case h.ND == maxDeltas: // cap: publish a snapshot instead
+		p.O = Obj{Snap: true, Min: 1, Max: ni.Seq, Post: ni}
+	case t.Max-t.Min < tailCap && (hasBaseRef(&h) || x.v == TailWithoutObject):
+		x.publishUpdate(true) // D16: single CAS carrying the inline tail
+		return
+	default: // upload tail+delta as one ordinary delta
+		p.O = Obj{Min: t.Min, Max: t.Max, Pre: t.Pre, Post: t.Post}
 	}
-	p.O, p.Put = o, 0
-	x.wait(pcUpdPut, Msg{Kind: mPutObj, Obj: o})
+	p.O.Att, p.O.Inc, p.O.Base, p.O.Stamp, p.O.Present = x.fresh(), h.Inc, h.Rev, x.clock(), true
+	p.Put = 0
+	x.wait(pcUpdPut, Msg{Kind: mPutObj, Obj: p.O})
+}
+
+// tailOf is compact(H.tail, delta) for the mutation producing ni (D16).
+func tailOf(h *Head, ni *Image) Tail {
+	t := Tail{Min: ni.Seq, Max: ni.Seq, Pre: h.Img, Post: *ni}
+	if h.Tail.Max != 0 {
+		t.Min, t.Pre = h.Tail.Min, h.Tail.Pre
+	}
+	return t
+}
+
+func hasBaseRef(h *Head) bool {
+	for _, r := range headRefs(h) {
+		if r.Base >= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// publishUpdate is §6 step 9: the next head with the inline tail, or with the
+// uploaded delta appended (or the cap snapshot) and no tail.
+func (x *px) publishUpdate(inline bool) {
+	p := x.p
+	h := x.m.H
+	next := h
+	next.Rev++
+	next.Nonce = x.fresh()
+	next.Img = x.m.Img
+	c := Cand{Kind: p.Kind, Req: p.Req + 1, Base: h}
+	switch {
+	case inline:
+		next.Tail = tailOf(&h, &x.m.Img)
+	case p.O.Snap:
+		next.Snap, next.ND, next.Deltas, next.Tail = ref(p.O), 0, [maxDeltas]Ref{}, Tail{}
+		c.Att = p.O.Att
+	default:
+		next.Deltas[next.ND] = ref(p.O)
+		next.ND++
+		next.Tail, c.Att = Tail{}, p.O.Att
+	}
+	c.Next = next
+	x.publish(c, pcUpdDone)
 }
 
 func (x *px) readExec() {

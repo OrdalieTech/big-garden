@@ -27,7 +27,7 @@ func model(args []string) error {
 	exhaustive := fs.Bool("exhaustive-bounded", false, "explore the bounded cases exhaustively")
 	cases := fs.String("cases", "P,O,G,I,C,C0", "bounded cases to explore")
 	traces := fs.Uint64("random-traces", 0, "seeded random traces of the random configuration")
-	deletion := fs.Bool("head-deletion", true, "random configuration may delete a head administratively (G6; see finding F1)")
+	deletion := fs.Bool("head-deletion", true, "random configuration may delete a head administratively while no create of it is in flight (G6 scope of DECISIONS D14)")
 	seed := fs.Uint64("seed", 20261107, "random seed")
 	negatives := fs.String("negative-controls", "", `"all", or a comma-separated list of broken variants`)
 	out := fs.String("out", "", "output directory (model.json and counterexamples/)")

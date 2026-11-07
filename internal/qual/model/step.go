@@ -113,7 +113,7 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 		}
 	}
 	for e := 0; e < c.Ents; e++ {
-		if int(s.Losses) < c.Losses && s.Ents[e].HasHead {
+		if int(s.Losses) < c.Losses && s.Ents[e].HasHead && !(c.LossAtRest && createInFlight(c, s, e)) {
 			buf = append(buf, Tr{tLoss, uint8(e), 0})
 		}
 	}
@@ -216,6 +216,24 @@ func step(c *Case, v Variant, s *State, t Tr, cov *coverage) (bound uint8, viol 
 		cov[w.fin[0]][w.fin[1]]++
 	}
 	return 0, w.viol
+}
+
+// createInFlight reports whether a create of entity e could still publish a
+// genesis: a running Create, an in-flight birth PUT or genesis CAS (abandoned
+// ones included), or an unresolved genesis candidate in some node's memory.
+func createInFlight(c *Case, s *State, e int) bool {
+	for n := 0; n < c.Nodes; n++ {
+		if s.Procs[n][e][0].Kind == kCreate || (s.Mem[n][e].Unres && s.Mem[n][e].C.Genesis) {
+			return true
+		}
+	}
+	for i := range s.Msgs {
+		m := &s.Msgs[i]
+		if m.Kind != 0 && int(m.Ent) == e && (m.Kind == mPutBirth || (m.Kind == mCAS && m.Cond == 0)) {
+			return true
+		}
+	}
+	return false
 }
 
 // deliver hands message i's reply to its waiting process; a hedged twin still

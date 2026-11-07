@@ -11,13 +11,16 @@ type Case struct {
 	Msgs        int // storage requests in flight
 	Active      int // concurrent operations
 	Depth       int
-	Restarts    int    // node crash/restart events (cache loss, new session)
-	Jumps       int    // arbitrary clock changes
-	Losses      int    // administrative head deletions (G6)
-	Hedges      int    // duplicate CAS sends (D3)
-	Clocks      []int8 // values a clock jump may set
-	Retention   int8   // ReceiptRetention in clock units
-	Age         int8   // age threshold of the age-only GC control
+	Restarts    int // node crash/restart events (cache loss, new session)
+	Jumps       int // arbitrary clock changes
+	Losses      int // administrative head deletions (G6)
+	// LossAtRest allows a deletion only while no create of the key is in
+	// flight, the scope in which DECISIONS D14 keeps G6's missing-head clause.
+	LossAtRest bool
+	Hedges     int    // duplicate CAS sends (D3)
+	Clocks     []int8 // values a clock jump may set
+	Retention  int8   // ReceiptRetention in clock units
+	Age        int8   // age threshold of the age-only GC control
 	// Split delivers replies as separate transitions. Bounded cases deliver a
 	// reply at its request's apply point instead, with per-request client
 	// abandonment and orphans that may still apply later. That is complete: a
@@ -32,11 +35,12 @@ type Case struct {
 
 const all = 0xff
 
-// Cases returns the M1 bounded cases P, O, G, I (PLAN §14), C, which covers
-// Create, the D5 resume and an administrative head deletion, and C0, which is
-// C without the deletion.
+// Cases returns the M1 bounded cases P, O, G, I (PLAN §14) and three creation
+// cases: C (Create, the D5 resume and an administrative head deletion at any
+// time: finding F1, accepted by D14), C0 (no deletion) and CD (deletion only
+// while no create of the key is in flight, D14's scope).
 func Cases() []*Case {
-	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0()}
+	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -151,11 +155,21 @@ func caseC0() *Case {
 	return c
 }
 
+// CD is C with the head deletion restricted to D14's scope: no create of the
+// key in flight. G6 must hold; D5's LIST check and D16's object-before-tail
+// rule are what make it hold.
+func caseCD() *Case {
+	c := caseC()
+	c.Name, c.LossAtRest = "CD", true
+	return c
+}
+
 // CaseR is the random-trace configuration: entity 0 exists with a two-delta
 // root, entity 1 does not; every operation kind is in the pool.
 func CaseR(nodes, ents, active int) *Case {
 	c := &Case{Name: fmt.Sprintf("R%d%d%d", nodes, ents, active), Nodes: nodes, Ents: ents, Msgs: maxMsgs, Active: active, Depth: 150,
-		Restarts: 2, Jumps: 2, Losses: 1, Hedges: 2, Clocks: []int8{0, 1, 2, 3, 4}, Retention: 2, Age: 1, Split: true}
+		Restarts: 2, Jumps: 2, Losses: 1, Hedges: 2, Clocks: []int8{0, 1, 2, 3, 4}, Retention: 2, Age: 1, Split: true,
+		LossAtRest: true}
 	c.Reqs = []Req{
 		genesisReq(3),
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 3, Schema: 1},
