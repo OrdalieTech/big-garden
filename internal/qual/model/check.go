@@ -116,11 +116,33 @@ func (x *px) name() string {
 	return fmt.Sprintf("%s r%d at n%d", kindNames[x.r.Kind], x.p.Req, x.n)
 }
 
+// orphan marks message i as abandoned by its client. An abandoned read is
+// removed at once: applying it has no effect, and holding its slot could only
+// block other sends.
 func (w *world) orphan(i int) {
 	m := &w.s.Msgs[i]
 	m.Waited = false
-	if m.Applied {
+	if m.Applied || m.Kind <= mList {
 		*m = Msg{}
+	}
+}
+
+// sweep removes abandoned writes that can never take effect (correct protocol
+// only, where every head carries a fresh nonce, so a replaced head never comes
+// back): a conditional CAS whose ETag is no longer the head's, and a birth PUT
+// once birth.json exists (it is never deleted).
+func (w *world) sweep() {
+	for i := range w.s.Msgs {
+		m := &w.s.Msgs[i]
+		if m.Kind == 0 || m.Waited || m.Applied {
+			continue
+		}
+		en := &w.s.Ents[m.Ent]
+		switch {
+		case m.Kind == mCAS && !m.Uncond && m.Cond != 0 && (!en.HasHead || en.Head.Nonce != m.Cond),
+			m.Kind == mPutBirth && en.Birth.Present:
+			*m = Msg{}
+		}
 	}
 }
 

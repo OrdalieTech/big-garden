@@ -205,6 +205,9 @@ func Step(c *Case, v Variant, s *State, t Tr) (ok bool, viol string) {
 	if w.viol == "" {
 		w.checkState()
 	}
+	if v == Correct {
+		w.sweep()
+	}
 	return true, w.viol
 }
 
