@@ -29,20 +29,24 @@ const maxFrame = pageSize + pageSize/255 + 16
 // length, SHA-256, frame sizes, header, sequence range and checksums are
 // verified against h before and while it is applied; the final page count
 // and checksum must equal h's, the metadata row must match h and
-// integrity_check must pass. Every validation failure wraps ErrCorrupt.
-func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (*DB, error) {
+// integrity_check must pass. Every validation failure wraps ErrCorrupt. pages
+// holds the page frames of each restored object (snapshot, deltas, tail):
+// the replay pages of PROTOCOL §6 step 7.
+func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (
+	d *DB, pages []uint32, err error) {
 	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
 	if h.Tail != nil {
 		refs = append(refs, h.Tail.Ref())
 	}
 	if len(objs) != len(refs) || h.PageCount > maxPages {
-		return nil, errors.New("engine: objects do not match the head or exceed the page limit")
+		return nil, nil, errors.New("engine: objects do not match the head or exceed the page limit")
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	img, pages := Image{}, make([]uint32, len(refs))
+	img := Image{}
+	pages = make([]uint32, len(refs))
 	for i, ref := range refs {
 		if img, pages[i], err = apply(ctx, f, img, ref, objs[i]); err != nil {
 			break
@@ -56,13 +60,12 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 		err = fmt.Errorf("%w: restored image %+v (file %+v) differs from the head", ErrCorrupt, img, full)
 	}
 	if err = errors.Join(err, f.Close()); err != nil {
-		return nil, errors.Join(err, removeFiles(path))
+		return nil, nil, errors.Join(err, removeFiles(path))
 	}
-	d, err := open(ctx, drv, path, maxPages)
-	if err != nil {
-		return nil, errors.Join(err, removeFiles(path))
+	if d, err = open(ctx, drv, path, maxPages); err != nil {
+		return nil, nil, errors.Join(err, removeFiles(path))
 	}
-	d.pub, d.Pages = img, pages
+	d.pub = img
 	// integrity_check connects every virtual table whose module is
 	// registered: it runs on a second connection, from a driver without the
 	// Node's extensions, so activation never runs caller code.
@@ -71,9 +74,9 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 		err = c.check(h)
 	}
 	if err = errors.Join(err, c.close()); err != nil {
-		return nil, errors.Join(err, d.Discard())
+		return nil, nil, errors.Join(err, d.Discard())
 	}
-	return d, nil
+	return d, pages, nil
 }
 
 // Rebase rewrites the identity in the metadata row of an imported image
