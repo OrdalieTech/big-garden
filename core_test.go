@@ -1188,7 +1188,27 @@ func TestPendingPerEntity(t *testing.T) {
 	_, err := n.Update(bg, ref, newReq(t, "over", 1), put("o", "1"))
 	wantCode(t, err, CodeCapacity)
 	close(release)
+	if st := n.Stats(); st.InflightStorage < 0 || st.InflightStorage > 64 {
+		t.Fatalf("inflight %d", st.InflightStorage)
+	}
 	if err := <-queued; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestInflightStorageBound(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", func(l *Limits) { l.InflightStorage = 1 })
+	l := newLedger()
+	refs := []Ref{mustCreate(t, n, "x", l), mustCreate(t, n, "y", l)}
+	var wg sync.WaitGroup // one slot: concurrent uploads, activations and hedges must queue, never deadlock
+	for i := range 8 {
+		wg.Go(func() { mustPut(t, n, refs[i%2], fmt.Sprint("k", i), randText(40<<10), l) })
+	}
+	wg.Wait()
+	n.wg.Wait()
+	if st := n.Stats(); st.InflightStorage != 0 {
+		t.Fatalf("%d storage slots leaked", st.InflightStorage)
+	}
+	l.verify(t, mem, "a")
 }

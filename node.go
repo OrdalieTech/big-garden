@@ -47,7 +47,7 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: st, entities: map[string]*entity{}, now: time.Now}
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now}
 	if err := n.namespace(ctx); err != nil {
 		return nil, err
 	}
@@ -340,4 +340,59 @@ func engineError(err error) *Error {
 		return newError(CodeCapacity, "entity size limit reached", err)
 	}
 	return newError(CodeUnavailable, "local database", err)
+}
+
+// limited bounds the storage requests in flight to Limits.InflightStorage.
+type limited struct {
+	store.Store
+	sem chan struct{}
+}
+
+func (l limited) acquire(ctx context.Context, op, key string) error {
+	select {
+	case l.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return &store.Error{Outcome: store.Unknown, Op: op, Key: key, Err: ctx.Err()} // never sent
+	}
+}
+
+func (l limited) Get(ctx context.Context, key, ifNoneMatch string, max int64) (store.Object, error) {
+	if err := l.acquire(ctx, "get", key); err != nil {
+		return store.Object{}, err
+	}
+	defer func() { <-l.sem }()
+	return l.Store.Get(ctx, key, ifNoneMatch, max)
+}
+
+func (l limited) PutImmutable(ctx context.Context, key string, body []byte) error {
+	if err := l.acquire(ctx, "put", key); err != nil {
+		return err
+	}
+	defer func() { <-l.sem }()
+	return l.Store.PutImmutable(ctx, key, body)
+}
+
+func (l limited) PutCAS(ctx context.Context, key string, body []byte, ifMatch string) (string, error) {
+	if err := l.acquire(ctx, "cas", key); err != nil {
+		return "", err
+	}
+	defer func() { <-l.sem }()
+	return l.Store.PutCAS(ctx, key, body, ifMatch)
+}
+
+func (l limited) List(ctx context.Context, prefix, after string, limit int) ([]store.Entry, bool, error) {
+	if err := l.acquire(ctx, "list", prefix); err != nil {
+		return nil, false, err
+	}
+	defer func() { <-l.sem }()
+	return l.Store.List(ctx, prefix, after, limit)
+}
+
+func (l limited) Delete(ctx context.Context, key string) error {
+	if err := l.acquire(ctx, "delete", key); err != nil {
+		return err
+	}
+	defer func() { <-l.sem }()
+	return l.Store.Delete(ctx, key)
 }

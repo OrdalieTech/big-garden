@@ -101,7 +101,8 @@ func (n *Node) Stats() Stats {
 		}
 	}
 	n.mu.Unlock()
-	if s3, ok := n.st.(*store.S3); ok {
+	s.InflightStorage = int64(len(n.st.(limited).sem))
+	if s3, ok := n.st.(limited).Store.(*store.S3); ok {
 		k := s3.Counts()
 		s.CASAttempts, s.CASConflicts, s.AmbiguousPuts = k.CASAttempts, k.CASConflicts, k.AmbiguousPuts
 		for i := range s.Storage {
