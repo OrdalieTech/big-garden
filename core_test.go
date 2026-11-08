@@ -945,7 +945,7 @@ func TestCollect(t *testing.T) {
 	inflight := head.ObjectKey("k", h.Incarnation, h.Revision, head.NewID(), head.Digest{1}) // an upload not yet published
 	mem.PutImmutable(bg, inflight, []byte("x"))
 	mem.PutImmutable(bg, prefix+"junk", []byte("x")) // unparseable: never deleted
-	other := testNode(t, mem, "b", nil)               // any node may collect
+	other := testNode(t, mem, "b", nil)              // any node may collect
 	if err := other.Collect(bg, ref); err != nil {
 		t.Fatal(err)
 	}
