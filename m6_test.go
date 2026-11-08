@@ -7,8 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -675,4 +680,127 @@ func TestCorruptBirthAndNamespace(t *testing.T) {
 		_ = ref
 		l.verify(t, mem, "a")
 	})
+}
+
+// storeBytes is what the test store keeps in this process: the journaled
+// request bodies of a Mem (they include every object it holds).
+func storeBytes(st store.Store) uint64 {
+	var total uint64
+	if fs, ok := st.(faultStore); ok {
+		for _, a := range fs.Journal() {
+			total += uint64(len(a.Body))
+		}
+	}
+	return total
+}
+
+func dirBytes(dir string) int64 {
+	var total int64
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			if fi, err := d.Info(); err == nil {
+				total += fi.Size()
+			}
+		}
+		return nil
+	})
+	return total
+}
+
+// TestDatasetLargerThanCache cycles writes and reads over entities whose
+// total size is several times CacheBytes: the cache directory, sampled
+// continuously, never exceeds CacheBytes, the heap stays flat across cycles,
+// and every read returns the acknowledged rows.
+func TestDatasetLargerThanCache(t *testing.T) {
+	var st store.Store = storetest.NewMem()
+	if os.Getenv(storetest.MinIOEnv) != "" { // the S3 adapter without the journaling fault proxy
+		ep := storetest.MinIO(t)
+		st = store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, 2*time.Second)
+		t.Cleanup(func() {
+			for range 100 {
+				page, _, err := st.List(bg, "", "", 1000)
+				if err != nil || len(page) == 0 {
+					return
+				}
+				for _, o := range page {
+					st.Delete(bg, o.Key)
+				}
+			}
+		})
+	}
+	const entities, cycles = 48, 3
+	var dir string
+	n := testNode(t, st, "a", func(l *Limits) {
+		l.EntityBytes, l.Recoveries, l.CacheBytes = 1<<20, 1, 6<<20
+	})
+	dir = n.cfg.CacheDir
+	l := newLedger()
+	var maxDisk atomic.Int64
+	stop := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		for {
+			if b := dirBytes(dir); b > maxDisk.Load() {
+				maxDisk.Store(b)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	refs := make([]Ref, entities)
+	for i := range refs {
+		refs[i] = mustCreate(t, n, fmt.Sprint("e", i), l)
+	}
+	var heap [cycles]uint64
+	for c := range cycles {
+		for i, ref := range refs {
+			mustPut(t, n, ref, fmt.Sprint("r", c), randText(120<<10), l)
+			if got := readAll(t, n, refs[(i+entities/2)%entities]); c > 0 && len(got) < c {
+				t.Fatalf("entity %d returned %d rows in cycle %d", (i+entities/2)%entities, len(got), c)
+			}
+		}
+		n.wg.Wait()
+		for _, ref := range refs {
+			got := readAll(t, n, ref)
+			for k, v := range l.rows[ref.Key] {
+				if got[k] != v {
+					t.Fatalf("%s/%s wrong after cycle %d", ref.Key, k, c)
+				}
+			}
+		}
+		for _, ref := range refs {
+			if err := n.Collect(bg, ref); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		kept := storeBytes(st) // the test store's objects and journal live in this heap, and so do the ledger's values
+		for _, rows := range l.rows {
+			for _, v := range rows {
+				kept += uint64(len(v))
+			}
+		}
+		heap[c] = ms.HeapInuse - min(ms.HeapInuse, kept)
+	}
+	close(stop)
+	<-sampled
+	total := int64(entities * cycles * 120 << 10)
+	t.Logf("dataset ~%d MiB (hex rows), CacheBytes %d MiB, max cache dir %d KiB, heap in use minus the test store and ledger per cycle %v MiB",
+		total>>20, n.cfg.Limits.CacheBytes>>20, maxDisk.Load()>>10, []uint64{heap[0] >> 20, heap[1] >> 20, heap[2] >> 20})
+	if maxDisk.Load() > n.cfg.Limits.CacheBytes {
+		t.Fatalf("cache dir reached %d bytes > CacheBytes %d", maxDisk.Load(), n.cfg.Limits.CacheBytes)
+	}
+	if s := n.Stats(); s.CacheBytes > n.cfg.Limits.CacheBytes {
+		t.Fatalf("accounted cache bytes %d > %d", s.CacheBytes, n.cfg.Limits.CacheBytes)
+	}
+	if heap[cycles-1] > heap[0]+heap[0]/2+16<<20 {
+		t.Fatalf("heap grows with cycles: %v", heap)
+	}
+	l.verify(t, st, "a")
 }
