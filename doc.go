@@ -38,4 +38,33 @@
 // Errors are *Error values with a stable Code. CodeOutcomeUnknown means the
 // mutation may have committed: retry with the identical Request, never with
 // a new ID.
+//
+// # Ownership
+//
+// Update, Migrate, Read, Lookup and Export run only on the entity's owner
+// session. Reads too: they run on the owner's cache, validated by a head GET
+// issued after the call began, which makes them strong (linearizable) with
+// no read lease. A Node that does not own the entity, including an unowned
+// one (after Release), gets CodeNotOwner with Error.Route set;
+// Takeover(*Error.Route) claims it, then retry the identical Request.
+// CodeRouteChanged means another session moved the entity first; its
+// Error.Route is current. A Node takes over implicitly from earlier sessions
+// of its own NodeID (a restarted process), never from other NodeIDs. Close
+// does not release ownership; Release does. Resolve costs one GET: keep the
+// Ref of each key rather than resolving before every call.
+//
+//	for {
+//		res, err := n.Update(ctx, ref, req, fn) // same req on every attempt
+//		var e *garden.Error
+//		if !errors.As(err, &e) || e.Code != garden.CodeNotOwner {
+//			return res, err
+//		}
+//		if _, err := n.Takeover(ctx, *e.Route); err != nil &&
+//			(!errors.As(err, &e) || e.Code != garden.CodeRouteChanged) {
+//			return res, err
+//		} // route_changed: retry, the next not_owner carries the new route
+//	}
+//
+// A real loop bounds its attempts: two Nodes taking over from each other
+// otherwise trade the entity indefinitely.
 package garden

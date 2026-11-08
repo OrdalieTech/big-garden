@@ -32,8 +32,8 @@ type manifest struct {
 }
 
 // Export writes a snapshot of ref's validated state as a tar archive of
-// manifest.json and snapshot.ltx (PROTOCOL §11). A write error is returned
-// as is: the partial output is not a backup.
+// manifest.json and snapshot.ltx (PROTOCOL §11). It requires ownership, like
+// Read. A write error is returned as is: the partial output is not a backup.
 func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error) {
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Version{}, invalid(err.Error())
@@ -92,7 +92,8 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 // Import creates key from an Export archive (PROTOCOL §11): the archive is
 // read and validated strictly, then Create runs with kind 4 and a genesis
 // image rebased to (namespace, key, new incarnation) at manifest.sequence+1
-// with the receipts and floor preserved.
+// with the receipts and floor preserved. req.Schema must equal the archive's
+// schema, else CodeSchemaMismatch with Error.Schema set to it.
 func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader) (Ref, Result, error) {
 	if err := cmp.Or(checkRequest(key, req), n.checkClock(req)); err != nil {
 		return Ref{}, Result{}, err

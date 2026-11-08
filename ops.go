@@ -211,7 +211,8 @@ func callbackError(err, cb error) error {
 	return engineError(err)
 }
 
-// Resolve returns the current Route of key from a fresh head GET (PROTOCOL §3).
+// Resolve returns the current Route of key from a fresh head GET (PROTOCOL
+// §3). Each call costs that GET: cache Route.Ref per key.
 func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 	if err := head.ValidKey(key); err != nil {
 		return Route{}, invalid(err.Error())
@@ -234,7 +235,9 @@ func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 }
 
 // Read runs fn on the state validated by a head GET issued after the call
-// began (PROTOCOL §3).
+// began (PROTOCOL §3). It requires ownership, like Lookup and Export: the
+// owner's cache revalidated by that GET is what makes the read strong
+// (CodeNotOwner otherwise; see Ownership in the package doc).
 func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) ([]byte, error)) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
 	if err := head.ValidKey(ref.Key); err != nil {
@@ -260,7 +263,8 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	return Result{Value: v, Version: Version{e.h.Incarnation, e.h.Sequence}}, nil
 }
 
-// Lookup returns the stored outcome of id in freshly validated state.
+// Lookup returns the stored outcome of id in freshly validated state. It
+// requires ownership, like Read.
 func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
 	if err := head.ValidKey(ref.Key); err != nil {

@@ -14,6 +14,8 @@ import (
 )
 
 // Ref prevents a retry for an old/imported incarnation from reaching a new one.
+// It changes only when the key is recreated: keep it per key (Resolve costs a
+// GET).
 type Ref struct {
 	Key         string
 	Incarnation [16]byte
@@ -34,13 +36,23 @@ type Route struct {
 }
 
 // MutationID is 8-byte big-endian Unix ms + 16 cryptographic random bytes.
+// Its time must be at most 5 minutes ahead of the Node's clock
+// (invalid_argument) and within Limits.ReceiptRetention of it (id_expired),
+// both checked when a mutation is admitted. The caller generates and keeps
+// the ID: for a client idempotency key, call NewMutationID once when the key
+// is first seen, store the ID with the key, and send the same Request on
+// every retry, even after a restart; never generate a fresh ID for a retry.
 type MutationID [24]byte
 
 // Request is the stable identity of one mutation; reuse it unchanged to retry.
+// Hash is a SHA-256 over a canonical, unambiguous encoding (fixed field
+// order, length-prefixed or canonical JSON) of the operation name and every
+// input that determines its effect; the library binds the kind and Schema
+// itself. A reused ID with another Hash gets CodeIDConflict.
 type Request struct {
 	ID     MutationID
-	Hash   [32]byte // caller hashes canonical operation name, input, and schema contract
-	Schema uint32
+	Hash   [32]byte // nonzero; see above
+	Schema uint32   // Create, Import: the schema stored; Update: the one expected; Migrate: the one migrated from
 }
 
 // Version names one published logical state of an entity.
@@ -67,14 +79,17 @@ type Config struct {
 	Logger   *slog.Logger // nil: no logs; else outcome_unknown and corrupt outcomes, rate-limited
 
 	// Extend, if not nil, is called once by Open with the Node's private
-	// SQLite driver, before any connection, to register SQL functions and
-	// virtual table modules (DECISIONS D19). They reach only this Node's
-	// connections; its modules may be used by CREATE VIRTUAL TABLE besides
-	// the built-in fts5, fts5vocab, rtree, rtree_i32 and geopoly. Durable
-	// state must live in the SQLite file only: a module keeps none
-	// elsewhere. Functions may be called from statements, not from schema
-	// objects (index expressions, triggers, views, CHECK, generated
-	// columns), so activation never runs caller code. Collations,
+	// SQLite driver (*sqlite.Driver of modernc.org/sqlite), before any
+	// connection, to register SQL functions and virtual table modules
+	// (DECISIONS D19). They reach only this Node's connections; its modules
+	// may be used by CREATE VIRTUAL TABLE besides the built-in fts5,
+	// fts5vocab, rtree, rtree_i32 and geopoly. Durable state must live in
+	// the SQLite file only: a module keeps none elsewhere. Functions may be
+	// called from statements, not from schema objects, so activation never
+	// runs caller code: index expressions, CHECK and generated columns
+	// using one fail at CREATE, while a trigger or view using one is
+	// accepted at CREATE and then fails each time it fires or is queried
+	// ("unsafe use of"; SQLite checks trusted_schema at use). Collations,
 	// connection hooks and names replacing a built-in function or module
 	// are refused. An error fails Open with invalid_argument.
 	Extend func(*sqlite.Driver) error

@@ -10,9 +10,22 @@ import (
 )
 
 // Limits bounds the resources of one Node. A zero field selects its
-// documented default; negative, overflowing or mutually inconsistent values
-// are rejected by Open. Protocol-format limits (64 KiB heads, 32 deltas,
-// 4 KiB pages) are fixed and not configurable here.
+// default; negative, overflowing or mutually inconsistent values are
+// rejected by Open. Protocol-format limits (64 KiB heads, 32 deltas, 4 KiB
+// pages) are fixed and not configurable here. Defaults [bounds]:
+//
+//	EntityBytes            64 MiB [4 KiB..256 MiB]  database size
+//	CacheBytes             8 GiB  local cache; >= Recoveries*(4*EntityBytes+1 MiB)
+//	ResultBytes            16 KiB [..64 KiB]        a callback's result (Result.Value)
+//	ResidentEntities       256                      open entities
+//	InflightStorage        64                       concurrent storage requests
+//	PendingPerEntity       64                       queued requests per entity
+//	Recoveries             8                        concurrent activations
+//	BatchMax               16 [..16]                mutations per publication (1: no batching)
+//	StorageAttemptTimeout  2s                       one storage request
+//	CommitTimeout          10s [>= StorageAttemptTimeout]
+//	IdleTimeout            60s                      idle entity eviction
+//	ReceiptRetention       1h [1h..720h]            receipts kept; older IDs get id_expired
 type Limits struct {
 	EntityBytes, CacheBytes                        int64
 	ResultBytes, ResidentEntities, InflightStorage int

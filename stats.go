@@ -25,7 +25,7 @@ type Stats struct {
 	ResidentEntities, QueuedRequests, InflightStorage          int64
 	CacheBytes, StagingBytes                                   int64
 	OldestUnresolved                                           time.Duration
-	Batches                                                    [maxBatch]uint64 // committed mutation publications by member count - 1
+	Batches                                                    [maxBatch]uint64 // [16]: committed publications by member count - 1
 	Storage                                                    [4]struct {
 		Attempts, Failures             uint64
 		UploadedBytes, DownloadedBytes uint64

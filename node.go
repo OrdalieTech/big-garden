@@ -41,7 +41,10 @@ type Node struct {
 	skipMaintenance bool           // tests of the §6.7 cap only
 }
 
-// Open validates cfg and opens a Node on its namespace (PROTOCOL §8).
+// Open validates cfg and opens a Node on its namespace (PROTOCOL §8). It
+// writes and deletes probe objects under <Prefix>/probe/ to check that the
+// store enforces If-None-Match and If-Match on PUT; a store that does not
+// fails Open with CodeUnsupported.
 func Open(ctx context.Context, cfg Config) (*Node, error) {
 	cfg, err := cfg.validate()
 	if err != nil {
