@@ -49,12 +49,12 @@ type mnode struct {
 	tags  int
 }
 
-func startNode(t *testing.T, ep storetest.Endpoint, name string) *mnode {
+func startNode(t *testing.T, ep storetest.Endpoint, name string, args ...string) *mnode {
 	cache, err := os.MkdirTemp("", "killnode-cache")
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := start(t, ep, cache, "", "-node", name)
+	p := start(t, ep, cache, "", append([]string{"-node", name}, args...)...)
 	m := &mnode{name: name, cache: cache, p: p, wait: map[string]chan Resp{}}
 	go func() {
 		for line := range p.lines {
@@ -121,6 +121,27 @@ func (m *mnode) kill() {
 	m.p.cmd.Process.Kill()
 	m.p.stop()
 	os.RemoveAll(m.cache)
+}
+
+// resolveAfterStall resolves key on e. While a SIGSTOPped process is stopped
+// between the headers and the body of its head CAS (If-Match PUT), the pinned
+// MinIO holds the object's lock and every GET of that head blocks until the
+// server drops the stalled request after about 30 s (measured: an
+// unconditional PUT does not block readers). The library then correctly
+// answers unavailable; this waits up to 60 s for the store to recover and
+// reports whether it had to. Any other failure is fatal.
+func resolveAfterStall(t *testing.T, e endpoint, key string) (*Rt, bool) {
+	t.Helper()
+	for deadline, waited := time.Now().Add(60*time.Second), false; ; waited = true {
+		r, ok := e.do(Req{Op: "resolve", Key: key}, 60*time.Second)
+		if ok && r.OK {
+			return r.Route, waited
+		}
+		if !ok || r.Code != "unavailable" || time.Now().After(deadline) {
+			t.Fatalf("resolve %s: %+v", key, r)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 type inproc struct{ n *garden.Node }
@@ -213,21 +234,21 @@ func (l *ledger) check(t *testing.T, ep storetest.Endpoint, key, inc string, iss
 func TestConcurrentTakeover(t *testing.T) {
 	base := storetest.MinIO(t)
 	runs := killRuns()
-	var procWins, inWins, staleAcks int
+	var procWins, inWins, staleAcks, stalls int
 	for i := range runs {
 		ep := base.Sub(fmt.Sprintf("takeover-%d", i))
-		p, n, s := takeoverRun(t, ep)
-		procWins, inWins, staleAcks = procWins+p, inWins+n, staleAcks+s
+		p, n, s, w := takeoverRun(t, ep)
+		procWins, inWins, staleAcks, stalls = procWins+p, inWins+n, staleAcks+s, stalls+w
 		clean(t, ep)
 		if t.Failed() {
 			return
 		}
 	}
-	t.Logf("%d runs x 3 rounds of 35 candidates: %d rounds won by a process, %d by an in-process node; stopped owner's in-flight add acknowledged in %d runs",
-		runs, procWins, inWins, staleAcks)
+	t.Logf("%d runs x 3 rounds of 35 candidates: %d rounds won by a process, %d by an in-process node; stopped owner's in-flight add acknowledged in %d runs; %d resolves waited for MinIO to drop a stalled CAS",
+		runs, procWins, inWins, staleAcks, stalls)
 }
 
-func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAck int) {
+func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAck, stalls int) {
 	a := startNode(t, ep, "a")
 	defer a.kill()
 	cands := map[string]endpoint{}
@@ -271,7 +292,10 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 	owner := endpoint(a)
 	ownerName := "a"
 	for round := range 3 {
-		rt := must(cands["b"], Req{Op: "resolve", Key: "k"}).Route
+		rt, waited := resolveAfterStall(t, cands["b"], "k")
+		if waited {
+			stalls++
+		}
 		if rt.Node != ownerName {
 			t.Fatalf("round %d: resolved owner %q, expected %q", round, rt.Node, ownerName)
 		}
@@ -390,7 +414,7 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 		t.Fatalf("resumed stale owner served a strong read: %+v", rd)
 	}
 	led.check(t, ep, "k", inc, issued)
-	return procWins, inWins, staleAck
+	return procWins, inWins, staleAck, stalls
 }
 
 // TestSameIDSeveralNodes sends one Request (same ID and hash) to two node
@@ -443,7 +467,7 @@ func sameIDRun(t *testing.T, ep storetest.Endpoint) (tl [4]int) {
 		return resp
 	}
 	takeover := func(name string) Resp {
-		rt := call(name, Req{Op: "resolve", Key: "k"}).Route
+		rt, _ := resolveAfterStall(t, nodes[name], "k")
 		return call(name, Req{Op: "takeover", Key: "k", Route: rt})
 	}
 	inc := call("b", Req{Op: "create", Key: "k", ID: newID()}).Inc
