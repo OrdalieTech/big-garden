@@ -29,6 +29,9 @@ type Node struct {
 	entities map[string]*entity
 	reserved int64 // cache bytes reserved by activations in progress
 	closed   bool
+
+	wg              sync.WaitGroup // maintenance steps in flight
+	skipMaintenance bool           // tests of the §6.7 cap only
 }
 
 // Open validates cfg and opens a Node on its namespace (PROTOCOL §8).
@@ -215,6 +218,7 @@ func (n *Node) Close(ctx context.Context) error {
 		es = append(es, e)
 	}
 	n.mu.Unlock()
+	n.wg.Wait()
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout)
 	defer cancel()
 	unknown := false

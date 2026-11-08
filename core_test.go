@@ -490,6 +490,7 @@ func TestRestartRecoversEverything(t *testing.T) {
 func TestSnapshotOnCap(t *testing.T) {
 	mem := storetest.NewMem()
 	n := testNode(t, mem, "a", nil)
+	n.skipMaintenance = true // §9 would compact long before the §6.7 cap
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
 	snapshots := 0
@@ -874,5 +875,58 @@ func TestCloseReportsUnresolved(t *testing.T) {
 	_, err = n.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
 	wantCode(t, err, CodeClosed)
 	armed.Store(false)
+	l.verify(t, mem, "a")
+}
+
+func TestMaintenance(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	if _, err := n.Update(bg, ref, newReq(t, "fill", 1), func(tx *Tx) ([]byte, error) {
+		for i := range 200 {
+			if _, err := tx.Exec(bg, "INSERT INTO kv VALUES (?, ?)", fmt.Sprint("fill", i), randText(4000)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	compacted, snapshots := false, 0
+	for i := range 60 {
+		// rewrite 12 distinct fill rows: an uploaded delta of distinct pages
+		res, err := n.Update(bg, ref, newReq(t, fmt.Sprint("rows", i), 1), func(tx *Tx) ([]byte, error) {
+			for j := range 12 {
+				k := fmt.Sprint("fill", (i*12+j)%200)
+				v := randText(4000)
+				if _, err := tx.Exec(bg, "UPDATE kv SET v = ? WHERE k = ?", v, k); err != nil {
+					return nil, err
+				}
+				l.ack(ref, k, v) // acknowledged only if the update succeeds (checked below)
+			}
+			return nil, nil
+		})
+		if err != nil || res.Replayed {
+			t.Fatal(err)
+		}
+		if i%5 == 0 {
+			mustPut(t, n, ref, fmt.Sprint("small", i), "x", l) // inline tails ride along
+		}
+		n.wg.Wait()
+		h, _ := headAt(t, mem, "k")
+		if len(h.Deltas) > 2*fanout {
+			t.Fatalf("%d deltas: compaction is not keeping up", len(h.Deltas))
+		}
+		for _, d := range h.Deltas {
+			compacted = compacted || d.Level > 0
+		}
+		if len(h.Deltas) == 0 && h.Snapshot.BaseRevision > 0 {
+			snapshots++
+		}
+	}
+	if !compacted || snapshots == 0 {
+		t.Fatalf("compacted %v, snapshots %d", compacted, snapshots)
+	}
 	l.verify(t, mem, "a")
 }

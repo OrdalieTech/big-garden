@@ -594,6 +594,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 	if err != nil {
 		return Result{}, withOp(err, req.ID)
 	}
+	n.maintainLater(e)
 	if rec != nil {
 		return Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
 	}
