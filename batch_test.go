@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/OrdalieTech/big-garden/internal/store"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
@@ -106,8 +108,8 @@ func TestBatchMembers(t *testing.T) {
 			put("c", "3")(tx)
 			return nil, boom
 		}),
-		enqueue(t, n, bg, ref, r1, put("a", "1")),                // replay of an unpublished member
-		enqueue(t, n, bg, ref, conflict, put("a", "x")),          // id_conflict with an unpublished member
+		enqueue(t, n, bg, ref, r1, put("a", "1")),       // replay of an unpublished member
+		enqueue(t, n, bg, ref, conflict, put("a", "x")), // id_conflict with an unpublished member
 		enqueue(t, n, bg, ref, newReq(t, "f6", 1), func(*Tx) ([]byte, error) { return make([]byte, 2<<10), nil }),
 		enqueue(t, n, bg, ref, newReq(t, "f7", 2), put("z", "z")), // schema_mismatch
 		enqueue(t, n, bg, ref, newReq(t, "f9", 1), func(tx *Tx) ([]byte, error) { put("p", "p")(tx); panic("member panic") }),
@@ -320,4 +322,71 @@ func TestBatchNeverPassesRead(t *testing.T) {
 	if rows := <-read; rows["l"] != "0" {
 		t.Fatalf("read %v misses the leader", rows)
 	}
+}
+
+// TestBatchHotLedger: 16 writers on one entity with BatchMax 16 while one
+// head CAS in four loses its reply (applied), and for the last 150 ms of
+// every 300 ms every head CAS and head GET fails with an unknown outcome (so
+// resolution runs out of CommitTimeout and members get outcome_unknown).
+// Every outcome_unknown or unavailable is retried with the same Request
+// until it answers; every acknowledged write survives a restart, no two
+// writes share a sequence, and batches of several members formed.
+func TestBatchHotLedger(t *testing.T) {
+	mem := newStore(t)
+	n := batchNode(t, mem, func(l *Limits) { l.StorageAttemptTimeout, l.CommitTimeout = 50*time.Millisecond, 100*time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "hot", l)
+	var cas atomic.Int64
+	start := time.Now()
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		window := time.Since(start)%(300*time.Millisecond) >= 150*time.Millisecond
+		switch {
+		case window && (a.Op == "cas" || (a.Op == "get" && a.Key == head.HeadKey("hot"))):
+			return storetest.MemFault{Reject: store.Unknown}
+		case a.Op == "cas" && cas.Add(1)%4 == 1:
+			return storetest.MemFault{LoseReply: true}
+		}
+		return storetest.MemFault{}
+	})
+	var seqs sync.Map
+	var wg sync.WaitGroup
+	var retried atomic.Int64
+	for g := range 16 {
+		wg.Go(func() {
+			for i := range 60 {
+				k, v := fmt.Sprint("g", g, "-", i), randText(32)
+				req := newReq(t, k+v, 1)
+				for try := 0; ; try++ {
+					res, err := n.Update(bg, ref, req, put(k, v))
+					if err == nil {
+						if prev, dup := seqs.LoadOrStore(res.Version.Sequence, k); dup && prev != k {
+							t.Errorf("sequence %d acknowledged for %s and %s", res.Version.Sequence, prev, k)
+						}
+						l.ack(ref, k, v)
+						break
+					}
+					var e *Error
+					if !errors.As(err, &e) || (e.Code != CodeOutcomeUnknown && e.Code != CodeUnavailable) || try > 100 {
+						t.Errorf("%s (try %d): %v", k, try, err)
+						return
+					}
+					retried.Add(1)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	n.wg.Wait()
+	b := n.Stats().Batches
+	multi := uint64(0)
+	for _, c := range b[1:] {
+		multi += c
+	}
+	if multi == 0 || retried.Load() == 0 {
+		t.Fatalf("no batch of several members (%v) or no retried outcome (%d)", b, retried.Load())
+	}
+	t.Logf("batch distribution (index = size-1): %v; %d retries", b, retried.Load())
+	mem.SetPlan(nil)
+	n.Close(bg)
+	l.verify(t, mem, "a")
 }
