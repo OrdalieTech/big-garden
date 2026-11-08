@@ -146,21 +146,18 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 // local image is checkpointed if it is the candidate's, and discarded if it
 // is not cur's.
 func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
-	e.h, e.etag, e.unresolved = cur, etag, nil
-	if e.db == nil {
-		return
-	}
-	if slices.Contains(c.nonces, cur.Nonce) {
+	e.unresolved = nil
+	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
 		e.pages = c.pages
 		o := engine.Object{Ref: head.Ref{MaxSequence: cur.Sequence, PostChecksum: cur.DatabaseChecksum}, PageCount: cur.PageCount}
 		if e.db.Published() != imageOf(cur) && e.db.Checkpoint(o) != nil {
 			e.discard()
-			return
 		}
 	}
-	if e.db.Published() != imageOf(cur) {
+	if e.db != nil && e.db.Published() != imageOf(cur) {
 		e.discard()
 	}
+	e.h, e.etag = cur, etag // kept even without a local image: the next access activates or revalidates it
 }
 
 // resolve runs PROTOCOL §2 resolve(c) until ctx ends.

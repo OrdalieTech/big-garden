@@ -457,10 +457,10 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 	if err != nil {
 		return Ref{}, Result{}, withOp(err, req.ID)
 	}
-	if rec != nil {
-		result = rec.Result
+	if rec != nil { // another genesis carrying our receipt
+		return Ref{key, e.h.Incarnation}, Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
 	}
-	return Ref{key, e.h.Incarnation}, Result{Value: result, Version: Version{e.h.Incarnation, e.h.Sequence}}, nil
+	return Ref{key, inc}, Result{Value: result, Version: Version{inc, next.Sequence}}, nil
 }
 
 func withOp(err error, id MutationID) error {
