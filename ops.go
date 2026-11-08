@@ -719,14 +719,14 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 }
 
 // waiter is an Update queued on a busy entity that a batch may take
-// (PROTOCOL §6 Batches). The batch leader sets taken under entity.qmu, runs
-// the callback, and closes done once res, err (or panic) are final.
+// (PROTOCOL §6 Batches). The batch leader takes it off entity.queue under
+// entity.qmu, runs the callback, and closes done once res, err (or panic)
+// are final.
 type waiter struct {
 	ctx    context.Context
 	req    Request
 	bound  head.Digest
 	fn     func(*Tx) ([]byte, error)
-	taken  bool
 	commit bool // its transaction committed locally: it is in the publication
 	done   chan struct{}
 	res    Result
@@ -758,14 +758,14 @@ func (n *Node) wait(ctx context.Context, e *entity, m *waiter) (served bool, err
 	}
 	e.qmu.Lock()
 	defer e.qmu.Unlock()
-	if m.taken {
-		if locked { // the leader released mu only after closing done
-			e.mu.Unlock()
-		}
-		return true, err
+	if i := slices.Index(e.queue, m); i >= 0 {
+		e.queue = slices.Delete(e.queue, i, i+1)
+		return false, err
 	}
-	e.queue = slices.DeleteFunc(e.queue, func(x *waiter) bool { return x == m })
-	return false, err
+	if locked { // taken: the leader released mu only after closing done
+		e.mu.Unlock()
+	}
+	return true, err
 }
 
 // collect runs, after the leader's own transaction, the transactions of the
@@ -779,7 +779,6 @@ func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 		e.qmu.Lock()
 		if len(e.queue) > 0 && e.waiting.Load() <= int64(len(e.queue)) {
 			m, e.queue = e.queue[0], e.queue[1:]
-			m.taken = true
 			e.waiting.Add(-1)
 		}
 		e.qmu.Unlock()
