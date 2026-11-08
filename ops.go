@@ -443,6 +443,16 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		return Ref{}, Result{}, engineError(err)
 	}
 	failpoint("capture")
+	// From the birth attempt on, birth.json may exist, and only this request
+	// can resume it (D5): a failure is outcome_unknown, never a code that
+	// invites a retry under another ID (§5 step 5).
+	unknown := func(err error) (Ref, Result, error) {
+		var pe *Error
+		if errors.As(err, &pe) && (pe.Code == CodeUnavailable || pe.Code == CodeCorrupt || pe.Code == CodeCapacity) {
+			err = &Error{Code: CodeOutcomeUnknown, Operation: req.ID, Message: "create outcome unknown: " + pe.Message, cause: pe}
+		}
+		return Ref{}, Result{}, withOp(err, req.ID)
+	}
 	if writeBirth {
 		attempt := head.NewID()
 		body, err := head.Birth{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, OperationID: op,
@@ -468,14 +478,14 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		}
 		if err != nil {
 			e.discard()
-			return Ref{}, Result{}, storeError(err)
+			return unknown(storeError(err))
 		}
 	}
 	ref := snap.Ref
 	ref.Key = head.ObjectKey(key, inc, 0, head.NewID(), ref.SHA256)
 	if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
 		e.discard()
-		return Ref{}, Result{}, err
+		return unknown(err)
 	}
 	self := n.self
 	next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
@@ -483,7 +493,7 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
 	rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
 	if err != nil {
-		return Ref{}, Result{}, withOp(err, req.ID)
+		return unknown(err)
 	}
 	if rec != nil { // another genesis carrying our receipt
 		return Ref{key, e.h.Incarnation}, Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil

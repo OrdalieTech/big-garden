@@ -463,6 +463,50 @@ func TestCreateResumeD5(t *testing.T) {
 	wantCode(t, err, CodeStateMissing)
 }
 
+// TestCreateAfterBirthIsUnknown: once birth.json may exist, only the same
+// request can finish the create (D5), so every later failure is
+// outcome_unknown and the same-request retry completes.
+func TestCreateAfterBirthIsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault func(a storetest.Attempt) bool
+		fate  storetest.MemFault
+	}{
+		{"birth reply lost", func(a storetest.Attempt) bool { return a.Op == "put" && a.Key == head.BirthKey("k") },
+			storetest.MemFault{LoseReply: true}},
+		{"snapshot put refused", func(a storetest.Attempt) bool { return a.Op == "put" && strings.HasSuffix(a.Key, ".ltx") },
+			storetest.MemFault{Reject: store.Failed}},
+		{"genesis cas refused", func(a storetest.Attempt) bool { return a.Op == "cas" && a.Key == head.HeadKey("k") },
+			storetest.MemFault{Reject: store.Failed}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := newStore(t)
+			n := testNode(t, mem, "a", nil)
+			var armed atomic.Bool
+			armed.Store(true)
+			mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+				if armed.Load() && tc.fault(a) {
+					return tc.fate
+				}
+				return storetest.MemFault{}
+			})
+			req := newReq(t, "create", 1)
+			_, _, err := n.Create(bg, "k", req, createKV)
+			if e := wantCode(t, err, CodeOutcomeUnknown); e.Operation != req.ID {
+				t.Fatalf("operation %x", e.Operation)
+			}
+			armed.Store(false)
+			ref, res, err := n.Create(bg, "k", req, createKV)
+			if err != nil || string(res.Value) != "created" {
+				t.Fatalf("same-request retry %+v %v", res, err)
+			}
+			l := newLedger()
+			mustPut(t, n, ref, "a", "1", l)
+			l.verify(t, mem, "a")
+		})
+	}
+}
+
 func TestMissingHeadFailsClosed(t *testing.T) {
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)

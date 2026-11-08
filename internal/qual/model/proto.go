@@ -606,9 +606,9 @@ func (x *px) run(ev, res uint8) {
 		case ev == evTimeout && p.Put < 1:
 			p.Put++
 			x.wait(pcCrPutBirth, x.birthMsg())
-		case ev == evTimeout:
+		case ev == evTimeout: // birth.json may exist: only this request can resume it (D5)
 			x.discard()
-			x.finish(out{code: cUnavailable, def: true})
+			x.finish(out{code: cUnknown})
 		case res == rOK:
 			x.crUpload()
 		default:
@@ -637,7 +637,7 @@ func (x *px) run(ev, res uint8) {
 				return
 			}
 			x.discard()
-			x.finish(out{code: cUnavailable, def: true})
+			x.finish(out{code: cUnknown}) // after the birth, as above
 			return
 		}
 		next := Head{Inc: p.Inc, Rev: 1, Nonce: x.fresh(), Owner: int8(x.n + 1), Sess: x.self(),
