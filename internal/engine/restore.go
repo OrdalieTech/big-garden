@@ -113,18 +113,11 @@ func (d *DB) check(h *head.Head) error {
 // contents of the pages it replaces or truncates and returns the new image
 // and the number of page frames the object carried.
 func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.ReaderAt) (Image, uint32, error) {
-	if err := checkObject(r, ref); err != nil {
+	dec, err := openObject(r, ref)
+	if err != nil {
 		return img, 0, err
 	}
-	snapshot := ref.MinSequence == 1
-	dec := ltx.NewDecoder(io.NewSectionReader(r, 0, int64(ref.Bytes)))
-	if err := dec.DecodeHeader(); err != nil {
-		return img, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
-	}
-	hd := dec.Header()
-	if err := checkHeader(hd, ref); err != nil {
-		return img, 0, err
-	}
+	snapshot, hd := ref.MinSequence == 1, dec.Header()
 	if snapshot != (img == Image{}) || (!snapshot && (ref.MinSequence != img.Sequence+1 || ref.PreChecksum != img.Checksum)) {
 		return img, 0, fmt.Errorf("%w: object %d..%d does not follow image at %d", ErrCorrupt, ref.MinSequence, ref.MaxSequence, img.Sequence)
 	}
@@ -182,14 +175,24 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 	return Image{ref.MaxSequence, hd.Commit, post}, carried, nil
 }
 
-// checkHeader verifies an LTX header against the reference that names it.
-func checkHeader(hd ltx.Header, ref head.Ref) error {
-	if hd.NoChecksum() || hd.PageSize != pageSize || hd.Commit == 0 || hd.Commit > head.MaxPages ||
+// openObject verifies r against ref (checkObject), then decodes its LTX
+// header and checks it against ref. Callers only stream the pages, so the
+// decoder does not retain the page index (Close still validates it).
+func openObject(r io.ReaderAt, ref head.Ref) (*ltx.Decoder, error) {
+	if err := checkObject(r, ref); err != nil {
+		return nil, err
+	}
+	dec := ltx.NewDecoder(io.NewSectionReader(r, 0, int64(ref.Bytes)))
+	dec.SetRetainPageIndex(false)
+	if err := dec.DecodeHeader(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	if hd := dec.Header(); hd.NoChecksum() || hd.PageSize != pageSize || hd.Commit == 0 || hd.Commit > head.MaxPages ||
 		uint64(hd.MinTXID) != ref.MinSequence || uint64(hd.MaxTXID) != ref.MaxSequence ||
 		head.Checksum(hd.PreApplyChecksum) != ref.PreChecksum {
-		return fmt.Errorf("%w: LTX header %+v does not match its reference", ErrCorrupt, hd)
+		return nil, fmt.Errorf("%w: LTX header %+v does not match its reference", ErrCorrupt, hd)
 	}
-	return nil
+	return dec, nil
 }
 
 // checkObject verifies r's exact length and SHA-256 against ref and bounds
@@ -266,15 +269,8 @@ func Compact(ctx context.Context, w io.Writer, refs []head.Ref, objs []io.Reader
 		if i > 0 && (ref.MinSequence != refs[i-1].MaxSequence+1 || ref.PreChecksum != refs[i-1].PostChecksum) {
 			return Object{}, fmt.Errorf("%w: objects %d and %d are not a chain", ErrCorrupt, i-1, i)
 		}
-		if err := checkObject(objs[i], ref); err != nil {
-			return Object{}, err
-		}
-		dec := ltx.NewDecoder(io.NewSectionReader(objs[i], 0, int64(ref.Bytes)))
-		dec.SetRetainPageIndex(false)
-		if err := dec.DecodeHeader(); err != nil {
-			return Object{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
-		}
-		if err := checkHeader(dec.Header(), ref); err != nil {
+		dec, err := openObject(objs[i], ref)
+		if err != nil {
 			return Object{}, err
 		}
 		var ph ltx.PageHeader
