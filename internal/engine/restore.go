@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/superfly/ltx"
+	"modernc.org/sqlite"
 )
 
 // maxFrame bounds a page frame's declared compressed size: lz4's
@@ -61,7 +63,14 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 		return nil, errors.Join(err, removeFiles(path))
 	}
 	d.pub, d.Pages = img, pages
-	if err := d.check(h); err != nil {
+	// integrity_check connects every virtual table whose module is
+	// registered: it runs on a second connection, from a driver without the
+	// Node's extensions, so activation never runs caller code.
+	c := &DB{db: sql.OpenDB(connector{&sqlite.Driver{}, fileDSN(path, "ro")})}
+	if c.conn, err = c.db.Conn(ctx); err == nil {
+		err = c.check(h)
+	}
+	if err = errors.Join(err, c.close()); err != nil {
 		return nil, errors.Join(err, d.Discard())
 	}
 	return d, nil

@@ -103,7 +103,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 3. Into a new private file (`O_EXCL`, 0600) in the session cache dir: apply the snapshot, then each delta in order, then the tail as `Tail.Ref()` over `tail.data`. Per object: `MinTXID/MaxTXID` = ref range, `PreApplyChecksum` = running checksum, decoder close succeeds, truncate to `Commit` pages, recomputed checksum = trailer post-checksum = `ref.post_checksum`.
 4. Check `page_count = H.page_count` and checksum = `H.database_checksum`.
 5. Install by rename; open with mode `rw` (never `rwc`); set and verify `page_size=4096`, `journal_mode=WAL`, `wal_autocheckpoint=0`, `synchronous=OFF` (D1), `trusted_schema=OFF`; install the authorizer.
-6. `_state_meta`: format 1, namespace/key/incarnation = head, `sequence = H.sequence`, `schema = H.schema`; no reserved name or foreign key to a reserved table outside §1's (§6 step 4); `PRAGMA integrity_check` = `ok`. Else discard, `corrupt`.
+6. `_state_meta`: format 1, namespace/key/incarnation = head, `sequence = H.sequence`, `schema = H.schema`; no reserved name or foreign key to a reserved table outside §1's (§6 step 4); `PRAGMA integrity_check` = `ok`, run on a read-only connection without the `Config.Extend` registrations (it connects every virtual table whose module is registered). Else discard, `corrupt`.
 7. `e.H, e.E = H, etag`.
 
 ## 5. Create(key, req, fn) (PLAN §6.3, D5, D11)

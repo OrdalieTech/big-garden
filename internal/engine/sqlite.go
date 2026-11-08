@@ -233,8 +233,7 @@ func open(ctx context.Context, drv *Driver, path string, maxPages uint32) (*DB, 
 			return nil, err
 		}
 	}
-	dsn := (&url.URL{Scheme: "file", OmitHost: true, Path: path, RawQuery: "mode=rw&_defensive=1"}).String()
-	db := sql.OpenDB(connector{drv.sqlite, dsn})
+	db := sql.OpenDB(connector{drv.sqlite, fileDSN(path, "rw")})
 	db.SetMaxOpenConns(1)
 	d := &DB{path: path, db: db, modules: drv.modules}
 	var err error
@@ -248,6 +247,10 @@ func open(ctx context.Context, drv *Driver, path string, maxPages uint32) (*DB, 
 		return nil, errors.Join(err, d.close())
 	}
 	return d, nil
+}
+
+func fileDSN(path, mode string) string {
+	return (&url.URL{Scheme: "file", OmitHost: true, Path: path, RawQuery: "mode=" + mode + "&_defensive=1"}).String()
 }
 
 func (d *DB) setup(maxPages uint32) error {

@@ -446,11 +446,11 @@ func TestExtendReplacesBuiltin(t *testing.T) {
 		"upper": fn("upper", 1), "UPPER/2": fn("UPPER", 2), "like": fn("like", 2), "like/3": fn("like", 3),
 		"lower": fn("lower", 1), "json_extract": fn("json_extract", 2), "fts5 function": fn("fts5", 1),
 		"nocase": coll("nocase"), "binary": coll("BINARY"), "rtrim": coll("rtrim"),
-		"fts5": func(d *sqlite.Driver) error { return d.RegisterModule("fts5", series{}) },
-		"RTREE": func(d *sqlite.Driver) error { return d.RegisterModule("RTREE", series{}) },
-		"json_each": func(d *sqlite.Driver) error { return d.RegisterModule("json_each", series{}) },
+		"fts5":              func(d *sqlite.Driver) error { return d.RegisterModule("fts5", series{}) },
+		"RTREE":             func(d *sqlite.Driver) error { return d.RegisterModule("RTREE", series{}) },
+		"json_each":         func(d *sqlite.Driver) error { return d.RegisterModule("json_each", series{}) },
 		"pragma_table_info": func(d *sqlite.Driver) error { return d.RegisterModule("pragma_table_info", series{}) },
-		"_state_m": func(d *sqlite.Driver) error { return d.RegisterModule("_state_m", series{}) },
+		"_state_m":          func(d *sqlite.Driver) error { return d.RegisterModule("_state_m", series{}) },
 		"hook": func(d *sqlite.Driver) error {
 			d.RegisterConnectionHook(func(sqlite.ExecQuerierContext, string) error { return nil })
 			return nil
@@ -461,5 +461,55 @@ func TestExtendReplacesBuiltin(t *testing.T) {
 		} else {
 			t.Logf("%s: %v", name, err)
 		}
+	}
+}
+
+// brokenConnect is series whose Connect fails and counts its calls.
+type brokenConnect struct{ series }
+
+var connects int
+
+func (brokenConnect) Connect(vtab.Context, []string) (vtab.Table, error) {
+	connects++
+	return nil, errors.New("connect refused")
+}
+
+// TestActivationRunsNoModuleCode: integrity_check connects every virtual
+// table whose module is registered, so activation runs it on a driver
+// without the Node's extensions: a module whose Connect fails (or would run
+// arbitrary caller code) must not make activation fail.
+func TestActivationRunsNoModuleCode(t *testing.T) {
+	ext, err := NewDriver(func(d *sqlite.Driver) error { return d.RegisterModule("broken", brokenConnect{}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFixture(t, 4000)
+	f.d.Discard()
+	ns, inc := head.NewID(), head.NewID()
+	if f.d, err = Create(bg, ext, filepath.Join(t.TempDir(), "db"), 4000, ns, "key", inc); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.d.Discard() })
+	f.head = head.Head{Namespace: ns, Key: "key", Incarnation: inc, Schema: 1}
+	f.mutate(t, "CREATE TABLE app(a); CREATE VIRTUAL TABLE b USING broken(3)")
+	f.publish(t, true)
+	connects = 0
+	r, err := Restore(bg, ext, filepath.Join(t.TempDir(), "r"), head.MaxPages, &f.head, readers(f.objs))
+	if err != nil {
+		t.Fatalf("activation with a failing module: %v", err)
+	}
+	defer r.Discard()
+	if connects != 0 {
+		t.Fatalf("activation connected the module %d times", connects)
+	}
+	if _, _, err := r.Mutate(commit(99), func(tx *Tx) ([]byte, error) {
+		_, err := tx.Exec(bg, "INSERT INTO app VALUES (1)")
+		return nil, err
+	}); err != nil || connects != 0 {
+		t.Fatalf("mutation: %v, %d connects", err, connects)
+	}
+	if _, err := r.Read(func(v *View) ([]byte, error) { return nil, v.Query(bg, "SELECT * FROM b", nil, nil) }); err == nil ||
+		!strings.Contains(err.Error(), "connect refused") {
+		t.Fatalf("query of the module: %v", err)
 	}
 }
