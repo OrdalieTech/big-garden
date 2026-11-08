@@ -1033,3 +1033,101 @@ func FuzzImport(f *testing.F) {
 		n.Evict(bg, dst)
 	})
 }
+
+// countStore counts the calls and uploaded bytes of one Node.
+type countStore struct {
+	store.Store
+	puts, cas, gets, lists, dels atomic.Int64
+	putBytes, casBytes, getBytes atomic.Int64
+}
+
+func (c *countStore) Get(ctx context.Context, key, inm string, max int64) (store.Object, error) {
+	o, err := c.Store.Get(ctx, key, inm, max)
+	c.gets.Add(1)
+	c.getBytes.Add(int64(len(o.Body)))
+	return o, err
+}
+
+func (c *countStore) PutImmutable(ctx context.Context, key string, body []byte) error {
+	c.puts.Add(1)
+	c.putBytes.Add(int64(len(body)))
+	return c.Store.PutImmutable(ctx, key, body)
+}
+
+func (c *countStore) PutCAS(ctx context.Context, key string, body []byte, ifMatch string) (string, error) {
+	c.cas.Add(1)
+	c.casBytes.Add(int64(len(body)))
+	return c.Store.PutCAS(ctx, key, body, ifMatch)
+}
+
+func (c *countStore) List(ctx context.Context, prefix, after string, limit int) ([]store.Entry, bool, error) {
+	c.lists.Add(1)
+	return c.Store.List(ctx, prefix, after, limit)
+}
+
+func (c *countStore) Delete(ctx context.Context, key string) error {
+	c.dels.Add(1)
+	return c.Store.Delete(ctx, key)
+}
+
+// TestAmplification measures S3 requests and bytes per acknowledged
+// mutation, maintenance included, for small inline writes and for
+// upload-path writes on a 1 MiB entity (numbers for PLAN §18; logged).
+// GARDEN_AMP_N scales the run (default 300 mutations per workload).
+func TestAmplification(t *testing.T) {
+	runs := 300
+	if v := os.Getenv("GARDEN_AMP_N"); v != "" {
+		fmt.Sscan(v, &runs)
+	}
+	for _, w := range []struct {
+		name string
+		row  int // hex characters per write (random: ~half compresses away)
+		keys int
+	}{{"inline-100B", 100, 1000}, {"upload-64KiB", 128 << 10, 4}} {
+		t.Run(w.name, func(t *testing.T) {
+			cs := &countStore{Store: newStore(t)}
+			n := testNode(t, cs, "a", nil)
+			l := newLedger()
+			ref := mustCreate(t, n, "k", l)
+			if _, err := n.Update(bg, ref, newReq(t, "base", 1), func(tx *Tx) ([]byte, error) {
+				for i := range 250 { // ~1 MiB of rows
+					if _, err := tx.Exec(bg, "INSERT INTO kv VALUES (?, ?)", fmt.Sprint("base", i), randText(4000)); err != nil {
+						return nil, err
+					}
+				}
+				return nil, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			n.wg.Wait()
+			p0, c0, pb0, cb0, g0 := cs.puts.Load(), cs.cas.Load(), cs.putBytes.Load(), cs.casBytes.Load(), cs.gets.Load()
+			s0 := n.Stats()
+			start := time.Now()
+			maxDeltas, tails := 0, 0
+			for i := range runs {
+				mustPut(t, n, ref, fmt.Sprint("w", i%w.keys), randText(w.row), l)
+				n.wg.Wait()
+				h, _ := headAt(t, cs.Store, "k")
+				maxDeltas = max(maxDeltas, len(h.Deltas))
+				if h.Tail != nil {
+					tails++
+				}
+			}
+			el := time.Since(start)
+			s := n.Stats()
+			m := float64(runs)
+			puts, cas := float64(cs.puts.Load()-p0), float64(cs.cas.Load()-c0)
+			t.Logf("%s: %d mutations (row %d hex chars) in %v: PUT_IMM/mut %.3f, CAS/mut %.3f, GET/mut %.3f, uploaded object KiB/mut %.1f, head KiB/mut %.1f;"+
+				" snapshots %d (%.0f KiB total), compactions %d (in %.0f KiB, out %.0f KiB); max deltas %d, heads with inline tail %d/%d",
+				w.name, runs, w.row, el.Round(time.Millisecond), puts/m, cas/m, float64(cs.gets.Load()-g0)/m,
+				float64(cs.putBytes.Load()-pb0)/m/1024, float64(cs.casBytes.Load()-cb0)/m/1024,
+				s.Snapshots-s0.Snapshots, float64(s.SnapshotBytes-s0.SnapshotBytes)/1024, s.Compactions-s0.Compactions,
+				float64(s.CompactionInputBytes-s0.CompactionInputBytes)/1024, float64(s.CompactionOutputBytes-s0.CompactionOutputBytes)/1024,
+				maxDeltas, tails, runs)
+			if maxDeltas > head.MaxDeltas {
+				t.Fatalf("%d deltas", maxDeltas)
+			}
+			l.verify(t, cs.Store, "a")
+		})
+	}
+}
