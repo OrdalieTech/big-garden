@@ -109,39 +109,48 @@ func pause(ctx context.Context) error {
 }
 
 // evict discards resident, idle, settled entities last used before cutoff.
-// With keep > 0 it instead discards the least recently used one if at
-// least keep entities other than self are resident (busy ones count), and
-// reports whether there is room for self. It never blocks on an entity mutex.
+// With keep > 0 it also discards the least recently used one if at least
+// keep entities other than self are resident, and reports whether there is
+// room for self.
 func (n *Node) evict(cutoff time.Time, keep int, self *entity) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	resident, lru := 0, (*entity)(nil)
-	var lruUsed time.Time
+	resident, _, lru := n.scan(cutoff, self)
+	return keep == 0 || resident < keep || shed(lru)
+}
+
+// scan walks the entities other than self under n.mu, never blocking on an
+// entity mutex: it discards the idle, settled resident ones last used before
+// cutoff and forgets unneeded ones. It returns the number of resident
+// entities (a busy one only with a file), their cache bytes (a busy one with
+// its last seen size) and the least recently admitted idle, settled one.
+func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, lru *entity) {
+	var at time.Time
 	for _, e := range n.entities {
-		if e == self {
-			continue
-		}
-		if !e.mu.TryLock() {
-			if e.bytes.Load() > 0 { // busy: resident only with a file
-				resident++
+		if e == self || !e.mu.TryLock() {
+			if b := e.bytes.Load(); b > 0 {
+				resident, used = resident+1, used+b
 			}
 			continue
 		}
-		if e.db != nil && e.unresolved == nil && keep == 0 && e.used.Before(cutoff) {
+		if e.db != nil && e.unresolved == nil && e.used.Before(cutoff) {
 			e.discard()
 		}
-		n.forget(e)
 		if e.db != nil {
-			resident++
-			if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
-				lru, lruUsed = e, e.used
+			e.bytes.Store(e.db.Bytes())
+			resident, used = resident+1, used+e.bytes.Load()
+			if e.unresolved == nil && (lru == nil || e.used.Before(at)) {
+				lru, at = e, e.used
 			}
 		}
+		n.forget(e)
 		e.mu.Unlock()
 	}
-	if keep == 0 || resident < keep {
-		return true
-	}
+	return resident, used, lru
+}
+
+// shed discards lru if it is still resident, idle and settled.
+func shed(lru *entity) bool {
 	if lru == nil || !lru.mu.TryLock() {
 		return false
 	}
@@ -341,35 +350,14 @@ func (n *Node) fit(self *entity) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
-		used, lru := n.reserved, (*entity)(nil)
-		var lruUsed time.Time
-		for _, e := range n.entities {
-			if e == self || !e.mu.TryLock() {
-				used += e.bytes.Load()
-				continue
-			}
-			if e.db != nil {
-				e.bytes.Store(e.db.Bytes())
-				if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
-					lru, lruUsed = e, e.used
-				}
-			}
-			used += e.bytes.Load()
-			e.mu.Unlock()
-		}
-		if used+n.buildBytes() <= n.cfg.Limits.CacheBytes {
+		_, used, lru := n.scan(time.Time{}, self)
+		if n.reserved+used+n.buildBytes() <= n.cfg.Limits.CacheBytes {
 			n.reserved += n.buildBytes()
 			return true
 		}
-		if lru == nil || !lru.mu.TryLock() {
+		if !shed(lru) {
 			return false
 		}
-		if lru.db == nil || lru.unresolved != nil {
-			lru.mu.Unlock()
-			return false
-		}
-		lru.discard()
-		lru.mu.Unlock()
 	}
 }
 

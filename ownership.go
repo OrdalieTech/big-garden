@@ -8,11 +8,14 @@ import (
 	"github.com/OrdalieTech/big-garden/internal/store"
 )
 
-// fetch replaces e's cached head with a fresh GET of it (no If-None-Match),
-// discarding a local image that no longer matches or is no longer owned.
-func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID) error {
-	obj, err := n.st.Get(ctx, head.HeadKey(e.key), "", maxHeadBytes)
+// fetch revalidates e's cached head with a GET (If-None-Match: etag, if not
+// empty), discarding a local image that no longer matches or is no longer
+// owned.
+func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) error {
+	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, maxHeadBytes)
 	switch store.OutcomeOf(err) {
+	case store.NotModified:
+		return nil
 	case store.OK:
 	case store.NotFound:
 		e.discard()
@@ -42,7 +45,7 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 	}
 	defer n.leave(e)
 	for try := 0; ; try++ {
-		if err := n.fetch(ctx, e, observed.Ref.Incarnation); err != nil {
+		if err := n.fetch(ctx, e, observed.Ref.Incarnation, ""); err != nil {
 			return Route{}, err
 		}
 		cur := *routeOf(e.h)
@@ -90,7 +93,7 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 	}
 	defer n.leave(e)
 	if e.h == nil || !n.mine(e.h) {
-		if err := n.fetch(ctx, e, ref.Incarnation); err != nil {
+		if err := n.fetch(ctx, e, ref.Incarnation, ""); err != nil {
 			return err
 		}
 	}

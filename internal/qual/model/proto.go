@@ -624,8 +624,6 @@ func (x *px) run(ev, res uint8) {
 		switch {
 		case res == rOK && b.Att == p.BAtt:
 			x.crUpload()
-		case res == rOK && b.Req == p.Req+1 && b.Inc == p.Inc:
-			x.crUpload()
 		case res == rOK && b.Req == p.Req+1 && p.Loops < 1: // restart at step 3 with its incarnation
 			p.Loops++
 			x.discard()

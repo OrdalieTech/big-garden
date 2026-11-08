@@ -101,23 +101,8 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, 
 // GET; otherwise a cached head owned by this session is used as is.
 func (n *Node) owned(ctx context.Context, e *entity, ref Ref, fresh bool) error {
 	if fresh || e.h == nil || !n.mine(e.h) || e.db == nil {
-		obj, err := n.st.Get(ctx, head.HeadKey(e.key), e.etag, maxHeadBytes)
-		switch store.OutcomeOf(err) {
-		case store.NotModified:
-		case store.OK:
-			cur, err := n.decodeHead(obj.Body, e.key, ref.Incarnation)
-			if err != nil {
-				return err
-			}
-			if e.db != nil && (e.db.Published() != imageOf(cur) || !n.mine(cur)) {
-				e.discard()
-			}
-			e.h, e.etag = cur, obj.ETag
-		case store.NotFound:
-			e.discard()
-			return n.missing(ctx, e.key)
-		default:
-			return storeError(err)
+		if err := n.fetch(ctx, e, ref.Incarnation, e.etag); err != nil {
+			return err
 		}
 	}
 	if e.h.Incarnation != ref.Incarnation {
