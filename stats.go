@@ -121,12 +121,12 @@ func (n *Node) Stats() Stats {
 			s.OldestUnresolved = max(s.OldestUnresolved, time.Since(time.Unix(0, t)))
 		}
 		s.QueuedRequests += e.waiting.Load()
-		if e.mu.TryLock() { // a busy entity is resident by definition
+		if e.mu.TryLock() {
 			if e.db != nil {
 				s.ResidentEntities++
 			}
 			e.mu.Unlock()
-		} else {
+		} else if e.bytes.Load() > 0 { // busy: resident only with a file
 			s.ResidentEntities++
 		}
 	}

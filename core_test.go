@@ -1398,6 +1398,35 @@ func TestEntityMapBounded(t *testing.T) {
 	l.verify(t, mem, "a")
 }
 
+// TestBusyColdEntityNotResident: an entity busy without a cache file does
+// not count against ResidentEntities.
+func TestBusyColdEntityNotResident(t *testing.T) {
+	mem := newStore(t)
+	creator := testNode(t, mem, "a", nil)
+	x, y := mustCreate(t, creator, "x", nil), mustCreate(t, creator, "y", nil)
+	creator.Close(bg)
+	n := testNode(t, mem, "a", func(l *Limits) { l.ResidentEntities = 1 })
+	hold := make(chan struct{})
+	var state atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if a.Op == "get" && a.Key == head.HeadKey("x") && state.CompareAndSwap(0, 1) {
+			return storetest.MemFault{Hold: hold}
+		}
+		return storetest.MemFault{}
+	})
+	done := make(chan struct{})
+	go func() { defer close(done); readAll(t, n, x) }()
+	for state.Load() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	if st := n.Stats(); st.ResidentEntities != 0 {
+		t.Errorf("busy cold entity counted resident: %+v", st)
+	}
+	readAll(t, n, y)
+	close(hold)
+	<-done
+}
+
 func TestMaintenance(t *testing.T) {
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)

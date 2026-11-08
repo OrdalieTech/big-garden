@@ -122,7 +122,9 @@ func (n *Node) evict(cutoff time.Time, keep int, self *entity) bool {
 			continue
 		}
 		if !e.mu.TryLock() {
-			resident++
+			if e.bytes.Load() > 0 { // busy: resident only with a file
+				resident++
+			}
 			continue
 		}
 		if e.db != nil && e.unresolved == nil && keep == 0 && e.used.Before(cutoff) {
