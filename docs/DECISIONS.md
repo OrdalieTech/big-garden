@@ -91,3 +91,16 @@ Rules, enforced by `head.Validate`:
 - Snapshots empty the tail. Run compaction of delta refs carries it unchanged.
 
 Resolve, GC and the 32-ref cap are unchanged: the tail is never an object and is always replaced together with the head, so a single-CAS mutation resolves through the receipt in the head. Capture must emit every page a delta grew the database by, because compaction is exact only then (asserted in the engine).
+
+## D17. The inline tail keeps its 31 KiB threshold despite the head bytes it carries
+
+Every inline mutation re-uploads the whole tail inside the head, so a 100-byte write uploads about 29 KiB of head on average (M6 `TestAmplification`, 2,000 mutations of a 1 MiB entity). Lowering the publish threshold below the format maximum was measured with the same fixture:
+
+| Inline threshold | Head KiB/mut | Object KiB/mut | Total KiB/mut | PUT_IMM/mut | Single-CAS writes |
+|---|---|---|---|---|---|
+| 31 KiB (D16) | 29.4 | 2.9 | 32.3 | 0.05 | 95% |
+| 16 KiB | 17.5 | 5.0 | 22.5 | 0.16 | 84% |
+| 8 KiB | 9.2 | 14.0 | 23.2 | 0.85 | 26% |
+| 4 KiB | 7.6 | 16.1 | 23.7 | 1.14 | 0% |
+
+Total upload bytes fall by at most a third, because the bytes move into delta objects and compaction, while every write that leaves the inline path pays a second sequential S3 round trip and its stall exposure. Scaleway bills requests, not ingress bytes, and the measured cost of the larger head on fr-par is a few milliseconds (small update p50 38 ms against 35 ms for a raw 4 KiB CAS, docs/PERFORMANCE.md). The threshold therefore stays at the format maximum. PLAN §18.3's upload-bytes gate is evaluated on this fixture as measured, and it is the gate to revisit if a provider bills ingress.
