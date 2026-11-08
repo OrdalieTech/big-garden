@@ -88,6 +88,9 @@ func (e *entity) discard() {
 	e.bytes.Store(0)
 }
 
+// resolved clears the unresolved candidate and its since.
+func (e *entity) resolved() { e.unresolved = nil; e.since.Store(0) }
+
 func imageOf(h *head.Head) engine.Image {
 	return engine.Image{Sequence: h.Sequence, PageCount: h.PageCount, Checksum: h.DatabaseChecksum}
 }
@@ -181,8 +184,7 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	}
 	if !unsure { // definitely not committed (§2 step 5)
 		e.discard()
-		e.unresolved = nil
-		e.since.Store(0)
+		e.resolved()
 		return nil, storeError(err)
 	}
 	rec, err = n.resolve(ctx, e, c)
@@ -198,8 +200,7 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 // local image is checkpointed if it is the candidate's, and discarded if it
 // is not cur's.
 func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
-	e.unresolved = nil
-	e.since.Store(0)
+	e.resolved()
 	n.countCommit(c)
 	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
 		e.pages = c.pages
@@ -280,14 +281,12 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 			return nil, engineError(err)
 		}
 		if ok && r.InputHash != c.bound {
-			e.unresolved = nil
-			e.since.Store(0)
+			e.resolved()
 			return nil, &Error{Code: CodeIDConflict, Operation: opOf(c), Message: "operation ID used with another input"}
 		}
 		if !ok && tsOf(opOf(c)) <= int64(m.FloorMs) { // a newer owner may have pruned our receipt
 			e.discard()
-			e.unresolved = nil
-			e.since.Store(0)
+			e.resolved()
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "receipt floor passed during publication"}
 		}
 		committed, rec = ok, &r
@@ -302,8 +301,7 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 		return rec, nil
 	}
 	e.discard()
-	e.unresolved = nil
-	e.since.Store(0)
+	e.resolved()
 	if !n.mine(cur) {
 		return nil, notOwner(cur)
 	}
