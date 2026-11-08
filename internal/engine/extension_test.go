@@ -426,3 +426,40 @@ func TestForeignKeyToReserved(t *testing.T) {
 		t.Fatalf("restore with a key to a reserved table: %v", err)
 	}
 }
+
+// TestExtendReplacesBuiltin: Extend must not replace what a fresh driver
+// has. A replaced nocase or binary collation corrupts index lookups and
+// fails activation's integrity_check, a replaced upper() breaks activation
+// of images using it in a CHECK or an index, a Go module named fts5 runs
+// caller code at activation, and replaced like() or lower() would skew the
+// engine's own introspection. Collations and connection hooks are refused.
+func TestExtendReplacesBuiltin(t *testing.T) {
+	fn := func(name string, n int32) func(*sqlite.Driver) error {
+		return func(d *sqlite.Driver) error {
+			return d.RegisterScalarFunction(name, n, func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) { return 1, nil })
+		}
+	}
+	coll := func(name string) func(*sqlite.Driver) error {
+		return func(d *sqlite.Driver) error { return d.RegisterCollationUtf8(name, strings.Compare) }
+	}
+	for name, extend := range map[string]func(*sqlite.Driver) error{
+		"upper": fn("upper", 1), "UPPER/2": fn("UPPER", 2), "like": fn("like", 2), "like/3": fn("like", 3),
+		"lower": fn("lower", 1), "json_extract": fn("json_extract", 2), "fts5 function": fn("fts5", 1),
+		"nocase": coll("nocase"), "binary": coll("BINARY"), "rtrim": coll("rtrim"),
+		"fts5": func(d *sqlite.Driver) error { return d.RegisterModule("fts5", series{}) },
+		"RTREE": func(d *sqlite.Driver) error { return d.RegisterModule("RTREE", series{}) },
+		"json_each": func(d *sqlite.Driver) error { return d.RegisterModule("json_each", series{}) },
+		"pragma_table_info": func(d *sqlite.Driver) error { return d.RegisterModule("pragma_table_info", series{}) },
+		"_state_m": func(d *sqlite.Driver) error { return d.RegisterModule("_state_m", series{}) },
+		"hook": func(d *sqlite.Driver) error {
+			d.RegisterConnectionHook(func(sqlite.ExecQuerierContext, string) error { return nil })
+			return nil
+		},
+	} {
+		if _, err := NewDriver(extend); err == nil {
+			t.Errorf("%s: Extend accepted", name)
+		} else {
+			t.Logf("%s: %v", name, err)
+		}
+	}
+}

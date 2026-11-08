@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 
@@ -111,53 +112,70 @@ var builtinModules = []string{"fts5", "fts5vocab", "rtree", "rtree_i32", "geopol
 
 // NewDriver returns a Driver on which extend (if not nil) has registered
 // functions and virtual table modules. The modules it added are allowed to
-// application SQL besides the built-in ones; a collation is refused, since a
-// schema can use it (an index, a column) whatever trusted_schema says.
+// application SQL besides the built-in ones. It must not replace a function,
+// collation or module a fresh driver has (an index, a CHECK constraint or
+// the library's own SQL may use it), nor register a collation (a schema can
+// use it whatever trusted_schema says) or a connection hook (caller code on
+// every connection, activation included).
 func NewDriver(extend func(*sqlite.Driver) error) (*Driver, error) {
 	d := &Driver{sqlite: &sqlite.Driver{}, modules: map[string]bool{}}
-	if extend != nil {
-		if err := extend(d.sqlite); err != nil {
-			return nil, err
-		}
+	for _, m := range builtinModules {
+		d.modules[m] = true
+	}
+	if extend == nil {
+		return d, nil
+	}
+	if err := extend(d.sqlite); err != nil {
+		return nil, err
 	}
 	base, err := listed(&sqlite.Driver{})
 	if err != nil {
 		return nil, err
 	}
-	own, err := listed(d.sqlite)
-	if err != nil {
-		return nil, err
+	// modernc keeps a driver's registrations in unexported fields and
+	// replaces a built-in silently: reading them is the only way to see it.
+	v := reflect.ValueOf(d.sqlite).Elem()
+	funcs, colls, hooks, mods := v.FieldByName("udfs"), v.FieldByName("collations"), v.FieldByName("connectionHooks"), v.FieldByName("modules")
+	if !funcs.IsValid() || !colls.IsValid() || !hooks.IsValid() || !mods.IsValid() {
+		return nil, errors.New("engine: unsupported modernc.org/sqlite driver layout")
 	}
-	for name := range own {
-		if !base[name] && strings.HasPrefix(name, "collation ") {
-			return nil, fmt.Errorf("engine: registered %s: collations are not supported", name)
-		}
-		if mod, ok := strings.CutPrefix(name, "module "); ok && !base[name] && !reserved(mod) {
-			d.modules[mod] = true
+	if colls.Len() != 0 || hooks.Len() != 0 {
+		return nil, errors.New("engine: collations and connection hooks are not supported")
+	}
+	for _, k := range funcs.MapKeys() {
+		if n := strings.ToLower(k.String()); base["function "+n] {
+			return nil, fmt.Errorf("engine: registered function %s replaces a built-in", n)
 		}
 	}
-	for _, m := range builtinModules {
-		d.modules[m] = true
+	for _, k := range mods.MapKeys() {
+		n := strings.ToLower(k.String())
+		// SQLite registers json_* and pragma_* modules when first used.
+		if base["module "+n] || reserved(n) || strings.HasPrefix(n, "json") || strings.HasPrefix(n, "pragma_") {
+			return nil, fmt.Errorf("engine: registered module %s replaces a built-in or is reserved", n)
+		}
+		d.modules[n] = true
 	}
 	return d, nil
 }
 
-// listed returns the modules and collations of a connection opened by drv.
+// listed returns the functions and modules of a connection opened by drv,
+// lowercased in Go.
 func listed(drv *sqlite.Driver) (map[string]bool, error) {
 	db := sql.OpenDB(connector{drv, ":memory:"})
 	defer db.Close()
-	rows, err := db.Query("SELECT 'module ' || lower(name) FROM pragma_module_list UNION SELECT 'collation ' || lower(name) FROM pragma_collation_list")
+	rows, err := db.Query(`SELECT 'function ', name FROM pragma_function_list
+		UNION ALL SELECT 'module ', name FROM pragma_module_list`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	names := map[string]bool{}
 	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
+		var kind, n string
+		if err := rows.Scan(&kind, &n); err != nil {
 			return nil, err
 		}
-		names[n] = true
+		names[kind+strings.ToLower(n)] = true
 	}
 	return names, rows.Err()
 }

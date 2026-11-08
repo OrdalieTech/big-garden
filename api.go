@@ -74,9 +74,9 @@ type Config struct {
 	// state must live in the SQLite file only: a module keeps none
 	// elsewhere. Functions may be called from statements, not from schema
 	// objects (index expressions, triggers, views, CHECK, generated
-	// columns), so activation never runs caller code. Collations and
-	// connection hooks are not supported. An error fails Open with
-	// invalid_argument.
+	// columns), so activation never runs caller code. Collations,
+	// connection hooks and names replacing a built-in function or module
+	// are refused. An error fails Open with invalid_argument.
 	Extend func(*sqlite.Driver) error
 }
 
