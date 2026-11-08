@@ -16,16 +16,20 @@ const fanout = 8
 // maintainLater runs one maintenance step for e after the caller released
 // its mutex (PROTOCOL §6 step 10, best effort).
 func (n *Node) maintainLater(e *entity) {
-	if n.skipMaintenance {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed || n.skipMaintenance {
 		return
 	}
-	n.wg.Go(func() {
+	n.wg.Add(1) // under n.mu with closed false: never concurrent with Close's Wait
+	go func() {
+		defer n.wg.Done()
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) {
 			n.maintain(e)
 		}
-	})
+	}()
 }
 
 // maintain publishes a snapshot when the replay pages exceed page_count+256,
