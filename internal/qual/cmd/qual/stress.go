@@ -234,7 +234,9 @@ func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers
 		}
 	}
 	slices.Sort(durs)
-	q := func(x float64) string { return durs[min(n-1, int(x*float64(n)))].Round(100 * time.Microsecond).String() }
+	q := func(x float64) string {
+		return durs[min(n-1, int(x*float64(n)))].Round(100 * time.Microsecond).String()
+	}
 	p.P50, p.P95, p.P99, p.Max = q(0.50), q(0.95), q(0.99), q(1)
 	r.Phases = append(r.Phases, p)
 }
@@ -245,9 +247,9 @@ func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers
 // (a D12 re-proposal is sent only after the previous reply, so it is not
 // counted).
 type wire struct {
-	base *http.Transport
-	mu   sync.Mutex
-	c    wireCounts
+	base     *http.Transport
+	mu       sync.Mutex
+	c        wireCounts
 	inflight map[string]int // head key + condition of head CAS requests awaiting a reply
 }
 
