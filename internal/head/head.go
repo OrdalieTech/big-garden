@@ -62,19 +62,15 @@ func NewID() ID {
 	return id
 }
 
-func (v ID) String() string                  { return hex.EncodeToString(v[:]) }
-func (v ID) MarshalText() ([]byte, error)    { return hexText(v[:]), nil }
-func (v *ID) UnmarshalText(t []byte) error   { return unhex(v[:], t) }
-func (v OpID) MarshalText() ([]byte, error)  { return hexText(v[:]), nil }
-func (v *OpID) UnmarshalText(t []byte) error { return unhex(v[:], t) }
-func (v Digest) String() string              { return hex.EncodeToString(v[:]) }
-func (v Digest) MarshalText() ([]byte, error) {
-	return hexText(v[:]), nil
-}
-func (v *Digest) UnmarshalText(t []byte) error { return unhex(v[:], t) }
-func (c Checksum) MarshalText() ([]byte, error) {
-	return fmt.Appendf(nil, "%016x", uint64(c)), nil
-}
+func (v ID) String() string                     { return hex.EncodeToString(v[:]) }
+func (v ID) MarshalText() ([]byte, error)       { return hex.AppendEncode(nil, v[:]), nil }
+func (v *ID) UnmarshalText(t []byte) error      { return unhex(v[:], t) }
+func (v OpID) MarshalText() ([]byte, error)     { return hex.AppendEncode(nil, v[:]), nil }
+func (v *OpID) UnmarshalText(t []byte) error    { return unhex(v[:], t) }
+func (v Digest) String() string                 { return hex.EncodeToString(v[:]) }
+func (v Digest) MarshalText() ([]byte, error)   { return hex.AppendEncode(nil, v[:]), nil }
+func (v *Digest) UnmarshalText(t []byte) error  { return unhex(v[:], t) }
+func (c Checksum) MarshalText() ([]byte, error) { return fmt.Appendf(nil, "%016x", uint64(c)), nil }
 func (c *Checksum) UnmarshalText(t []byte) error {
 	var b [8]byte
 	if err := unhex(b[:], t); err != nil {
@@ -83,8 +79,6 @@ func (c *Checksum) UnmarshalText(t []byte) error {
 	*c = Checksum(binary.BigEndian.Uint64(b[:]))
 	return nil
 }
-
-func hexText(b []byte) []byte { return hex.AppendEncode(nil, b) }
 
 // unhex decodes exactly len(dst) bytes of lower-case hex.
 func unhex(dst, t []byte) error {
@@ -248,17 +242,14 @@ func encode(v any, limit int, validate func() error) ([]byte, error) {
 }
 
 // ValidKey reports whether k is an acceptable entity key.
-func ValidKey(k string) error {
-	if k == "" || len(k) > MaxKeyBytes || !utf8.ValidString(k) {
-		return fmt.Errorf("key must be 1..%d bytes of valid UTF-8", MaxKeyBytes)
-	}
-	return nil
-}
+func ValidKey(k string) error { return validName("key", k, MaxKeyBytes) }
 
 // ValidNode reports whether n is an acceptable NodeID.
-func ValidNode(n string) error {
-	if n == "" || len(n) > MaxNodeBytes || !utf8.ValidString(n) {
-		return fmt.Errorf("node ID must be 1..%d bytes of valid UTF-8", MaxNodeBytes)
+func ValidNode(n string) error { return validName("node ID", n, MaxNodeBytes) }
+
+func validName(what, s string, max int) error {
+	if s == "" || len(s) > max || !utf8.ValidString(s) {
+		return fmt.Errorf("%s must be 1..%d bytes of valid UTF-8", what, max)
 	}
 	return nil
 }
