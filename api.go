@@ -95,9 +95,6 @@ func (*Node) Import(context.Context, string, Request, io.Reader) (Ref, Result, e
 	return Ref{}, Result{}, unsupported()
 }
 
-// Collect deletes unreachable immutable artifacts of one entity (PLAN §9.2).
-func (*Node) Collect(context.Context, Ref) error { return unsupported() }
-
 func (*Node) Stats() Stats { return Stats{} }
 
 func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {

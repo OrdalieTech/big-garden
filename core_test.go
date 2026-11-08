@@ -930,3 +930,40 @@ func TestMaintenance(t *testing.T) {
 	}
 	l.verify(t, mem, "a")
 }
+
+func TestCollect(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	for range 40 {
+		mustPut(t, n, ref, "blob", randText(40<<10), l)
+		n.wg.Wait()
+	}
+	h, _ := headAt(t, mem, "k")
+	prefix := head.ObjectPrefix("k", h.Incarnation)
+	inflight := head.ObjectKey("k", h.Incarnation, h.Revision, head.NewID(), head.Digest{1}) // an upload not yet published
+	mem.PutImmutable(bg, inflight, []byte("x"))
+	mem.PutImmutable(bg, prefix+"junk", []byte("x")) // unparseable: never deleted
+	other := testNode(t, mem, "b", nil)               // any node may collect
+	if err := other.Collect(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	page, _, _ := mem.List(bg, prefix, "", 1000)
+	want := map[string]bool{h.Snapshot.Key: true, inflight: true, prefix + "junk": true}
+	for _, d := range h.Deltas {
+		want[d.Key] = true
+	}
+	for _, o := range page {
+		if !want[o.Key] {
+			t.Fatalf("unreachable object survived: %s", o.Key)
+		}
+		delete(want, o.Key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("objects that must survive were deleted: %v", want)
+	}
+	err := other.Collect(bg, Ref{"k", [16]byte{9}})
+	wantCode(t, err, CodeIncarnationMismatch)
+	l.verify(t, mem, "a")
+}

@@ -2,11 +2,13 @@ package garden
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"slices"
 
 	"github.com/OrdalieTech/big-garden/internal/engine"
 	"github.com/OrdalieTech/big-garden/internal/head"
+	"github.com/OrdalieTech/big-garden/internal/store"
 )
 
 const fanout = 8
@@ -84,4 +86,51 @@ func (n *Node) maintain(e *entity) {
 	}
 	c.next, c.object = next, &ref
 	n.publish(e, c) // not committed: the object is abandoned to collection
+}
+
+// Collect deletes unreachable immutable artifacts of one entity (PLAN §9.2,
+// PROTOCOL §10): objects of ref's incarnation whose base revision is below
+// the current head's revision and that the head does not reference. It runs
+// on any node and opens no SQLite.
+func (n *Node) Collect(ctx context.Context, ref Ref) error {
+	if err := head.ValidKey(ref.Key); err != nil {
+		return invalid(err.Error())
+	}
+	if n.isClosed() {
+		return newError(CodeClosed, "", nil)
+	}
+	obj, err := n.st.Get(ctx, head.HeadKey(ref.Key), "", maxHeadBytes)
+	switch store.OutcomeOf(err) {
+	case store.OK:
+	case store.NotFound:
+		return n.missing(ctx, ref.Key)
+	default:
+		return storeError(err)
+	}
+	h, err := n.decodeHead(obj.Body, ref.Key, ref.Incarnation)
+	if err != nil {
+		return err
+	}
+	live := map[string]bool{h.Snapshot.Key: true}
+	for _, d := range h.Deltas {
+		live[d.Key] = true
+	}
+	prefix := head.ObjectPrefix(ref.Key, h.Incarnation)
+	for after := ""; ; {
+		page, more, err := n.st.List(ctx, prefix, after, 1000)
+		if err != nil {
+			return storeError(err)
+		}
+		for _, o := range page {
+			after = o.Key
+			if base, _, _, err := head.ParseObjectKey(prefix, o.Key); err == nil && base < h.Revision && !live[o.Key] {
+				if err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) == store.Failed {
+					return storeError(err)
+				} // Unknown: left for a later pass
+			}
+		}
+		if !more || len(page) == 0 {
+			return nil
+		}
+	}
 }
