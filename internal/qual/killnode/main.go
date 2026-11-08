@@ -66,7 +66,8 @@ type Resp struct {
 	Inc      string
 	IDs      []string
 	Tag      string
-	Route    *Rt // takeover/resolve result, or the Route of a typed error
+	Route    *Rt      // takeover/resolve result, or the Route of a typed error
+	Batches  []uint64 // add: the node's Stats.Batches when it answered (index k-1: k members)
 }
 
 func main() {
@@ -88,7 +89,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(2)
 	}
-	replyKill := 0
+	replyKill, replies := 0, 0
 	if f := strings.Split(os.Getenv("GARDEN_FAILPOINT")+"::", ":"); f[0] == "reply" {
 		replyKill, _ = strconv.Atoi(f[1])
 	}
@@ -96,7 +97,7 @@ func main() {
 	out := json.NewEncoder(os.Stdout)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for replies := 1; in.Scan(); replies++ {
+	for in.Scan() {
 		var r Req
 		if err := json.Unmarshal(in.Bytes(), &r); err != nil {
 			fmt.Fprintln(os.Stderr, "request:", err)
@@ -108,14 +109,20 @@ func main() {
 				resp.Tag = r.Tag
 				mu.Lock()
 				out.Encode(resp)
+				if replies++; replies == replyKill {
+					syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				}
 				mu.Unlock()
 			})
 			continue
 		}
-		out.Encode(serve(ctx, n, r))
-		if replies == replyKill {
+		resp := serve(ctx, n, r)
+		mu.Lock()
+		out.Encode(resp)
+		if replies++; replies == replyKill {
 			syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		}
+		mu.Unlock()
 	}
 	wg.Wait()
 	n.Close(ctx)
@@ -199,6 +206,11 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 	if r.Op == "resolve" || r.Op == "takeover" {
 		rt = toRt(route)
 	}
+	var batches []uint64
+	if r.Op == "add" {
+		b := n.Stats().Batches
+		batches = b[:]
+	}
 	return Resp{OK: true, Value: string(res.Value), Seq: res.Version.Sequence, Replayed: res.Replayed,
-		Inc: hex.EncodeToString(ref.Incarnation[:]), IDs: ids, Route: rt}
+		Inc: hex.EncodeToString(ref.Incarnation[:]), IDs: ids, Route: rt, Batches: batches}
 }

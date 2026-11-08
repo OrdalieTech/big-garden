@@ -431,14 +431,25 @@ func TestRoutedHistories(t *testing.T) {
 			return
 		}
 	}
-	t.Logf("%d runs: %d histories checked linearizable (%d needed unknown adds to take effect; 0 inconclusive), %d-%d ops each (%d total: %d acked adds (%d replayed, %d after an ambiguous attempt), %d unknown adds, %d failed adds, %d reads); %d stale-read mutations rejected (%d histories without a candidate read); %d attempts: %d unanswered, %d not_owner/route_changed followed, %d client takeovers (%d won); %d late replies checked (%d strong reads); faults: %v",
-		runs, st.histories, st.fullChecks, st.minOps, st.maxOps, st.ops, st.acked, st.replayed, st.ambiguous, st.unknown, st.failed, st.reads, st.controls, st.noControl, st.attempts, st.timeouts, st.redirects, st.takeovers, st.takeoversWon, st.late, st.lateReads, st.faults)
+	t.Logf("%d runs: %d histories checked linearizable (%d needed unknown adds to take effect; 0 inconclusive), %d-%d ops each (%d total: %d acked adds (%d replayed, %d after an ambiguous attempt), %d unknown adds, %d failed adds, %d reads); %d stale-read mutations rejected (%d histories without a candidate read); %d attempts: %d unanswered, %d not_owner/route_changed followed, %d client takeovers (%d won); %d late replies checked (%d strong reads); faults: %v; committed publications by members across node processes (GARDEN_TEST_BATCH) %v",
+		runs, st.histories, st.fullChecks, st.minOps, st.maxOps, st.ops, st.acked, st.replayed, st.ambiguous, st.unknown, st.failed, st.reads, st.controls, st.noControl, st.attempts, st.timeouts, st.redirects, st.takeovers, st.takeoversWon, st.late, st.lateReads, st.faults, batchSizes(st.batches))
+}
+
+func batchSizes(b [16]uint64) string {
+	var s []string
+	for k, c := range b {
+		if c > 0 {
+			s = append(s, fmt.Sprintf("%d:%d", k+1, c))
+		}
+	}
+	return strings.Join(s, " ")
 }
 
 type histStats struct {
 	histories, minOps, maxOps, ops, acked, replayed, ambiguous, unknown, failed, reads, controls, noControl int
 	attempts, timeouts, redirects, takeovers, takeoversWon, late, lateReads, fullChecks                     int
 	faults                                                                                                  map[string]int
+	batches                                                                                                 [16]uint64
 }
 
 func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
@@ -601,6 +612,9 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 	// independent ledger: every node process and cache destroyed, recovery from S3
 	for _, m := range cl.all {
 		m.kill()
+		for k, c := range m.batch {
+			st.batches[k] += c
+		}
 	}
 	for _, k := range keys {
 		led := newLedger()

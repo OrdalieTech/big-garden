@@ -47,6 +47,7 @@ type mnode struct {
 	wait  map[string]chan Resp
 	dead  bool
 	tags  int
+	batch []uint64 // the latest Stats.Batches the process reported
 }
 
 func startNode(t *testing.T, ep storetest.Endpoint, name string, args ...string) *mnode {
@@ -65,6 +66,9 @@ func startNode(t *testing.T, ep storetest.Endpoint, name string, args ...string)
 			m.mu.Lock()
 			c := m.wait[r.Tag]
 			delete(m.wait, r.Tag)
+			if sum(r.Batches) > sum(m.batch) {
+				m.batch = r.Batches
+			}
 			m.mu.Unlock()
 			if c != nil {
 				c <- r
