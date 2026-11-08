@@ -62,6 +62,7 @@ func (n *Node) enter(key string, id *MutationID) (*entity, error) {
 		return nil, err
 	}
 	e.mu.Lock()
+	e.used = time.Now()
 	if n.isClosed() {
 		e.mu.Unlock()
 		return nil, newError(CodeClosed, "", nil)
@@ -412,6 +413,9 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 // genesis runs PROTOCOL §5 steps 4–8.
 func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, bound head.Digest, inc head.ID, writeBirth bool,
 	build builder) (Ref, Result, error) {
+	if !n.room(e) {
+		return Ref{}, Result{}, newError(CodeCapacity, "ResidentEntities entities are busy", nil)
+	}
 	db, result, err := build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
 	if err != nil {
 		return Ref{}, Result{}, err

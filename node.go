@@ -30,6 +30,7 @@ type Node struct {
 	reserved int64 // cache bytes reserved by activations in progress
 	closed   bool
 
+	done            chan struct{} // closed by Close: stops the sweeper
 	counters        counters
 	wg              sync.WaitGroup // maintenance steps in flight
 	skipMaintenance bool           // tests of the §6.7 cap only
@@ -57,7 +58,77 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 	if err := n.sessionDir(); err != nil {
 		return nil, err
 	}
+	n.done = make(chan struct{})
+	go n.sweeper()
 	return n, nil
+}
+
+// sweeper discards the clean caches of entities idle for IdleTimeout.
+func (n *Node) sweeper() {
+	t := time.NewTicker(n.cfg.Limits.IdleTimeout / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.done:
+			return
+		case now := <-t.C:
+			n.evict(now.Add(-n.cfg.Limits.IdleTimeout), 0, nil)
+		}
+	}
+}
+
+// room makes room for self to become resident under ResidentEntities,
+// waiting briefly while every resident entity is busy.
+func (n *Node) room(self *entity) bool {
+	for i := 0; i < 100; i++ {
+		if n.evict(time.Time{}, n.cfg.Limits.ResidentEntities, self) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// evict discards resident, idle, settled entities last used before cutoff.
+// With keep > 0 it instead discards the least recently used one if at
+// least keep entities other than self are resident (busy ones count), and
+// reports whether there is room for self. It never blocks on an entity mutex.
+func (n *Node) evict(cutoff time.Time, keep int, self *entity) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	resident, lru := 0, (*entity)(nil)
+	var lruUsed time.Time
+	for _, e := range n.entities {
+		if e == self {
+			continue
+		}
+		if !e.mu.TryLock() {
+			resident++
+			continue
+		}
+		if e.db != nil && e.unresolved == nil && keep == 0 && e.used.Before(cutoff) {
+			e.discard()
+		}
+		if e.db != nil {
+			resident++
+			if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
+				lru, lruUsed = e, e.used
+			}
+		}
+		e.mu.Unlock()
+	}
+	if keep == 0 || resident < keep {
+		return true
+	}
+	if lru == nil || !lru.mu.TryLock() {
+		return false
+	}
+	defer lru.mu.Unlock()
+	if lru.db == nil || lru.unresolved != nil {
+		return false
+	}
+	lru.discard()
+	return true
 }
 
 func (n *Node) namespace(ctx context.Context) error {
@@ -213,6 +284,9 @@ func (n *Node) unreserve(b int64) {
 // deletes the session cache dir (PROTOCOL §7). It never closes the S3 client.
 func (n *Node) Close(ctx context.Context) error {
 	n.mu.Lock()
+	if !n.closed && n.done != nil {
+		close(n.done)
+	}
 	n.closed = true
 	es := make([]*entity, 0, len(n.entities))
 	for _, e := range n.entities {

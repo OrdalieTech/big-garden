@@ -32,6 +32,7 @@ type entity struct {
 	db         *engine.DB
 	unresolved *candidate
 	pages      []uint32
+	used       time.Time // last admission: cache policy only (ResidentEntities, IdleTimeout)
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.
@@ -272,6 +273,9 @@ func sleep(ctx context.Context, i int) error {
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting
 // with the current head if an object vanished or changed under it.
 func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag string) error {
+	if !n.room(e) {
+		return newError(CodeCapacity, "ResidentEntities entities are busy", nil)
+	}
 	need := 4*n.cfg.Limits.EntityBytes + 1<<20
 	if !n.reserve(need) {
 		return newError(CodeCapacity, "cache bytes exhausted", nil)

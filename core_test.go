@@ -1139,3 +1139,31 @@ func TestConcurrentUpdatesAndReads(t *testing.T) {
 	n.wg.Wait()
 	l.verify(t, mem, "a")
 }
+
+func TestCachePolicy(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", func(l *Limits) { l.ResidentEntities = 2; l.IdleTimeout = 100 * time.Millisecond })
+	l := newLedger()
+	var refs []Ref
+	for i := range 4 {
+		refs = append(refs, mustCreate(t, n, fmt.Sprint("e", i), l))
+		mustPut(t, n, refs[i], "a", fmt.Sprint(i), l)
+		if r := n.Stats().ResidentEntities; r > 2 {
+			t.Fatalf("%d resident entities, limit 2", r)
+		}
+	}
+	for _, ref := range refs { // evicted entities rehydrate on access
+		if got := readAll(t, n, ref); got["a"] == "" {
+			t.Fatalf("%s lost its row", ref.Key)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for n.Stats().ResidentEntities != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("idle caches were never evicted")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mustPut(t, n, refs[0], "b", "after idle", l)
+	l.verify(t, mem, "a")
+}
