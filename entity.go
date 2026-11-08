@@ -34,6 +34,7 @@ type entity struct {
 	unresolved *candidate
 	pages      []uint32
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
 	since      atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)

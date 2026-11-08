@@ -128,6 +128,7 @@ func (n *Node) evict(cutoff time.Time, keep int, self *entity) bool {
 		if e.db != nil && e.unresolved == nil && keep == 0 && e.used.Before(cutoff) {
 			e.discard()
 		}
+		n.forget(e)
 		if e.db != nil {
 			resident++
 			if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
@@ -273,7 +274,36 @@ func (n *Node) entity(key string) (*entity, error) {
 		e = &entity{key: key, mu: make(gate, 1)}
 		n.entities[key] = e
 	}
+	e.refs++
 	return e, nil
+}
+
+// leave ends an operation on e: it drops a head this session does not own
+// (the next access GETs it anyway), unlocks e and drops the reference.
+func (n *Node) leave(e *entity) {
+	if e.unresolved == nil && e.h != nil && !n.mine(e.h) {
+		e.discard()
+	}
+	e.mu.Unlock()
+	n.drop(e)
+}
+
+// drop releases one reference to e and forgets e once no operation holds it
+// and it is neither resident nor unresolved (PLAN §11.2).
+func (n *Node) drop(e *entity) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if e.refs--; e.refs == 0 && e.mu.TryLock() {
+		n.forget(e)
+		e.mu.Unlock()
+	}
+}
+
+// forget removes e from the map if nothing needs it; n.mu and e.mu are held.
+func (n *Node) forget(e *entity) {
+	if e.refs == 0 && e.db == nil && e.unresolved == nil && n.entities[e.key] == e {
+		delete(n.entities, e.key)
+	}
 }
 
 func (n *Node) isClosed() bool {

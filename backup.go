@@ -45,7 +45,7 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 	locked := true
 	defer func() {
 		if locked {
-			e.mu.Unlock()
+			n.leave(e)
 		}
 	}()
 	if err := n.owned(ctx, e, ref, true); err != nil {
@@ -67,7 +67,7 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 	if err != nil || len(m) > maxHeadBytes {
 		return Version{}, newError(CodeCorrupt, "manifest", err)
 	}
-	e.mu.Unlock() // the archive is in memory: w never blocks the entity
+	n.leave(e) // the archive is in memory: w never blocks the entity
 	locked = false
 	tw := tar.NewWriter(w)
 	for _, f := range []struct {

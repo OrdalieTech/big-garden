@@ -1360,6 +1360,44 @@ func TestRecoveriesBound(t *testing.T) {
 	}
 }
 
+// TestEntityMapBounded: operations on entities this node does not hold
+// leave no in-memory entry behind (PLAN §11.2).
+func TestEntityMapBounded(t *testing.T) {
+	mem := newStore(t)
+	owner := testNode(t, mem, "owner", nil)
+	var refs []Ref
+	for i := range 20 {
+		refs = append(refs, mustCreate(t, owner, fmt.Sprint("k", i), nil))
+	}
+	n := testNode(t, mem, "a", nil)
+	for i := range 1000 {
+		_, err := n.Read(bg, refs[i%len(refs)], 1, func(*View) ([]byte, error) { return nil, nil })
+		wantCode(t, err, CodeNotOwner)
+	}
+	_, err := n.Read(bg, Ref{Key: "missing"}, 1, func(*View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeNotFound)
+	entries := func() int {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		return len(n.entities)
+	}
+	if got := entries(); got != 0 {
+		t.Fatalf("%d entries after misrouted reads", got)
+	}
+	l := newLedger()
+	ref := mustCreate(t, n, "mine", l)
+	mustPut(t, n, ref, "a", "1", l)
+	if got := entries(); got != 1 { // resident
+		t.Fatalf("%d entries", got)
+	}
+	err = n.Evict(bg, ref)
+	n.wg.Wait() // the maintenance step after the Update holds the entity too
+	if err != nil || entries() != 0 {
+		t.Fatalf("evict %v, %d entries", err, entries())
+	}
+	l.verify(t, mem, "a")
+}
+
 func TestMaintenance(t *testing.T) {
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)

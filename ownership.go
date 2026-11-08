@@ -40,7 +40,7 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 	if err != nil {
 		return Route{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	for try := 0; ; try++ {
 		if err := n.fetch(ctx, e, observed.Ref.Incarnation); err != nil {
 			return Route{}, err
@@ -88,7 +88,7 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 	if err != nil {
 		return err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	if e.h == nil || !n.mine(e.h) {
 		if err := n.fetch(ctx, e, ref.Incarnation); err != nil {
 			return err
@@ -110,8 +110,7 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 }
 
 // Evict closes and deletes the local cache of ref; ownership is unchanged
-// (PROTOCOL §7). The entity struct stays registered, so its mutex keeps
-// serializing every operation on the key.
+// (PROTOCOL §7).
 func (n *Node) Evict(ctx context.Context, ref Ref) error {
 	if err := head.ValidKey(ref.Key); err != nil {
 		return invalid(err.Error())
@@ -120,7 +119,7 @@ func (n *Node) Evict(ctx context.Context, ref Ref) error {
 	if err != nil {
 		return err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	e.discard()
 	return nil
 }

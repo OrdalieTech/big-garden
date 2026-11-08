@@ -64,11 +64,13 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, 
 	}
 	if e.waiting.Add(1) > int64(n.cfg.Limits.PendingPerEntity) {
 		e.waiting.Add(-1)
+		n.drop(e)
 		return nil, newError(CodeCapacity, "too many operations queued on the entity", nil)
 	}
 	err = e.mu.lock(ctx)
 	e.waiting.Add(-1)
 	if err != nil {
+		n.drop(e)
 		if id == nil || *id != (MutationID{}) {
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: *cmp.Or(id, &MutationID{}), Message: "deadline while queued", cause: err}
 		}
@@ -76,7 +78,7 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, 
 	}
 	e.used = time.Now()
 	if n.isClosed() {
-		e.mu.Unlock()
+		n.leave(e)
 		return nil, newError(CodeClosed, "", nil)
 	}
 	if c := e.unresolved; c != nil {
@@ -84,7 +86,7 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, 
 		n.resolve(ctx, e, c)
 		cancel()
 		if e.unresolved != nil {
-			e.mu.Unlock()
+			n.leave(e)
 			if id == nil || (c.op != nil && *c.op == head.OpID(*id)) {
 				return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "earlier attempt still unresolved"}
 			}
@@ -245,7 +247,7 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	if err != nil {
 		return Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	if err := n.owned(ctx, e, ref, true); err != nil {
 		return Result{}, err
 	}
@@ -270,7 +272,7 @@ func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, 
 	if err != nil {
 		return Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	return n.lookup(ctx, e, ref, id)
 }
 
@@ -340,7 +342,7 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
@@ -554,7 +556,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 	if err != nil {
 		return Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	for redo := 0; redo < 2; redo++ {
 		if err := n.owned(ctx, e, ref, redo > 0); err != nil {
 			return Result{}, withOp(err, req.ID)

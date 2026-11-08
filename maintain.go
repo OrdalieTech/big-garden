@@ -22,10 +22,11 @@ func (n *Node) maintainLater(e *entity) {
 		return
 	}
 	n.wg.Add(1) // under n.mu with closed false: never concurrent with Close's Wait
+	e.refs++
 	go func() {
 		defer n.wg.Done()
 		e.mu.Lock()
-		defer e.mu.Unlock()
+		defer n.leave(e)
 		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) {
 			n.maintain(e)
 		}
