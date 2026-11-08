@@ -157,7 +157,6 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 		e.discard()
 		e.unresolved = nil
 		e.since.Store(0)
-		e.since.Store(0)
 		return nil, storeError(err)
 	}
 	rec, err = n.resolve(ctx, e, c)
@@ -248,16 +247,21 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 			return nil, err // e.unresolved stays: a later operation resolves again
 		}
 		r, ok, err := e.db.Receipt(*c.op)
-		if err != nil {
+		m, merr := e.db.Meta()
+		if err = errors.Join(err, merr); err != nil {
 			e.discard()
 			return nil, engineError(err)
 		}
 		if ok && r.InputHash != c.bound {
 			e.unresolved = nil
 			e.since.Store(0)
-			e.since.Store(0)
-			e.since.Store(0)
 			return nil, &Error{Code: CodeIDConflict, Operation: opOf(c), Message: "operation ID used with another input"}
+		}
+		if !ok && tsOf(opOf(c)) <= int64(m.FloorMs) { // a newer owner may have pruned our receipt
+			e.discard()
+			e.unresolved = nil
+			e.since.Store(0)
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "receipt floor passed during publication"}
 		}
 		committed, rec = ok, &r
 	case c.object != nil: // maintenance: committed only if its object is referenced

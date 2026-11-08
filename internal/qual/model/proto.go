@@ -290,6 +290,11 @@ func (x *px) run(ev, res uint8) {
 		case i >= 0:
 			x.resolved()
 			x.subret(sConflict)
+		case x.c.Reqs[c.Req-1].TS <= cur.Img.Floor: // the receipt may have been pruned: unknown for good
+			x.discard()
+			x.resolved()
+			x.p.Cur, x.p.Code = cur, cUnknown
+			x.subret(sDead)
 		default:
 			x.dead(cur)
 		}
@@ -724,7 +729,7 @@ func (x *px) settled() bool {
 func (x *px) subFail() {
 	switch x.p.Res {
 	case sDead:
-		x.finish(out{code: x.p.Code, def: true})
+		x.finish(out{code: x.p.Code, def: x.p.Code != cUnknown})
 	case sConflict:
 		x.finish(out{code: cIDConflict, img: x.p.Cur.Img, hasImg: true, def: true})
 	case sUnknown:

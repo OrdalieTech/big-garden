@@ -875,6 +875,58 @@ func TestResolveBranches(t *testing.T) {
 	})
 }
 
+// TestResolvePrunedReceipt: an inline mutation applies, its reply is lost,
+// and before resolve reads the head another owner advances the expiry floor
+// past the ID, pruning the receipt. Resolve must not call it not committed.
+func TestResolvePrunedReceipt(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	other := testNode(t, mem, "b", nil)
+	other.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	hold := make(chan struct{})
+	var state atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		switch {
+		case a.Op == "cas" && a.Key == head.HeadKey("k") && state.CompareAndSwap(0, 1):
+			return storetest.MemFault{LoseReply: true}
+		case a.Op == "get" && a.Key == head.HeadKey("k") && state.CompareAndSwap(1, 2):
+			return storetest.MemFault{Hold: hold}
+		}
+		return storetest.MemFault{}
+	})
+	go func() {
+		defer close(hold)
+		for state.Load() != 2 {
+			time.Sleep(time.Millisecond)
+		}
+		route, err := other.Resolve(bg, "k")
+		if err == nil {
+			_, err = other.Takeover(bg, route)
+		}
+		req := newReq(t, "advance the floor", 1)
+		req.ID, _ = NewMutationID(time.Now().Add(2 * time.Hour))
+		if err == nil {
+			_, err = other.Update(bg, ref, req, put("c", "3"))
+		}
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	req := newReq(t, "applied", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	if e := wantCode(t, err, CodeOutcomeUnknown); e.Operation != req.ID {
+		t.Fatalf("operation %x", e.Operation)
+	}
+	if got := readAll(t, other, ref); got["b"] != "2" { // it did commit
+		t.Fatalf("rows %v", got)
+	}
+	_, err = other.Lookup(bg, ref, req.ID)
+	wantCode(t, err, CodeIDExpired)
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer

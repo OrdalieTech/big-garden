@@ -71,7 +71,7 @@ A candidate is `{base *Head (nil for genesis), baseETag, next Head, nonces []ID,
 2. Strict decode `cur`. If `cur.nonce ∈ c.nonces`: committed; `e.H, e.E = cur, etag`; `unresolved = nil`.
 3. If `base == nil` or `cur.revision > base.revision`, every proposal is dead (their condition can never hold again). Then:
    - `c.object` is referenced by `cur`: committed (only our transition could introduce it). The tail is not an object and never proves anything here. A maintenance candidate (object, no op) whose object is not referenced is not committed.
-   - else `c.op != nil` (always the case for an inline-tail mutation): hydrate `cur` (§4) and look up the receipt: same `bound` → committed (return the stored result); other `bound` → `id_conflict`; absent → not committed.
+   - else `c.op != nil` (always the case for an inline-tail mutation): hydrate `cur` (§4) and look up the receipt: same `bound` → committed (return the stored result); other `bound` → `id_conflict`; absent with `ts(op) ≤ meta.expiry_floor_ms` of `cur`'s image → a newer owner may have pruned the receipt (or a snapshot or compaction dropped our object), so the outcome is unknown for good: discard; `unresolved = nil` (every proposal is dead); return `outcome_unknown` (a retry then gets `id_expired`); absent otherwise → not committed.
    - else takeover: committed iff `cur.owner == self`; release: done iff `cur.owner != self`.
    - Not committed: discard; `unresolved = nil`; return `not_owner` with `cur`'s Route if `cur.owner != self`, else `route_changed`.
 4. `cur` is still the base (same nonce, or still absent): if `len(c.nonces) < 3`, set `next.nonce = NewID()`, append it, `CAS(encode(next), baseETag)`; `OK` → committed. Back off, loop.
