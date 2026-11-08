@@ -1,8 +1,12 @@
 package garden
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
 	"testing"
@@ -10,6 +14,8 @@ import (
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/OrdalieTech/big-garden/internal/store"
+	"github.com/OrdalieTech/big-garden/internal/storetest"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // pauseStore calls hook before and after each store call of one Node: a
@@ -456,4 +462,217 @@ func TestCollectDuringActivation(t *testing.T) {
 	mustPut(t, c, ref, "after", "1", l)
 	c.Close(bg)
 	l.verify(t, st, "c")
+}
+
+// corruptFixture is an entity whose head references a genesis snapshot, a
+// compacted (level 1) delta and level-0 deltas, and carries an inline tail.
+func corruptFixture(t *testing.T) (*storetest.Mem, Ref, *ledger, *head.Head) {
+	mem := storetest.NewMem()
+	a := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, a, "k", l)
+	for i := range fanout + 1 {
+		mustPut(t, a, ref, fmt.Sprint("blob", i), randText(40<<10), l)
+		a.wg.Wait()
+	}
+	mustPut(t, a, ref, "inline", "x", l)
+	a.wg.Wait()
+	a.Close(bg)
+	h, _ := headAt(t, mem, "k")
+	if h.Tail == nil || len(h.Deltas) < 2 || h.Deltas[0].Level != 1 || h.Deltas[len(h.Deltas)-1].Level != 0 {
+		t.Fatalf("fixture head: tail %v deltas %+v", h.Tail != nil, h.Deltas)
+	}
+	return mem, ref, l, h
+}
+
+// TestCorruptRetainedObjects flips a byte in, truncates or deletes each
+// retained object type and rewrites the head's inline tail: a fresh node
+// (empty cache) fails closed with corrupt or state_missing, never serves and
+// never reinitializes; once the fault is gone everything acknowledged reads.
+func TestCorruptRetainedObjects(t *testing.T) {
+	type target struct {
+		name string
+		key  func(*head.Head) string
+	}
+	targets := []target{
+		{"snapshot", func(h *head.Head) string { return h.Snapshot.Key }},
+		{"compacted", func(h *head.Head) string { return h.Deltas[0].Key }},
+		{"delta", func(h *head.Head) string { return h.Deltas[len(h.Deltas)-1].Key }},
+	}
+	faults := map[string]func([]byte) []byte{
+		"flip":     func(b []byte) []byte { b = bytes.Clone(b); b[len(b)/2] ^= 0x10; return b },
+		"truncate": func(b []byte) []byte { return b[:len(b)-1] },
+	}
+	for _, tg := range targets {
+		for name, f := range faults {
+			t.Run(tg.name+"/"+name, func(t *testing.T) {
+				mem, ref, l, h := corruptFixture(t)
+				key := tg.key(h)
+				mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+					if a.Op == "get" && a.Key == key {
+						return storetest.MemFault{Body: f}
+					}
+					return storetest.MemFault{}
+				})
+				expectFailClosed(t, mem, ref, CodeCorrupt)
+				mem.SetPlan(nil)
+				requireHeadUnchanged(t, mem, h)
+				l.verify(t, mem, ownerOf(t, mem)) // b's failed takeover kept its claim (PROTOCOL §7 step 7)
+			})
+		}
+		t.Run(tg.name+"/delete", func(t *testing.T) {
+			mem, ref, _, h := corruptFixture(t)
+			if err := mem.Delete(bg, tg.key(h)); err != nil {
+				t.Fatal(err)
+			}
+			expectFailClosed(t, mem, ref, CodeStateMissing)
+			requireHeadUnchanged(t, mem, h)
+		})
+	}
+	for _, recompute := range []bool{false, true} {
+		t.Run(fmt.Sprint("tail/sha-recomputed=", recompute), func(t *testing.T) {
+			mem, ref, l, h := corruptFixture(t)
+			o, _ := mem.Peek(head.HeadKey("k"))
+			data, _ := json.Marshal(h.Tail.Data)
+			bad := bytes.Clone(h.Tail.Data)
+			bad[len(bad)/2] ^= 0x10
+			badData, _ := json.Marshal(bad)
+			body := bytes.Replace(o.Body, data, badData, 1)
+			if recompute {
+				oldSum, _ := json.Marshal(h.Tail.SHA256)
+				newSum, _ := json.Marshal(head.Digest(sha256.Sum256(bad)))
+				body = bytes.Replace(body, oldSum, newSum, 1)
+			}
+			if bytes.Equal(body, o.Body) {
+				t.Fatal("tail not rewritten")
+			}
+			etag, err := mem.PutCAS(bg, head.HeadKey("k"), body, o.ETag)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := head.Decode(body); err == nil && !recompute {
+				t.Fatal("strict decode accepted a tail whose SHA-256 differs")
+			}
+			expectFailClosed(t, mem, ref, CodeCorrupt)
+			cur, _ := mem.Peek(head.HeadKey("k"))
+			if !recompute && cur.ETag != etag {
+				t.Fatal("a node rewrote a head that fails strict decode")
+			}
+			if recompute { // a claim may carry the tail byte-identical; it must stay the damaged one
+				ch, _ := headAt(t, mem, "k")
+				if !bytes.Equal(ch.Tail.Data, bad) || ch.Sequence != h.Sequence || ch.Incarnation != h.Incarnation {
+					t.Fatal("the damaged tail was replaced")
+				}
+			}
+			mem.PutCAS(bg, head.HeadKey("k"), o.Body, cur.ETag) // repair: the original head
+			l.verify(t, mem, "a")
+		})
+	}
+}
+
+// expectFailClosed reads, updates, exports and takes over ref from fresh
+// nodes with empty caches: each must fail with code.
+func expectFailClosed(t *testing.T, mem *storetest.Mem, ref Ref, code Code) {
+	t.Helper()
+	n := testNode(t, mem, "a", nil) // D4: the owner's next session
+	_, err := n.Read(bg, ref, 1, func(*View) ([]byte, error) { return []byte("served"), nil })
+	wantCode(t, err, code)
+	_, err = n.Update(bg, ref, newReq(t, "u", 1), put("u", "1"))
+	wantCode(t, err, code)
+	_, err = n.Export(bg, ref, io.Discard)
+	wantCode(t, err, code)
+	n.Close(bg)
+	b := testNode(t, mem, "b", nil)
+	if route, err := b.Resolve(bg, ref.Key); err == nil {
+		_, err = b.Takeover(bg, route)
+		wantCode(t, err, code)
+	} else {
+		wantCode(t, err, code)
+	}
+	_, _, err = b.Create(bg, ref.Key, newReq(t, "again", 1), createKV)
+	if err == nil {
+		t.Fatal("Create reinitialized a key whose state is damaged")
+	}
+	b.Close(bg)
+}
+
+func ownerOf(t *testing.T, st store.Store) string {
+	t.Helper()
+	h, _ := headAt(t, st, "k")
+	return h.Owner.Node
+}
+
+func requireHeadUnchanged(t *testing.T, mem *storetest.Mem, h *head.Head) {
+	t.Helper()
+	cur, _ := headAt(t, mem, h.Key)
+	if cur.Incarnation != h.Incarnation || cur.Sequence != h.Sequence || cur.DatabaseChecksum != h.DatabaseChecksum {
+		t.Fatalf("head changed from seq %d to %d (incarnation %v)", h.Sequence, cur.Sequence, cur.Incarnation == h.Incarnation)
+	}
+}
+
+// TestCorruptBirthAndNamespace: a damaged birth.json or namespace.json
+// fails closed; nothing is reinitialized empty.
+func TestCorruptBirthAndNamespace(t *testing.T) {
+	flip := func(b []byte) []byte { b = bytes.Clone(b); b[len(b)/2] ^= 0x10; return b }
+	trunc := func(b []byte) []byte { return b[:len(b)-1] }
+	for name, f := range map[string]func([]byte) []byte{"flip": flip, "truncate": trunc} {
+		t.Run("namespace/"+name, func(t *testing.T) {
+			mem, _, _, _ := corruptFixture(t)
+			mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+				if a.Op == "get" && a.Key == head.NamespaceKey {
+					return storetest.MemFault{Body: f}
+				}
+				return storetest.MemFault{}
+			})
+			cfg, _ := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: t.TempDir()}.validate()
+			_, err := open(bg, cfg, mem)
+			wantCode(t, err, CodeCorrupt)
+		})
+		t.Run("birth/"+name, func(t *testing.T) {
+			mem, ref, l, h := corruptFixture(t)
+			mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+				if a.Op == "get" && a.Key == head.BirthKey("k") {
+					return storetest.MemFault{Body: f}
+				}
+				return storetest.MemFault{}
+			})
+			n := testNode(t, mem, "b", nil)
+			_, _, err := n.Create(bg, "k", newReq(t, "other", 1), createKV)
+			if err == nil {
+				t.Fatal("Create over a damaged birth succeeded")
+			}
+			requireHeadUnchanged(t, mem, h)
+			o, _ := mem.Peek(head.HeadKey("k"))
+			mem.Delete(bg, head.HeadKey("k")) // head gone too: only the damaged birth remains
+			_, _, err = n.Create(bg, "k", newReq(t, "other2", 1), createKV)
+			wantCode(t, err, CodeCorrupt)
+			_, err = n.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+			wantCode(t, err, CodeStateMissing)
+			if _, ok := mem.Peek(head.HeadKey("k")); ok {
+				t.Fatal("a head was created over a damaged birth")
+			}
+			mem.SetPlan(nil)
+			mem.PutCAS(bg, head.HeadKey("k"), o.Body, "")
+			l.verify(t, mem, "a")
+		})
+	}
+	t.Run("namespace/delete", func(t *testing.T) {
+		mem, _, _, _ := corruptFixture(t)
+		mem.Delete(bg, head.NamespaceKey)
+		cfg, _ := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: t.TempDir()}.validate()
+		_, err := open(bg, cfg, mem)
+		wantCode(t, err, CodeStateMissing)
+	})
+	t.Run("birth/delete", func(t *testing.T) {
+		mem, ref, l, h := corruptFixture(t)
+		mem.Delete(bg, head.BirthKey("k"))
+		n := testNode(t, mem, "b", nil)
+		_, _, err := n.Create(bg, "k", newReq(t, "other", 1), createKV)
+		if err == nil {
+			t.Fatal("Create reinitialized a key whose birth.json is gone")
+		}
+		requireHeadUnchanged(t, mem, h)
+		_ = ref
+		l.verify(t, mem, "a")
+	})
 }
