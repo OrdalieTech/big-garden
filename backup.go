@@ -80,7 +80,7 @@ func (n *Node) exportFiles(ctx context.Context, ref Ref) (*head.Head, [2][]byte,
 	}
 	m, err := json.Marshal(manifest{head.Format, h.Namespace, h.Key, h.Incarnation, h.Sequence, h.Schema, head.Codec,
 		head.PageSize, h.PageCount, h.DatabaseChecksum, o.Ref.SHA256, o.Ref.Bytes})
-	if err != nil || len(m) > maxHeadBytes {
+	if err != nil || len(m) > head.MaxHeadBytes {
 		return nil, [2][]byte{}, newError(CodeCorrupt, "manifest", err)
 	}
 	return h, [2][]byte{m, snap.Bytes()}, nil
@@ -134,7 +134,7 @@ func (n *Node) readArchive(r io.Reader) (manifest, []byte, error) {
 	tr := tar.NewReader(cr)
 	var files [2][]byte
 	for i, name := range []string{"manifest.json", "snapshot.ltx"} {
-		limit := int64(maxHeadBytes)
+		limit := int64(head.MaxHeadBytes)
 		if i == 1 {
 			limit = n.cfg.Limits.EntityBytes + n.cfg.Limits.EntityBytes/head.PageSize*64 + 1<<20
 		}

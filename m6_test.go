@@ -865,7 +865,7 @@ func TestImportWhileOldWritersWrite(t *testing.T) {
 	}
 	l.verify(t, st, "a")
 	l2.verify(t, other, "z")
-	if _, err := other.Get(bg, head.HeadKey("src"), "", maxHeadBytes); store.OutcomeOf(err) != store.NotFound {
+	if _, err := other.Get(bg, head.HeadKey("src"), "", head.MaxHeadBytes); store.OutcomeOf(err) != store.NotFound {
 		t.Fatal("the import namespace has the source key")
 	}
 }
@@ -944,7 +944,7 @@ func TestImportRejectsMalformedArchives(t *testing.T) {
 		"symlink":             tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", typ: tar.TypeSymlink}),
 		"directory":           tarOf(member{name: "manifest.json", typ: tar.TypeDir}, member{name: "snapshot.ltx", body: snap}),
 		"oversized":           tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap, size: big}),
-		"manifest too big":    tarOf(member{name: "manifest.json", body: append(mj, make([]byte, maxHeadBytes)...)}, member{name: "snapshot.ltx", body: snap}),
+		"manifest too big":    tarOf(member{name: "manifest.json", body: append(mj, make([]byte, head.MaxHeadBytes)...)}, member{name: "snapshot.ltx", body: snap}),
 		"truncated":           archive.Bytes()[:len(archive.Bytes())-1024-100],
 		"trailing data":       append(bytes.Clone(archive.Bytes()), 'x'),
 		"trailing zeros>1MiB": append(bytes.Clone(archive.Bytes()), make([]byte, 1<<20+1)...),
@@ -976,7 +976,7 @@ func TestImportRejectsMalformedArchives(t *testing.T) {
 			key := fmt.Sprint("x", i)
 			_, _, err := a.Import(bg, key, newReq(t, name, 1), bytes.NewReader(archive))
 			wantCode(t, err, CodeCorrupt)
-			if _, err := st.Get(bg, head.BirthKey(key), "", 4<<10); store.OutcomeOf(err) != store.NotFound {
+			if _, err := st.Get(bg, head.BirthKey(key), "", head.MaxBirthBytes); store.OutcomeOf(err) != store.NotFound {
 				t.Fatal("a rejected import wrote birth.json")
 			}
 		})

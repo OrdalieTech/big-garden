@@ -184,7 +184,7 @@ func (n *Node) namespace(ctx context.Context) error {
 
 // readNamespace sets n.ns from namespace.json and reports whether it exists.
 func (n *Node) readNamespace(ctx context.Context) (bool, error) {
-	obj, err := n.st.Get(ctx, head.NamespaceKey, "", 1<<10)
+	obj, err := n.st.Get(ctx, head.NamespaceKey, "", head.MaxNamespaceBytes)
 	if store.OutcomeOf(err) == store.NotFound {
 		return false, nil
 	} else if err != nil {

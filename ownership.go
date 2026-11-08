@@ -12,7 +12,7 @@ import (
 // empty), discarding a local image that no longer matches or is no longer
 // owned.
 func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) error {
-	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, maxHeadBytes)
+	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
 		return nil

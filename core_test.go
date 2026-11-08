@@ -176,7 +176,7 @@ func headAt(t *testing.T, st store.Store, key string) (*head.Head, string) {
 			err = errors.New("no head")
 		}
 	} else {
-		o, err = st.Get(bg, head.HeadKey(key), "", maxHeadBytes)
+		o, err = st.Get(bg, head.HeadKey(key), "", head.MaxHeadBytes)
 	}
 	if err != nil {
 		t.Fatalf("head of %s: %v", key, err)

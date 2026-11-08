@@ -19,8 +19,6 @@ import (
 	"github.com/OrdalieTech/big-garden/internal/store"
 )
 
-const maxHeadBytes = 64 << 10
-
 // entity is the in-memory state of one key (DECISIONS D8): the cached head,
 // its ETag, the connection and the unresolved candidate. pages caches the
 // decoded page frames of each of h's snapshot, deltas and tail (the replay
@@ -121,7 +119,7 @@ func routeOf(h *head.Head) *Route {
 
 // missing returns state_missing if birth.json exists, else not_found.
 func (n *Node) missing(ctx context.Context, key string) error {
-	_, err := n.st.Get(ctx, head.BirthKey(key), "", 4<<10)
+	_, err := n.st.Get(ctx, head.BirthKey(key), "", head.MaxBirthBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
 		return newError(CodeStateMissing, "birth.json exists without head.json", nil)
@@ -219,7 +217,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		if i > 0 && pause(ctx, rand.N(10*time.Millisecond<<min(i, 7))) != nil { // full jitter, 10 ms doubling to 1 s
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown", cause: ctx.Err()}
 		}
-		obj, err := n.st.Get(ctx, head.HeadKey(e.key), "", maxHeadBytes)
+		obj, err := n.st.Get(ctx, head.HeadKey(e.key), "", head.MaxHeadBytes)
 		switch store.OutcomeOf(err) {
 		case store.OK:
 			cur, err := n.decodeHead(obj.Body, e.key, head.ID{})
@@ -344,7 +342,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 			err = cmp.Or(err, e)
 		}
 		if err != nil { // collection race, or a missing or corrupt object
-			obj, gerr := n.st.Get(ctx, head.HeadKey(e.key), etag, maxHeadBytes)
+			obj, gerr := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 			switch store.OutcomeOf(gerr) {
 			case store.OK:
 				if h, gerr = n.decodeHead(obj.Body, e.key, h.Incarnation); gerr != nil {

@@ -25,21 +25,21 @@ import (
 
 // Fixed format-1 protocol limits. None of them is configurable.
 const (
-	Format         = 1
-	Codec          = "ltx-v3"
-	PageSize       = 4096
-	MaxPages       = 256 << 20 / PageSize // 256 MiB qualified hard ceiling
-	MaxDeltas      = 32
-	MaxLevel       = 15
-	MaxKeyBytes    = 512
-	MaxNodeBytes   = 128
-	MaxInt         = 1<<63 - 1                      // revisions, epochs, sequences
-	MaxObjectBytes = MaxPages*(PageSize+64) + 1<<20 // LTX frame overhead plus index
-	InlineBytes    = 31 << 10                       // largest inline tail (raw LTX bytes), D16
-	ChecksumFlag   = Checksum(1 << 63)              // set on every LTX database checksum
-	maxHeadBytes   = 64 << 10
-	maxBirthBytes  = 4 << 10
-	maxNSBytes     = 1 << 10
+	Format            = 1
+	Codec             = "ltx-v3"
+	PageSize          = 4096
+	MaxPages          = 256 << 20 / PageSize // 256 MiB qualified hard ceiling
+	MaxDeltas         = 32
+	MaxLevel          = 15
+	MaxKeyBytes       = 512
+	MaxNodeBytes      = 128
+	MaxInt            = 1<<63 - 1                      // revisions, epochs, sequences
+	MaxObjectBytes    = MaxPages*(PageSize+64) + 1<<20 // LTX frame overhead plus index
+	InlineBytes       = 31 << 10                       // largest inline tail (raw LTX bytes), D16
+	ChecksumFlag      = Checksum(1 << 63)              // set on every LTX database checksum
+	MaxHeadBytes      = 64 << 10
+	MaxBirthBytes     = 4 << 10
+	MaxNamespaceBytes = 1 << 10
 )
 
 // ID is a 128-bit random identifier: namespace, incarnation, session, nonce
@@ -177,21 +177,21 @@ func (t *Tail) Ref() Ref {
 // DecodeNamespace strictly decodes and validates namespace.json.
 func DecodeNamespace(b []byte) (Namespace, error) {
 	var n Namespace
-	err := decode(b, maxNSBytes, &n, func() error { return n.validate() })
+	err := decode(b, MaxNamespaceBytes, &n, func() error { return n.validate() })
 	return n, err
 }
 
 // DecodeBirth strictly decodes and validates birth.json.
 func DecodeBirth(b []byte) (Birth, error) {
 	var v Birth
-	err := decode(b, maxBirthBytes, &v, func() error { return v.validate() })
+	err := decode(b, MaxBirthBytes, &v, func() error { return v.validate() })
 	return v, err
 }
 
 // Decode strictly decodes and validates head.json.
 func Decode(b []byte) (Head, error) {
 	var h Head
-	err := decode(b, maxHeadBytes, &h, func() error {
+	err := decode(b, MaxHeadBytes, &h, func() error {
 		if h.Deltas == nil {
 			return errors.New("deltas must be an array")
 		}
@@ -201,10 +201,10 @@ func Decode(b []byte) (Head, error) {
 }
 
 // Encode validates n and returns its canonical bytes.
-func (n Namespace) Encode() ([]byte, error) { return encode(n, maxNSBytes, n.validate) }
+func (n Namespace) Encode() ([]byte, error) { return encode(n, MaxNamespaceBytes, n.validate) }
 
 // Encode validates b and returns its canonical bytes.
-func (b Birth) Encode() ([]byte, error) { return encode(b, maxBirthBytes, b.validate) }
+func (b Birth) Encode() ([]byte, error) { return encode(b, MaxBirthBytes, b.validate) }
 
 // Encode validates h and returns its canonical bytes. A nil Deltas encodes
 // as an empty array.
@@ -212,7 +212,7 @@ func (h Head) Encode() ([]byte, error) {
 	if h.Deltas == nil {
 		h.Deltas = []Ref{}
 	}
-	return encode(h, maxHeadBytes, h.Validate)
+	return encode(h, MaxHeadBytes, h.Validate)
 }
 
 func decode(b []byte, limit int, v any, validate func() error) error {

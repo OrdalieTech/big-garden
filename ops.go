@@ -155,7 +155,7 @@ func (n *Node) claim(e *entity) error {
 // barrier revalidates the cached head (PROTOCOL §0). changed means the
 // caller redoes its operation from activation once.
 func (n *Node) barrier(ctx context.Context, e *entity) (changed bool, err error) {
-	_, err = n.st.Get(ctx, head.HeadKey(e.key), e.etag, maxHeadBytes)
+	_, err = n.st.Get(ctx, head.HeadKey(e.key), e.etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
 		return false, nil
@@ -233,7 +233,7 @@ func (n *Node) current(ctx context.Context, key string, inc head.ID) (*head.Head
 	if n.isClosed() {
 		return nil, newError(CodeClosed, "", nil)
 	}
-	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
+	obj, err := n.st.Get(ctx, head.HeadKey(key), "", head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
 		return n.decodeHead(obj.Body, key, inc)
@@ -348,7 +348,7 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 		return Ref{}, Result{}, err
 	}
 	defer n.leave(e)
-	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
+	obj, err := n.st.Get(ctx, head.HeadKey(key), "", head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
 		return n.createExists(ctx, e, req, bound, obj.Body)
@@ -485,7 +485,7 @@ func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound h
 
 // birth reads birth.json; nil if absent.
 func (n *Node) birth(ctx context.Context, key string) (*head.Birth, error) {
-	obj, err := n.st.Get(ctx, head.BirthKey(key), "", 4<<10)
+	obj, err := n.st.Get(ctx, head.BirthKey(key), "", head.MaxBirthBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotFound:
 		return nil, nil
