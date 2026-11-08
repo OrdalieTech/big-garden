@@ -19,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,10 +27,32 @@ import (
 	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
-// Req is one operation: create, add (insert a log row named by the ID) or read.
+// Req is one operation: create, add (insert a log row named by the ID), read,
+// resolve or takeover (of Route if set, else of the freshly resolved one).
+// A request with a Tag is served concurrently and its Resp carries the Tag.
 type Req struct {
 	Op, Key, Inc, ID, Input string
 	Big                     bool // add a 40 KiB pad so the delta is an object, not inline
+	Tag                     string
+	Route                   *Rt
+}
+
+// Rt is a garden.Route in JSON (hex incarnation and session).
+type Rt struct {
+	Inc, Node, Session string
+	Epoch, Revision    uint64
+}
+
+func toRt(r garden.Route) *Rt {
+	return &Rt{Inc: hex.EncodeToString(r.Ref.Incarnation[:]), Node: r.Owner.NodeID,
+		Session: hex.EncodeToString(r.Owner.Session[:]), Epoch: r.Epoch, Revision: r.Revision}
+}
+
+func fromRt(key string, r *Rt) garden.Route {
+	g := garden.Route{Ref: garden.Ref{Key: key}, Owner: garden.Owner{NodeID: r.Node}, Epoch: r.Epoch, Revision: r.Revision}
+	hex.Decode(g.Ref.Incarnation[:], []byte(r.Inc))
+	hex.Decode(g.Owner.Session[:], []byte(r.Session))
+	return g
 }
 
 // Resp answers one Req.
@@ -42,6 +65,8 @@ type Resp struct {
 	Replayed bool
 	Inc      string
 	IDs      []string
+	Tag      string
+	Route    *Rt // takeover/resolve result, or the Route of a typed error
 }
 
 func main() {
@@ -68,17 +93,30 @@ func main() {
 	}
 	in := bufio.NewScanner(os.Stdin)
 	out := json.NewEncoder(os.Stdout)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for replies := 1; in.Scan(); replies++ {
 		var r Req
 		if err := json.Unmarshal(in.Bytes(), &r); err != nil {
 			fmt.Fprintln(os.Stderr, "request:", err)
 			os.Exit(2)
 		}
+		if r.Tag != "" {
+			wg.Go(func() {
+				resp := serve(ctx, n, r)
+				resp.Tag = r.Tag
+				mu.Lock()
+				out.Encode(resp)
+				mu.Unlock()
+			})
+			continue
+		}
 		out.Encode(serve(ctx, n, r))
 		if replies == replyKill {
 			syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		}
 	}
+	wg.Wait()
 	n.Close(ctx)
 }
 
@@ -92,6 +130,7 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 	var res garden.Result
 	var err error
 	var ids []string
+	var route garden.Route
 	switch r.Op {
 	case "create":
 		ref, res, err = n.Create(ctx, r.Key, req, func(tx *garden.Tx) ([]byte, error) {
@@ -115,15 +154,19 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 			})
 			return []byte(strconv.Itoa(c)), err
 		})
+	case "resolve":
+		route, err = n.Resolve(ctx, r.Key)
+		ref = route.Ref
 	case "takeover":
-		var route garden.Route
-		if route, err = n.Resolve(ctx, r.Key); err == nil {
+		if r.Route != nil {
+			route, err = n.Takeover(ctx, fromRt(r.Key, r.Route))
+		} else if route, err = n.Resolve(ctx, r.Key); err == nil {
 			route, err = n.Takeover(ctx, route)
-			ref = route.Ref
 		}
+		ref = route.Ref
 	case "read":
 		res, err = n.Read(ctx, ref, 1, func(v *garden.View) ([]byte, error) {
-			return nil, v.Query(ctx, "SELECT id FROM log", nil, func(rows *sql.Rows) error {
+			return nil, v.Query(ctx, "SELECT id FROM log ORDER BY rowid", nil, func(rows *sql.Rows) error {
 				for rows.Next() {
 					var s string
 					if err := rows.Scan(&s); err != nil {
@@ -138,11 +181,19 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 	if err != nil {
 		var ge *garden.Error
 		code := "other"
+		var rt *Rt
 		if errors.As(err, &ge) {
 			code = string(ge.Code)
+			if ge.Route != nil {
+				rt = toRt(*ge.Route)
+			}
 		}
-		return Resp{Code: code, Err: err.Error()}
+		return Resp{Code: code, Err: err.Error(), Route: rt}
+	}
+	var rt *Rt
+	if r.Op == "resolve" || r.Op == "takeover" {
+		rt = toRt(route)
 	}
 	return Resp{OK: true, Value: string(res.Value), Seq: res.Version.Sequence, Replayed: res.Replayed,
-		Inc: hex.EncodeToString(ref.Incarnation[:]), IDs: ids}
+		Inc: hex.EncodeToString(ref.Incarnation[:]), IDs: ids, Route: rt}
 }
