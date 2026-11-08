@@ -392,7 +392,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 			objs = append(objs, bytes.NewReader(h.Tail.Data))
 		}
 		path := filepath.Join(n.dir, head.NewID().String()+".db")
-		db, err := engine.Restore(ctx, path, n.maxPages(), h, objs)
+		db, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs)
 		if err != nil {
 			n.counters.activationFailures.Add(1)
 			return engineError(err)

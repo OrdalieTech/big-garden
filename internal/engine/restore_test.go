@@ -67,7 +67,7 @@ func TestRestoreRejects(t *testing.T) {
 		}
 		fn(&h, objs)
 		path := filepath.Join(t.TempDir(), "db")
-		d, err := Restore(bg, path, 1000, &h, readers(objs[:len(h.Deltas)+1]))
+		d, err := Restore(bg, plain, path, 1000, &h, readers(objs[:len(h.Deltas)+1]))
 		if err == nil {
 			d.Discard()
 			t.Errorf("%s: restored", name)
@@ -102,7 +102,7 @@ func TestRestoreRejects(t *testing.T) {
 	}
 	h := f.head
 	h.Deltas = []head.Ref{c.Ref}
-	d, err := Restore(bg, filepath.Join(t.TempDir(), "db"), 1000, &h, readers([][]byte{f.objs[0], b.Bytes()}))
+	d, err := Restore(bg, plain, filepath.Join(t.TempDir(), "db"), 1000, &h, readers([][]byte{f.objs[0], b.Bytes()}))
 	if err != nil {
 		t.Fatalf("restore from compacted delta: %v", err)
 	}

@@ -22,6 +22,15 @@ import (
 
 var bg = context.Background()
 
+// plain is a Driver without extensions.
+var plain = func() *Driver {
+	d, err := NewDriver(nil)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}()
+
 func opID(n uint64) head.OpID {
 	var id head.OpID
 	binary.BigEndian.PutUint64(id[:], n)
@@ -54,7 +63,7 @@ func newFixture(t testing.TB, maxPages uint32) *fixture {
 		f.t = tt
 	}
 	ns, inc := head.NewID(), head.NewID()
-	d, err := Create(bg, filepath.Join(dir, "db"), maxPages, ns, "key", inc)
+	d, err := Create(bg, plain, filepath.Join(dir, "db"), maxPages, ns, "key", inc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +127,7 @@ func readers(objs [][]byte) []io.ReaderAt {
 // restore rebuilds the fixture's published head into a new file.
 func (f *fixture) restore(t testing.TB) *DB {
 	t.Helper()
-	d, err := Restore(bg, filepath.Join(t.TempDir(), "restored"), head.MaxPages, &f.head, readers(f.objs))
+	d, err := Restore(bg, plain, filepath.Join(t.TempDir(), "restored"), head.MaxPages, &f.head, readers(f.objs))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +167,7 @@ func TestCreateSettings(t *testing.T) {
 	if err := os.Mkdir(odd, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	od, err := Create(bg, filepath.Join(odd, "db?x"), 1000, head.ID{}, "k", head.ID{})
+	od, err := Create(bg, plain, filepath.Join(odd, "db?x"), 1000, head.ID{}, "k", head.ID{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,20 +188,20 @@ func TestCreateSettings(t *testing.T) {
 	}
 	// Genesis never reuses a file; an existing path is refused for both
 	// creation and restoration, and a missing file is never created by open.
-	if _, err := Create(bg, f.d.path, 1000, head.ID{}, "k", head.ID{}); !errors.Is(err, os.ErrExist) {
+	if _, err := Create(bg, plain, f.d.path, 1000, head.ID{}, "k", head.ID{}); !errors.Is(err, os.ErrExist) {
 		t.Fatalf("Create over an existing file: %v", err)
 	}
-	if _, err := Restore(bg, f.d.path, 1000, &f.head, []io.ReaderAt{bytes.NewReader(nil)}); !errors.Is(err, os.ErrExist) {
+	if _, err := Restore(bg, plain, f.d.path, 1000, &f.head, []io.ReaderAt{bytes.NewReader(nil)}); !errors.Is(err, os.ErrExist) {
 		t.Fatal("Restore over an existing file")
 	}
 	missing := filepath.Join(f.dir, "missing")
-	if _, err := open(bg, missing, 1000); err == nil {
+	if _, err := open(bg, plain, missing, 1000); err == nil {
 		t.Fatal("open created a missing file")
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("open left a file: %v", err)
 	}
-	if _, err := Create(bg, "relative", 1000, head.ID{}, "k", head.ID{}); err == nil {
+	if _, err := Create(bg, plain, "relative", 1000, head.ID{}, "k", head.ID{}); err == nil {
 		os.Remove("relative")
 		t.Fatal("relative path accepted")
 	}

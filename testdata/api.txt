@@ -46,6 +46,8 @@ type Config struct {
 	CacheDir	string
 	Limits		Limits
 	Logger		*slog.Logger
+
+	Extend	func(*sqlite.Driver) error
 }
 type Error struct {
 	Code		Code

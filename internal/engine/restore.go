@@ -28,7 +28,7 @@ const maxFrame = pageSize + pageSize/255 + 16
 // verified against h before and while it is applied; the final page count
 // and checksum must equal h's, the metadata row must match h and
 // integrity_check must pass. Every validation failure wraps ErrCorrupt.
-func Restore(ctx context.Context, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (*DB, error) {
+func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (*DB, error) {
 	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
 	if h.Tail != nil {
 		refs = append(refs, h.Tail.Ref())
@@ -56,7 +56,7 @@ func Restore(ctx context.Context, path string, maxPages uint32, h *head.Head, ob
 	if err = errors.Join(err, f.Close()); err != nil {
 		return nil, errors.Join(err, removeFiles(path))
 	}
-	d, err := open(ctx, path, maxPages)
+	d, err := open(ctx, drv, path, maxPages)
 	if err != nil {
 		return nil, errors.Join(err, removeFiles(path))
 	}

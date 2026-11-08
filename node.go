@@ -20,6 +20,7 @@ import (
 type Node struct {
 	cfg  Config
 	st   store.Store
+	drv  *engine.Driver
 	ns   head.ID
 	self head.Owner
 	dir  string   // session cache dir
@@ -53,6 +54,10 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
+	var err error
+	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {
+		return nil, invalid("Config.Extend: " + err.Error())
+	}
 	if err := n.namespace(ctx); err != nil {
 		return nil, err
 	}

@@ -10,6 +10,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
@@ -71,11 +73,12 @@ type Commit struct {
 
 // DB is one exclusively owned SQLite cache file.
 type DB struct {
-	path string
-	db   *sql.DB
-	conn *sql.Conn
-	main *os.File // read-only; holds the published image between checkpoints
-	pub  Image    // image of the main file (the last checkpointed, published state)
+	path    string
+	db      *sql.DB
+	conn    *sql.Conn
+	modules map[string]bool // virtual table modules application SQL may use
+	main    *os.File        // read-only; holds the published image between checkpoints
+	pub     Image           // image of the main file (the last checkpointed, published state)
 
 	// Pages holds, after Restore, the page frames of each restored object
 	// (snapshot, deltas, tail): the replay pages of PROTOCOL §6 step 7.
@@ -89,16 +92,91 @@ CREATE TABLE _state_meta(format INTEGER NOT NULL, namespace BLOB NOT NULL, key T
 CREATE TABLE _state_receipts(operation_id BLOB PRIMARY KEY, input_hash BLOB NOT NULL,
   result BLOB NOT NULL, sequence INTEGER NOT NULL) STRICT, WITHOUT ROWID;`
 
+// Driver opens the SQLite connections of one Node through a private modernc
+// driver, so the functions and modules registered on it reach no other
+// connection in the process (PLAN §6.1).
+type Driver struct {
+	sqlite  *sqlite.Driver
+	modules map[string]bool
+}
+
+// builtinModules are the compiled-in virtual table modules application SQL
+// may create: their state lives in ordinary shadow tables (DECISIONS D19).
+var builtinModules = []string{"fts5", "fts5vocab", "rtree", "rtree_i32", "geopoly"}
+
+// NewDriver returns a Driver on which extend (if not nil) has registered
+// functions and virtual table modules. The modules it added are allowed to
+// application SQL besides the built-in ones; a collation is refused, since a
+// schema can use it (an index, a column) whatever trusted_schema says.
+func NewDriver(extend func(*sqlite.Driver) error) (*Driver, error) {
+	d := &Driver{sqlite: &sqlite.Driver{}, modules: map[string]bool{}}
+	if extend != nil {
+		if err := extend(d.sqlite); err != nil {
+			return nil, err
+		}
+	}
+	base, err := listed(&sqlite.Driver{})
+	if err != nil {
+		return nil, err
+	}
+	own, err := listed(d.sqlite)
+	if err != nil {
+		return nil, err
+	}
+	for name := range own {
+		if !base[name] && strings.HasPrefix(name, "collation ") {
+			return nil, fmt.Errorf("engine: registered %s: collations are not supported", name)
+		}
+		if mod, ok := strings.CutPrefix(name, "module "); ok && !base[name] && !reserved(mod) {
+			d.modules[mod] = true
+		}
+	}
+	for _, m := range builtinModules {
+		d.modules[m] = true
+	}
+	return d, nil
+}
+
+// listed returns the modules and collations of a connection opened by drv.
+func listed(drv *sqlite.Driver) (map[string]bool, error) {
+	db := sql.OpenDB(connector{drv, ":memory:"})
+	defer db.Close()
+	rows, err := db.Query("SELECT 'module ' || lower(name) FROM pragma_module_list UNION SELECT 'collation ' || lower(name) FROM pragma_collation_list")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names[n] = true
+	}
+	return names, rows.Err()
+}
+
+// connector opens dsn through a private driver (database/sql registers it
+// nowhere).
+type connector struct {
+	d   *sqlite.Driver
+	dsn string
+}
+
+func (c connector) Connect(context.Context) (driver.Conn, error) { return c.d.Open(c.dsn) }
+func (c connector) Driver() driver.Driver                        { return c.d }
+
 // Create makes a new database for genesis at path, which must not exist, with
 // the reserved tables and a meta row at sequence 0 (PROTOCOL §5 step 4). The
 // first Mutate then produces sequence 1.
-func Create(ctx context.Context, path string, maxPages uint32, ns head.ID, key string, inc head.ID) (*DB, error) {
+func Create(ctx context.Context, drv *Driver, path string, maxPages uint32, ns head.ID, key string, inc head.ID) (*DB, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	f.Close()
-	d, err := open(ctx, path, maxPages)
+	d, err := open(ctx, drv, path, maxPages)
 	if err != nil {
 		removeFiles(path)
 		return nil, err
@@ -123,7 +201,7 @@ func Create(ctx context.Context, path string, maxPages uint32, ns head.ID, key s
 
 // open opens an existing file read-write (never creating it), applies and
 // verifies the engine settings, and installs the library-mode authorizer.
-func open(ctx context.Context, path string, maxPages uint32) (*DB, error) {
+func open(ctx context.Context, drv *Driver, path string, maxPages uint32) (*DB, error) {
 	if !filepath.IsAbs(path) || maxPages == 0 || maxPages > head.MaxPages {
 		return nil, fmt.Errorf("engine: invalid path or page limit")
 	}
@@ -133,12 +211,10 @@ func open(ctx context.Context, path string, maxPages uint32) (*DB, error) {
 		}
 	}
 	dsn := (&url.URL{Scheme: "file", OmitHost: true, Path: path, RawQuery: "mode=rw&_defensive=1"}).String()
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
+	db := sql.OpenDB(connector{drv.sqlite, dsn})
 	db.SetMaxOpenConns(1)
-	d := &DB{path: path, db: db}
+	d := &DB{path: path, db: db, modules: drv.modules}
+	var err error
 	if d.conn, err = db.Conn(ctx); err == nil {
 		err = d.setup(maxPages)
 	}
@@ -335,12 +411,16 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 	return result, seq, nil
 }
 
-// Read runs fn in a read-only scope inside a library read transaction.
+// Read runs fn in a read-only scope inside a library read transaction, with
+// query_only=ON besides the read-mode authorizer.
 func (d *DB) Read(fn func(*View) ([]byte, error)) (result []byte, err error) {
 	if err := d.exec("BEGIN"); err != nil {
 		return nil, err
 	}
-	defer func() { err = withCleanup(err, d.setMode(library), d.rollback()) }()
+	defer func() { err = withCleanup(err, d.setMode(library), d.exec("PRAGMA query_only=0"), d.rollback()) }()
+	if err := d.exec("PRAGMA query_only=1"); err != nil {
+		return nil, err
+	}
 	if err := d.setMode(read); err != nil {
 		return nil, err
 	}

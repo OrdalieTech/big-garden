@@ -10,6 +10,7 @@ import (
 
 	"github.com/OrdalieTech/big-garden/internal/engine"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"modernc.org/sqlite"
 )
 
 // Ref prevents a retry for an old/imported incarnation from reaching a new one.
@@ -64,6 +65,19 @@ type Config struct {
 	CacheDir string
 	Limits   Limits
 	Logger   *slog.Logger // nil: no logs; else outcome_unknown and corrupt outcomes, rate-limited
+
+	// Extend, if not nil, is called once by Open with the Node's private
+	// SQLite driver, before any connection, to register SQL functions and
+	// virtual table modules (DECISIONS D19). They reach only this Node's
+	// connections; its modules may be used by CREATE VIRTUAL TABLE besides
+	// the built-in fts5, fts5vocab, rtree, rtree_i32 and geopoly. Durable
+	// state must live in the SQLite file only: a module keeps none
+	// elsewhere. Functions may be called from statements, not from schema
+	// objects (index expressions, triggers, views, CHECK, generated
+	// columns), so activation never runs caller code. Collations and
+	// connection hooks are not supported. An error fails Open with
+	// invalid_argument.
+	Extend func(*sqlite.Driver) error
 }
 
 // Tx is the scoped SQL handle of a mutation callback. It is invalid after the

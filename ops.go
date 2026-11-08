@@ -303,7 +303,7 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 	}
 	bound := binding(1, req.Schema, req.Schema, req.Hash)
 	return n.create(ctx, key, req, bound, func(path string, inc head.ID) (*engine.DB, []byte, error) {
-		db, err := engine.Create(ctx, path, n.maxPages(), n.ns, key, inc)
+		db, err := engine.Create(ctx, n.drv, path, n.maxPages(), n.ns, key, inc)
 		if err != nil {
 			return nil, nil, engineError(err)
 		}

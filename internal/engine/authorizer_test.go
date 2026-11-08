@@ -55,8 +55,11 @@ func TestAuthorizerBypass(t *testing.T) {
 		"DELETE FROM sqlite_dbpage", "SELECT * FROM dbstat",
 		// connection-wide objects
 		"CREATE TEMP TABLE t(a)", "CREATE TEMP VIEW v AS SELECT 1", "CREATE TEMP TRIGGER tt AFTER INSERT ON app BEGIN SELECT 1; END",
-		"CREATE TABLE temp.t(a)", "CREATE VIRTUAL TABLE f USING fts5(x)",
-		"CREATE VIRTUAL TABLE r USING rtree(id, a, b)",
+		"CREATE TABLE temp.t(a)", "CREATE VIRTUAL TABLE temp.f USING fts5(x)",
+		// virtual tables of modules outside the allowlist or with reserved names (D19)
+		"CREATE VIRTUAL TABLE f USING dbstat", "CREATE VIRTUAL TABLE f USING sqlite_dbpage",
+		"CREATE VIRTUAL TABLE f USING nosuchmodule(x)", "CREATE VIRTUAL TABLE _state_f USING fts5(x)",
+		"CREATE VIRTUAL TABLE _state_r USING rtree(id, a, b)",
 		// schema table writes
 		"INSERT INTO sqlite_master VALUES ('table', 'x', 'x', 0, 'CREATE TABLE x(a)')",
 		"UPDATE sqlite_master SET sql = 'x'", "DELETE FROM sqlite_master",

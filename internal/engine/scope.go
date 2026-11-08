@@ -41,13 +41,27 @@ func (d *DB) setMode(m mode) error {
 		} else {
 			c.RegisterCommitHook(func() int32 { return 1 })
 		}
-		return c.RegisterAuthorizer(policy(m))
+		return c.RegisterAuthorizer(policy(m, d.modules))
 	})
 }
 
 // introspection lists the read-only pragmas application SQL may run.
 var introspection = map[string]bool{"table_info": true, "table_xinfo": true, "index_list": true,
 	"index_info": true, "index_xinfo": true, "foreign_key_list": true}
+
+// moduleReads lists the pragmas the built-in modules query, without an
+// argument: rtree reads page_size when it creates a table, fts5 reads
+// data_version to validate its cached structure.
+var moduleReads = map[string]bool{"page_size": true, "data_version": true}
+
+// rtreeShadow reports whether name may be a shadow table of rtree or
+// geopoly. Both prepare their writes when they connect, which may happen
+// first in read mode: those statements are authorized there, and Read's
+// query_only=ON keeps them (and any table so named) from writing.
+func rtreeShadow(name string) bool {
+	n := strings.ToLower(name)
+	return strings.HasSuffix(n, "_node") || strings.HasSuffix(n, "_rowid") || strings.HasSuffix(n, "_parent")
+}
 
 // reserved reports whether name is a library-owned object or a virtual table
 // exposing raw pages.
@@ -58,9 +72,12 @@ func reserved(name string) bool {
 
 // policy is the authorizer of mode m. Application modes allow an explicit
 // list of actions on the main database and deny everything else: transaction
-// control, ATTACH/DETACH, pragmas other than introspection, temporary and
-// virtual tables, extension loading, reserved objects and unknown actions.
-func policy(m mode) sqlite.AuthorizerFn {
+// control, ATTACH/DETACH, pragmas other than introspection, temporary
+// objects, virtual tables of modules outside modules, extension loading,
+// reserved objects and unknown actions. Statements a virtual table runs on
+// its shadow tables are authorized like application statements; defensive
+// mode keeps the shadow tables read-only to application SQL (DECISIONS D19).
+func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 	if m == library {
 		return func(sqlite.AuthorizerActionCode, string, string, string, string) sqlite.AuthorizerReturnCode {
 			return sqlite.AuthorizerOK
@@ -84,12 +101,20 @@ func policy(m mode) sqlite.AuthorizerFn {
 				return sqlite.AuthorizerOK
 			}
 		case sqlite.AuthPragma:
-			if introspection[strings.ToLower(arg1)] && !reserved(arg2) {
+			if introspection[strings.ToLower(arg1)] && !reserved(arg2) || moduleReads[strings.ToLower(arg1)] && arg2 == "" {
 				return sqlite.AuthorizerOK
 			}
-		case sqlite.AuthInsert, sqlite.AuthUpdate, sqlite.AuthDelete, sqlite.AuthCreateTable, sqlite.AuthCreateView,
+		case sqlite.AuthInsert, sqlite.AuthUpdate, sqlite.AuthDelete:
+			if m == mutation || rtreeShadow(arg1) { // read mode runs with query_only=ON
+				return sqlite.AuthorizerOK
+			}
+		case sqlite.AuthCreateTable, sqlite.AuthCreateView,
 			sqlite.AuthDropTable, sqlite.AuthDropView, sqlite.AuthReindex: // CREATE INDEX authorizes a REINDEX
 			if m == mutation {
+				return sqlite.AuthorizerOK
+			}
+		case sqlite.AuthCreateVTable, sqlite.AuthDropVTable: // arg2 is the module
+			if m == mutation && modules[strings.ToLower(arg2)] {
 				return sqlite.AuthorizerOK
 			}
 		case sqlite.AuthCreateIndex, sqlite.AuthCreateTrigger, sqlite.AuthDropIndex, sqlite.AuthDropTrigger,
