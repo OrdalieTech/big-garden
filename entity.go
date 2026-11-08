@@ -77,7 +77,6 @@ type candidate struct {
 	more     []head.OpID // the later members of a batch (PROTOCOL §6 Batches)
 	bound    head.Digest
 	pages    []uint32
-	unsure   bool // some proposal got an answer other than a definite failure (§2 step 5)
 }
 
 // discard closes and deletes the cache file and drops the cached head (D10).
@@ -141,12 +140,12 @@ func (n *Node) commitContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), n.cfg.Limits.CommitTimeout)
 }
 
-// cas sends c's proposal as one hedged head CAS (D3). c.unsure is set unless
-// every request of it definitely did not apply.
-func (n *Node) cas(ctx context.Context, e *entity, c *candidate) (string, error) {
+// cas sends c's proposal as one hedged head CAS (D3). unsure is false if
+// every request of it definitely did not apply (§2 step 5).
+func (n *Node) cas(ctx context.Context, e *entity, c *candidate) (tag string, unsure bool, err error) {
 	body, err := c.next.Encode()
 	if err != nil {
-		return "", newError(CodeCorrupt, "candidate head: "+err.Error(), nil)
+		return "", false, newError(CodeCorrupt, "candidate head: "+err.Error(), nil)
 	}
 	failpoint("cas.before")
 	tag, errs, err := store.Hedge(ctx, n.cfg.Limits.StorageAttemptTimeout/2, func(ctx context.Context) (string, error) {
@@ -155,8 +154,7 @@ func (n *Node) cas(ctx context.Context, e *entity, c *candidate) (string, error)
 	if err == nil {
 		failpoint("cas.after")
 	}
-	c.unsure = c.unsure || slices.ContainsFunc(errs, func(err error) bool { return store.OutcomeOf(err) != store.Failed })
-	return tag, err
+	return tag, slices.ContainsFunc(errs, func(err error) bool { return store.OutcomeOf(err) != store.Failed }), err
 }
 
 // publish runs PROTOCOL §2: one CAS, then resolve on anything but OK. A nil
@@ -176,12 +174,12 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	defer cancel()
 	e.unresolved, c.nonces = c, []head.ID{c.next.Nonce}
 	e.since.Store(time.Now().UnixNano())
-	etag, err := n.cas(ctx, e, c)
+	etag, unsure, err := n.cas(ctx, e, c)
 	if err == nil {
 		n.settle(e, c, &c.next, etag)
 		return nil, nil
 	}
-	if !c.unsure { // definitely not committed (§2 step 5)
+	if !unsure { // definitely not committed (§2 step 5)
 		e.discard()
 		e.unresolved = nil
 		e.since.Store(0)
@@ -253,7 +251,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		if len(c.nonces) < limit { // D12: re-propose with a fresh nonce under the same condition
 			c.next.Nonce = head.NewID()
 			c.nonces = append(c.nonces, c.next.Nonce)
-			if etag, err := n.cas(ctx, e, c); err == nil {
+			if etag, _, err := n.cas(ctx, e, c); err == nil {
 				n.settle(e, c, &c.next, etag)
 				return nil, nil
 			}
