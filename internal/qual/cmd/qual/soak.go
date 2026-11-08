@@ -1067,6 +1067,10 @@ func (s *soakRun) checkpoint(keys []string, final bool) {
 	s.hmu.Lock()
 	s.hz.Flush()
 	s.hmu.Unlock()
+	if m := s.get("n0"); m != nil { // heap profiles of the long-lived node, for any growth verdict
+		os.MkdirAll(filepath.Join(s.out, "heap"), 0o755)
+		m.do(sReq{Op: "heap", Key: filepath.Join(s.out, "heap", fmt.Sprintf("n0-%06.0fs.pb.gz", time.Since(s.t0).Seconds()))}, 10*time.Second)
+	}
 	s.report(checked, unread, final)
 }
 

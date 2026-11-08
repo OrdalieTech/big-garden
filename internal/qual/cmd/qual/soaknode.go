@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -209,6 +210,14 @@ func soakServe(ctx context.Context, n *garden.Node, r sReq, ring int, cache stri
 		ref = route.Ref
 	case "stats":
 		return sResp{OK: true, Proc: sample(n, cache)}
+	case "heap": // write a heap profile to the path in Key
+		f, ferr := os.Create(r.Key)
+		if err = ferr; err == nil {
+			err = errors.Join(pprof.Lookup("heap").WriteTo(f, 0), f.Close())
+		}
+		if err == nil {
+			return sResp{OK: true}
+		}
 	default:
 		err = fmt.Errorf("unknown op %q", r.Op)
 	}
