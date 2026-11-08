@@ -63,8 +63,8 @@ func main() {
 		os.Exit(2)
 	}
 	replyKill := 0
-	if name, k, _ := strings.Cut(os.Getenv("GARDEN_FAILPOINT"), ":"); name == "reply" {
-		replyKill, _ = strconv.Atoi(k)
+	if f := strings.Split(os.Getenv("GARDEN_FAILPOINT")+"::", ":"); f[0] == "reply" {
+		replyKill, _ = strconv.Atoi(f[1])
 	}
 	in := bufio.NewScanner(os.Stdin)
 	out := json.NewEncoder(os.Stdout)
@@ -115,6 +115,12 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 			})
 			return []byte(strconv.Itoa(c)), err
 		})
+	case "takeover":
+		var route garden.Route
+		if route, err = n.Resolve(ctx, r.Key); err == nil {
+			route, err = n.Takeover(ctx, route)
+			ref = route.Ref
+		}
 	case "read":
 		res, err = n.Read(ctx, ref, 1, func(v *garden.View) ([]byte, error) {
 			return nil, v.Query(ctx, "SELECT id FROM log", nil, func(rows *sql.Rows) error {

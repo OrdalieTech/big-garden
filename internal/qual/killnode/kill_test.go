@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -62,9 +63,9 @@ type proc struct {
 	lines chan []byte
 }
 
-func start(t *testing.T, ep storetest.Endpoint, cache, failpoint string) *proc {
-	cmd := exec.Command(nodeBinary(t), "-url", ep.URL, "-bucket", ep.Bucket, "-prefix", ep.Prefix, "-cache", cache,
-		"-commit-timeout", "1s")
+func start(t *testing.T, ep storetest.Endpoint, cache, failpoint string, args ...string) *proc {
+	cmd := exec.Command(nodeBinary(t), append([]string{"-url", ep.URL, "-bucket", ep.Bucket, "-prefix", ep.Prefix, "-cache", cache,
+		"-commit-timeout", "1s"}, args...)...)
 	cmd.Env = append(os.Environ(), "AWS_ACCESS_KEY_ID="+ep.AccessKey, "AWS_SECRET_ACCESS_KEY="+ep.SecretKey,
 		"GARDEN_FAILPOINT="+failpoint)
 	cmd.Stderr = os.Stderr
@@ -382,4 +383,136 @@ func clean(t *testing.T, ep storetest.Endpoint) {
 			st.Delete(context.Background(), o.Key)
 		}
 	}
+}
+
+// stopped reports whether the process is stopped by a signal.
+func (p *proc) stopped() bool {
+	b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/stat", p.cmd.Process.Pid))
+	i := strings.LastIndexByte(string(b), ')')
+	return i > 0 && i+2 < len(b) && b[i+2] == 'T'
+}
+
+// TestStaleOwner is the first M5 scenario on MinIO: owner a is SIGSTOPped at
+// a commit boundary (its nth pass, n random in 1..4), node b takes over and
+// commits, then a is continued. a's pending operation may only succeed if
+// b's lineage holds it; a strong read from a never shows a state without b's
+// acknowledged writes; the ledger is checked through a third node c.
+func TestStaleOwner(t *testing.T) {
+	base := storetest.MinIO(t)
+	runs := 20
+	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
+		runs, _ = strconv.Atoi(s)
+	}
+	for _, fp := range []string{"sql.after", "capture", "put.after", "cas.before", "cas.after"} {
+		t.Run(fp, func(t *testing.T) {
+			stops, aOK := 0, 0
+			for i := range runs {
+				ep := base.Sub(fmt.Sprintf("stale-%s-%d", fp, i))
+				s, ok := staleRun(t, ep, fmt.Sprintf("%s:%d:stop", fp, 2+rand.N(4)))
+				stops, aOK = stops+s, aOK+ok
+				clean(t, ep)
+				if t.Failed() {
+					return
+				}
+			}
+			t.Logf("%s: %d runs, %d stopped at the failpoint, %d stale-owner operations acknowledged after SIGCONT", fp, runs, stops, aOK)
+			if stops == 0 {
+				t.Fatalf("failpoint %s never stopped the owner", fp)
+			}
+		})
+	}
+}
+
+func staleRun(t *testing.T, ep storetest.Endpoint, failpoint string) (stops, aOK int) {
+	a := start(t, ep, t.TempDir(), failpoint, "-node", "a")
+	defer a.stop()
+	b := start(t, ep, t.TempDir(), "", "-node", "b")
+	defer b.stop()
+	must := func(p *proc, r Req) Resp {
+		resp, alive := p.call(t, r)
+		if !alive || !resp.OK {
+			t.Fatalf("%s: %+v: %+v", failpoint, r, resp)
+		}
+		return resp
+	}
+	inc := must(a, Req{Op: "create", Key: "k", ID: newID()}).Inc
+	committed := map[string]bool{}
+	var pending Req
+	for i := range 8 {
+		r := Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: strconv.Itoa(i), Big: i%2 == 1}
+		bs, _ := json.Marshal(r)
+		a.in.Write(append(bs, '\n'))
+		var line []byte
+		for line == nil && !a.stopped() {
+			select {
+			case line = <-a.lines:
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		if line == nil {
+			pending = r
+			break
+		}
+		var resp Resp
+		json.Unmarshal(line, &resp)
+		if !resp.OK {
+			t.Fatalf("%s: add before the stop: %+v", failpoint, resp)
+		}
+		committed[r.ID] = true
+	}
+	if pending.ID == "" {
+		return 0, 0 // the failpoint was not reached
+	}
+	must(b, Req{Op: "takeover", Key: "k"})
+	var bIDs []string
+	for i := range 2 {
+		r := Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: "b" + strconv.Itoa(i), Big: i == 1}
+		must(b, r)
+		committed[r.ID] = true
+		bIDs = append(bIDs, r.ID)
+	}
+	a.cmd.Process.Signal(syscall.SIGCONT)
+	var resp Resp
+	select {
+	case line, ok := <-a.lines:
+		if !ok {
+			t.Fatalf("%s: stale owner died", failpoint)
+		}
+		json.Unmarshal(line, &resp)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("%s: stale owner hung", failpoint)
+	}
+	if resp.OK {
+		aOK = 1
+		committed[pending.ID] = true
+	}
+	if rd, _ := a.call(t, Req{Op: "read", Key: "k", Inc: inc}); rd.OK {
+		for _, id := range bIDs {
+			if !contains(rd.IDs, id) {
+				t.Fatalf("%s: stale owner's strong read misses b's acknowledged %s", failpoint, id)
+			}
+		}
+	}
+	if !resp.OK && resp.Code == "outcome_unknown" { // retried on the owner with the same ID: at most once
+		must(b, pending)
+		committed[pending.ID] = true
+	}
+	c := start(t, ep, t.TempDir(), "", "-node", "c")
+	defer c.stop()
+	must(c, Req{Op: "takeover", Key: "k"}) // recovered from S3 alone
+	seen := map[string]int{}
+	for _, id := range must(c, Req{Op: "read", Key: "k", Inc: inc}).IDs {
+		seen[id]++
+	}
+	for id, n := range seen {
+		if n != 1 || !committed[id] {
+			t.Fatalf("%s: ID %s committed %d times (acknowledged or retried: %v); stale reply %+v", failpoint, id, n, committed[id], resp)
+		}
+	}
+	for id := range committed {
+		if seen[id] != 1 {
+			t.Fatalf("%s: acknowledged ID %s lost; stale reply %+v", failpoint, id, resp)
+		}
+	}
+	return 1, aOK
 }
