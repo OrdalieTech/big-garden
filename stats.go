@@ -1,10 +1,14 @@
 package garden
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"time"
 
+	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/OrdalieTech/big-garden/internal/store"
 )
 
@@ -32,10 +36,12 @@ type counters struct {
 	reads, readRejections, mutations, mutationRejections, commits, replays, expired, conflicts atomic.Uint64
 	unknown, ownerChanges, activations, activationFailures, corruptions                        atomic.Uint64
 	snapshots, compactions, collections, collected                                             atomic.Uint64
+	snapshotBytes, compactionIn, compactionOut, collectedBytes                                 atomic.Uint64
 }
 
-// observe counts the outcome of one public operation.
-func (n *Node) observe(read bool, res Result, err error) {
+// observe counts the outcome of one public operation on key, and logs one
+// that needs an operator (outcome_unknown, corrupt), at most once a second.
+func (n *Node) observe(key string, read bool, res Result, err error) {
 	c := &n.counters
 	var e *Error
 	switch {
@@ -59,22 +65,39 @@ func (n *Node) observe(read bool, res Result, err error) {
 			}
 		}
 	}
+	if e == nil || (e.Code != CodeOutcomeUnknown && e.Code != CodeCorrupt) || n.cfg.Logger == nil {
+		return
+	}
+	if last, now := n.logged.Load(), time.Now().UnixNano(); now-last >= int64(time.Second) && n.logged.CompareAndSwap(last, now) {
+		sum := sha256.Sum256([]byte(key))
+		attrs := []any{"code", string(e.Code), "entity", hex.EncodeToString(sum[:8]), "operation", hex.EncodeToString(e.Operation[:])}
+		if e.Route != nil {
+			attrs = append(attrs, "owner_session", hex.EncodeToString(e.Route.Owner.Session[:]), "epoch", e.Route.Epoch)
+		}
+		n.cfg.Logger.Warn("garden: "+e.Message, attrs...)
+	}
 }
 
 // countCommit counts one committed publication by its kind.
 func (n *Node) countCommit(c *candidate) {
+	k := &n.counters
+	if c.op != nil {
+		k.commits.Add(1)
+	}
 	switch {
-	case c.op != nil:
-		n.counters.commits.Add(1)
-		if c.base != nil && c.object != nil && c.next.Snapshot.Key == c.object.Key {
-			n.counters.snapshots.Add(1)
+	case c.object != nil && c.base != nil && c.next.Snapshot.Key == c.object.Key:
+		k.snapshots.Add(1)
+		k.snapshotBytes.Add(c.object.Bytes)
+	case c.object != nil && c.op == nil:
+		k.compactions.Add(1)
+		k.compactionOut.Add(c.object.Bytes)
+		for _, d := range c.base.Deltas {
+			if !slices.ContainsFunc(c.next.Deltas, func(r head.Ref) bool { return r.Key == d.Key }) {
+				k.compactionIn.Add(d.Bytes)
+			}
 		}
-	case c.object != nil && c.next.Snapshot.Key == c.object.Key:
-		n.counters.snapshots.Add(1)
-	case c.object != nil:
-		n.counters.compactions.Add(1)
-	default:
-		n.counters.ownerChanges.Add(1)
+	case c.op == nil:
+		k.ownerChanges.Add(1)
 	}
 }
 
@@ -86,11 +109,16 @@ func (n *Node) Stats() Stats {
 		Expired: c.expired.Load(), Conflicts: c.conflicts.Load(), UnknownOutcomes: c.unknown.Load(),
 		OwnerChanges: c.ownerChanges.Load(), Activations: c.activations.Load(), ActivationFailures: c.activationFailures.Load(),
 		Corruptions: c.corruptions.Load(), Snapshots: c.snapshots.Load(), Compactions: c.compactions.Load(),
-		Collections: c.collections.Load(), CollectedObjects: c.collected.Load()}
+		Collections: c.collections.Load(), CollectedObjects: c.collected.Load(), SnapshotBytes: c.snapshotBytes.Load(),
+		CompactionInputBytes: c.compactionIn.Load(), CompactionOutputBytes: c.compactionOut.Load(),
+		CollectedBytes: c.collectedBytes.Load(), StagingBytes: n.staging.Load()}
 	n.mu.Lock()
 	s.CacheBytes = n.reserved
 	for _, e := range n.entities {
 		s.CacheBytes += e.bytes.Load()
+		if t := e.since.Load(); t != 0 {
+			s.OldestUnresolved = max(s.OldestUnresolved, time.Since(time.Unix(0, t)))
+		}
 		s.QueuedRequests += e.waiting.Load()
 		if e.mu.TryLock() { // a busy entity is resident by definition
 			if e.db != nil {

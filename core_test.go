@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -760,6 +761,8 @@ func TestResolveBranches(t *testing.T) {
 	t.Run("ambiguous then definite stays unknown", func(t *testing.T) {
 		mem := storetest.NewMem()
 		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
+		var logBuf syncBuffer
+		n.cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
 		mustPut(t, n, ref, "a", "1", l)
@@ -782,6 +785,12 @@ func TestResolveBranches(t *testing.T) {
 		}
 		_, err = n.Update(bg, ref, newReq(t, "other", 1), put("c", "3"))
 		wantCode(t, err, CodeUnavailable)
+		if st := n.Stats(); st.OldestUnresolved < 400*time.Millisecond || st.UnknownOutcomes != 1 {
+			t.Fatalf("stats %+v", st)
+		}
+		if logs := strings.Count(logBuf.String(), "code=outcome_unknown"); logs != 1 || strings.Contains(logBuf.String(), `"k"`) {
+			t.Fatalf("log %q", logBuf.String())
+		}
 		mem.SetPlan(nil)
 		var first storetest.Attempt
 		for _, a := range mem.Journal()[before:] {
@@ -799,8 +808,28 @@ func TestResolveBranches(t *testing.T) {
 		}
 		l.ack(ref, "b", "2")
 		mustPut(t, n, ref, "c", "3", l)
+		if st := n.Stats(); st.OldestUnresolved != 0 {
+			t.Fatalf("stats %+v", st)
+		}
 		l.verify(t, mem, "a")
 	})
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 func TestResolveObjectBranch(t *testing.T) {
@@ -1050,6 +1079,9 @@ func TestMaintenance(t *testing.T) {
 	if !compacted || snapshots == 0 {
 		t.Fatalf("compacted %v, snapshots %d", compacted, snapshots)
 	}
+	if st := n.Stats(); st.Snapshots == 0 || st.SnapshotBytes < 200*4000/2 { // compressed random hex
+		t.Fatalf("snapshot stats %+v", st)
+	}
 	l.verify(t, mem, "a")
 }
 
@@ -1085,10 +1117,11 @@ func TestCollect(t *testing.T) {
 	if len(want) != 0 {
 		t.Fatalf("objects that must survive were deleted: %v", want)
 	}
-	if st := other.Stats(); st.Collections != 1 || st.CollectedObjects == 0 {
+	if st := other.Stats(); st.Collections != 1 || st.CollectedObjects == 0 || st.CollectedBytes == 0 {
 		t.Fatalf("collect stats %+v", st)
 	}
-	if st := n.Stats(); st.Compactions == 0 || st.Commits != 41 {
+	if st := n.Stats(); st.Compactions == 0 || st.Commits != 41 || st.CompactionInputBytes <= st.CompactionOutputBytes/2 ||
+		st.CompactionOutputBytes == 0 || st.StagingBytes != 0 || st.OldestUnresolved != 0 {
 		t.Fatalf("maintenance stats %+v", st)
 	}
 	err := other.Collect(bg, Ref{"k", [16]byte{9}})
@@ -1298,7 +1331,7 @@ func TestCacheBytes(t *testing.T) {
 		t.Fatalf("a resident entity accounts %d cache bytes", size)
 	}
 	n.cfg.Limits.CacheBytes = n.buildBytes() + size/2 // one build, and no resident entity beside it
-	ref1 := mustCreate(t, n, "e1", l)                  // genesis evicts e0
+	ref1 := mustCreate(t, n, "e1", l)                 // genesis evicts e0
 	mustPut(t, n, ref1, "a", randText(16<<10), l)
 	if s := n.Stats(); s.ResidentEntities != 1 || s.CacheBytes > n.cfg.Limits.CacheBytes {
 		t.Fatalf("stats %+v", s)

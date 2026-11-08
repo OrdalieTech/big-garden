@@ -63,7 +63,7 @@ type Config struct {
 	NodeID   string
 	CacheDir string
 	Limits   Limits
-	Logger   *slog.Logger
+	Logger   *slog.Logger // nil: no logs; else outcome_unknown and corrupt outcomes, rate-limited
 }
 
 // Tx is the scoped SQL handle of a mutation callback. It is invalid after the

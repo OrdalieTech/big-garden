@@ -131,6 +131,7 @@ func (n *Node) Collect(ctx context.Context, ref Ref) error {
 				switch err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) {
 				case store.OK:
 					n.counters.collected.Add(1)
+					n.counters.collectedBytes.Add(uint64(o.Size))
 				case store.Failed:
 					return storeError(err)
 				} // Unknown: left for a later pass

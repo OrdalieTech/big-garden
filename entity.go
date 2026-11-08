@@ -36,6 +36,7 @@ type entity struct {
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
+	since      atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.
@@ -142,6 +143,7 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	ctx, cancel := n.commitContext()
 	defer cancel()
 	e.unresolved, c.nonces = c, []head.ID{c.next.Nonce}
+	e.since.Store(time.Now().UnixNano())
 	etag, err := n.cas(ctx, e, c)
 	if err == nil {
 		n.settle(e, c, &c.next, etag)
@@ -150,6 +152,8 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	if !c.unsure { // definitely not committed (§2 step 5)
 		e.discard()
 		e.unresolved = nil
+		e.since.Store(0)
+		e.since.Store(0)
 		return nil, storeError(err)
 	}
 	rec, err = n.resolve(ctx, e, c)
@@ -166,6 +170,7 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 // is not cur's.
 func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 	e.unresolved = nil
+	e.since.Store(0)
 	n.countCommit(c)
 	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
 		e.pages = c.pages
@@ -245,6 +250,9 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 		}
 		if ok && r.InputHash != c.bound {
 			e.unresolved = nil
+			e.since.Store(0)
+			e.since.Store(0)
+			e.since.Store(0)
 			return nil, &Error{Code: CodeIDConflict, Operation: opOf(c), Message: "operation ID used with another input"}
 		}
 		committed, rec = ok, &r
@@ -260,6 +268,7 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 	}
 	e.discard()
 	e.unresolved = nil
+	e.since.Store(0)
 	if !n.mine(cur) {
 		return nil, notOwner(cur)
 	}

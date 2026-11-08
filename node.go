@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,7 +28,9 @@ type Node struct {
 
 	mu       sync.Mutex
 	entities map[string]*entity
-	reserved int64 // cache bytes reserved by activations in progress
+	reserved int64        // cache bytes reserved by activations in progress
+	staging  atomic.Int64 // bytes of objects being uploaded (Stats)
+	logged   atomic.Int64 // unix nanos of the last log line (rate limit)
 	closed   bool
 
 	done            chan struct{} // closed by Close: stops the sweeper

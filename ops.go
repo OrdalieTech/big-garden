@@ -162,6 +162,8 @@ func (n *Node) barrier(ctx context.Context, e *entity) (changed bool, err error)
 
 // putObject writes an immutable object; an existing one must hold body.
 func (n *Node) putObject(ctx context.Context, key string, body []byte) error {
+	n.staging.Add(int64(len(body)))
+	defer n.staging.Add(-int64(len(body)))
 	err := n.st.PutImmutable(ctx, key, body)
 	if store.OutcomeOf(err) == store.PreconditionFailed {
 		obj, gerr := n.st.Get(ctx, key, "", int64(len(body)))
@@ -222,7 +224,7 @@ func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 // Read runs fn on the state validated by a head GET issued after the call
 // began (PROTOCOL §3).
 func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) ([]byte, error)) (res Result, err error) {
-	defer func() { n.observe(true, res, err) }()
+	defer func() { n.observe(ref.Key, true, res, err) }()
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
@@ -247,7 +249,7 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 
 // Lookup returns the stored outcome of id in freshly validated state.
 func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, err error) {
-	defer func() { n.observe(true, res, err) }()
+	defer func() { n.observe(ref.Key, true, res, err) }()
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
@@ -309,7 +311,7 @@ type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
 
 // create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
 func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (ref Ref, res Result, err error) {
-	defer func() { n.observe(false, res, err) }()
+	defer func() { n.observe(key, false, res, err) }()
 	e, err := n.enter(key, &req.ID)
 	if err != nil {
 		return Ref{}, Result{}, err
@@ -506,7 +508,7 @@ func (n *Node) Migrate(ctx context.Context, ref Ref, req Request, to uint32, fn 
 
 // mutate is Update (kind 2) and Migrate (kind 3, schema req.Schema -> to).
 func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to uint32, fn func(*Tx) ([]byte, error)) (res Result, err error) {
-	defer func() { n.observe(false, res, err) }()
+	defer func() { n.observe(ref.Key, false, res, err) }()
 	if err := checkRequest(ref.Key, req); err != nil {
 		return Result{}, err
 	}
