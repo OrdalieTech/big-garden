@@ -375,23 +375,20 @@ func (r Ref) span(maxBytes uint64) error {
 	return nil
 }
 
-// CheckGenesis checks the extra invariants of a head created by Create or
-// Import: revision 1, epoch 1, an owner, no deltas or tail, snapshot at base 0.
-func CheckGenesis(h *Head) error {
-	if h.Revision != 1 || h.Epoch != 1 || h.Owner == nil || len(h.Deltas) != 0 || h.Tail != nil ||
-		h.Snapshot.BaseRevision != 0 {
-		return errors.New("not a genesis head")
-	}
-	return nil
-}
-
 // Successor checks that next is a legal replacement of prev (both already
-// valid): same identity, revision+1, fresh nonce, epoch+1 exactly when the
+// valid; a nil prev checks a genesis head instead): same identity, revision+1, fresh nonce, epoch+1 exactly when the
 // owner changes, data changes only by the unchanged owner, the tail carried
 // byte-identical unless the data changes or a snapshot (no deltas) empties it,
 // and the no-resurrection rule: every ref is carried over unchanged from prev
 // or was produced under base revision prev.Revision.
 func Successor(prev, next *Head) error {
+	if prev == nil { // genesis (Create or Import): revision 1, epoch 1, an owner, no deltas or tail, snapshot at base 0
+		if next.Revision != 1 || next.Epoch != 1 || next.Owner == nil || len(next.Deltas) != 0 || next.Tail != nil ||
+			next.Snapshot.BaseRevision != 0 {
+			return errors.New("not a genesis head")
+		}
+		return nil
+	}
 	sameOwner := (prev.Owner == nil && next.Owner == nil) ||
 		(prev.Owner != nil && next.Owner != nil && *prev.Owner == *next.Owner)
 	sameTail := (prev.Tail == nil && next.Tail == nil) || (prev.Tail != nil && next.Tail != nil &&

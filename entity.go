@@ -164,12 +164,7 @@ func (n *Node) cas(ctx context.Context, e *entity, c *candidate) (tag string, un
 // error means committed; rec is the stored receipt when resolution proved
 // the commit through it.
 func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error) {
-	if c.base == nil {
-		err = head.CheckGenesis(&c.next)
-	} else {
-		err = head.Successor(c.base, &c.next)
-	}
-	if err = errors.Join(err, c.next.Validate()); err != nil {
+	if err = errors.Join(head.Successor(c.base, &c.next), c.next.Validate()); err != nil {
 		e.discard()
 		return nil, newError(CodeCorrupt, "candidate head: "+err.Error(), nil)
 	}

@@ -594,14 +594,14 @@ func TestSuccessor(t *testing.T) {
 	if err := g.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckGenesis(&g); err != nil {
+	if err := Successor(nil, &g); err != nil {
 		t.Errorf("genesis rejected: %v", err)
 	}
-	if err := CheckGenesis(&prev); err == nil {
+	if err := Successor(nil, &prev); err == nil {
 		t.Error("non-genesis accepted")
 	}
 	g.Tail = tail(11, 11, g.DatabaseChecksum, g.DatabaseChecksum, 1)
-	if err := CheckGenesis(&g); err == nil {
+	if err := Successor(nil, &g); err == nil {
 		t.Error("genesis with a tail accepted")
 	}
 }
