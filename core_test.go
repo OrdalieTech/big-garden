@@ -50,9 +50,12 @@ func (l *ledger) ack(ref Ref, k, v string) {
 }
 
 // verify reads every acknowledged row through a new Node with an empty cache.
-func (l *ledger) verify(t *testing.T, mem *storetest.Mem, nodeID string) {
+func (l *ledger) verify(t *testing.T, st store.Store, nodeID string) {
 	t.Helper()
-	mem.SetPlan(nil)
+	if mem, ok := st.(*storetest.Mem); ok {
+		mem.SetPlan(nil)
+	}
+	mem := st
 	n := testNode(t, mem, nodeID, nil)
 	defer n.Close(bg)
 	for key, rows := range l.rows {
@@ -65,7 +68,29 @@ func (l *ledger) verify(t *testing.T, mem *storetest.Mem, nodeID string) {
 	}
 }
 
-func testNode(t *testing.T, mem *storetest.Mem, nodeID string, mod func(*Limits)) *Node {
+// newStore is the store of a core test: a fresh Mem, or with GARDEN_TEST_MINIO
+// set the S3 adapter on a fresh prefix of the MinIO fixture.
+func newStore(t *testing.T) store.Store {
+	if os.Getenv(storetest.MinIOEnv) == "" {
+		return storetest.NewMem()
+	}
+	ep := storetest.MinIO(t)
+	st := store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, 2*time.Second)
+	t.Cleanup(func() { // after the test's Nodes closed (cleanups run last-in first-out)
+		for range 100 {
+			page, _, err := st.List(bg, "", "", 1000)
+			if err != nil || len(page) == 0 {
+				return
+			}
+			for _, o := range page {
+				st.Delete(bg, o.Key)
+			}
+		}
+	})
+	return st
+}
+
+func testNode(t *testing.T, mem store.Store, nodeID string, mod func(*Limits)) *Node {
 	t.Helper()
 	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: nodeID, CacheDir: t.TempDir(),
 		Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}
@@ -161,11 +186,19 @@ func mustPut(t *testing.T, n *Node, ref Ref, k, v string, l *ledger) Result {
 	return res
 }
 
-func headAt(t *testing.T, mem *storetest.Mem, key string) (*head.Head, string) {
+func headAt(t *testing.T, st store.Store, key string) (*head.Head, string) {
 	t.Helper()
-	o, ok := mem.Peek(head.HeadKey(key))
-	if !ok {
-		t.Fatalf("no head for %s", key)
+	var o store.Object
+	var err error
+	if mem, ok := st.(*storetest.Mem); ok {
+		if o, ok = mem.Peek(head.HeadKey(key)); !ok {
+			err = errors.New("no head")
+		}
+	} else {
+		o, err = st.Get(bg, head.HeadKey(key), "", maxHeadBytes)
+	}
+	if err != nil {
+		t.Fatalf("head of %s: %v", key, err)
 	}
 	h, err := head.Decode(o.Body)
 	if err != nil {
@@ -181,7 +214,7 @@ func randText(n int) string {
 }
 
 func TestOpenNamespace(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	a := testNode(t, mem, "a", nil)
 	b := testNode(t, mem, "b", nil)
 	if a.ns != b.ns || a.ns == (head.ID{}) || a.self.Session == b.self.Session {
@@ -206,7 +239,7 @@ func TestOpenNamespace(t *testing.T) {
 }
 
 func TestSessionDirCleanup(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	dir := t.TempDir()
 	cfg, _ := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: dir}.validate()
 	a, err := open(bg, cfg, mem)
@@ -237,7 +270,7 @@ func TestSessionDirCleanup(t *testing.T) {
 }
 
 func TestCreateUpdateReadLookup(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	ref := mustCreate(t, n, "doc", l)
@@ -252,10 +285,16 @@ func TestCreateUpdateReadLookup(t *testing.T) {
 		t.Fatalf("first update did not upload: %d deltas, tail %v", len(h.Deltas), h.Tail != nil)
 	}
 	// small writes go inline: one CAS, no PUT
-	before := len(mem.Journal())
+	journal := func() []storetest.Attempt { // Mem only; the head checks below hold on every store
+		if mem, ok := mem.(*storetest.Mem); ok {
+			return mem.Journal()
+		}
+		return nil
+	}
+	before := len(journal())
 	mustPut(t, n, ref, "b", "2", l)
 	mustPut(t, n, ref, "c", "3", l)
-	for _, a := range mem.Journal()[before:] {
+	for _, a := range journal()[before:] {
 		if a.Op == "put" {
 			t.Fatalf("inline write uploaded %s", a.Key)
 		}
@@ -335,7 +374,7 @@ func TestCreateUpdateReadLookup(t *testing.T) {
 }
 
 func TestCreateIdempotentAndConflicts(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	req := newReq(t, "create", 1)
 	ref, res, err := n.Create(bg, "k", req, createKV)
@@ -383,7 +422,7 @@ func TestCreateIdempotentAndConflicts(t *testing.T) {
 }
 
 func TestConcurrentCreates(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	nodes := []*Node{testNode(t, mem, "a", nil), testNode(t, mem, "b", nil)}
 	var wins atomic.Int32
 	var wg sync.WaitGroup
@@ -448,7 +487,7 @@ func TestCreateResumeD5(t *testing.T) {
 }
 
 func TestMissingHeadFailsClosed(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -468,7 +507,7 @@ func TestMissingHeadFailsClosed(t *testing.T) {
 }
 
 func TestRestartRecoversEverything(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	refs := []Ref{mustCreate(t, n, "x", l), mustCreate(t, n, "y", l)}
@@ -497,7 +536,7 @@ func TestRestartRecoversEverything(t *testing.T) {
 }
 
 func TestSnapshotOnCap(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	n.skipMaintenance = true // §9 would compact long before the §6.7 cap
 	l := newLedger()
@@ -908,7 +947,7 @@ func TestResolveHydrationFailureIsUnknown(t *testing.T) {
 }
 
 // stealHead publishes a takeover of key by another node directly.
-func stealHead(t *testing.T, mem *storetest.Mem, key string) {
+func stealHead(t *testing.T, mem store.Store, key string) {
 	h, etag := headAt(t, mem, key)
 	h.Owner = &head.Owner{Node: "thief", Session: head.NewID()}
 	h.Epoch, h.Revision, h.Nonce = h.Epoch+1, h.Revision+1, head.NewID()
@@ -928,7 +967,7 @@ func statDir(p string) (bool, error) {
 }
 
 func TestOwnershipAndMigrate(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	a := testNode(t, mem, "a", nil)
 	b := testNode(t, mem, "b", nil)
 	l := newLedger()
@@ -1030,7 +1069,7 @@ func TestCloseReportsUnresolved(t *testing.T) {
 }
 
 func TestMaintenance(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -1086,7 +1125,7 @@ func TestMaintenance(t *testing.T) {
 }
 
 func TestCollect(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -1130,7 +1169,7 @@ func TestCollect(t *testing.T) {
 }
 
 func TestExport(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -1176,7 +1215,7 @@ func TestExport(t *testing.T) {
 }
 
 func TestImport(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	src := mustCreate(t, n, "src", l)
@@ -1186,7 +1225,7 @@ func TestImport(t *testing.T) {
 	if _, err := n.Export(bg, src, &archive); err != nil {
 		t.Fatal(err)
 	}
-	other := storetest.NewMem() // another namespace
+	other := newStore(t) // another namespace
 	m := testNode(t, other, "z", nil)
 	req := newReq(t, "import", 1)
 	ref, res, err := m.Import(bg, "dst", req, bytes.NewReader(archive.Bytes()))
@@ -1214,13 +1253,13 @@ func TestImport(t *testing.T) {
 	bad[1536+100] ^= 1 // inside snapshot.ltx data (after two 512-byte headers and the padded manifest)
 	_, _, err = m.Import(bg, "x", newReq(t, "u", 1), bytes.NewReader(bad))
 	wantCode(t, err, CodeCorrupt)
-	if _, ok := other.Peek(head.BirthKey("x")); ok {
+	if _, err := other.Get(bg, head.BirthKey("x"), "", 4<<10); store.OutcomeOf(err) != store.NotFound {
 		t.Fatal("a rejected import wrote birth.json")
 	}
 }
 
 func TestConcurrentUpdatesAndReads(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	refs := []Ref{mustCreate(t, n, "p", l), mustCreate(t, n, "q", l)}
@@ -1248,7 +1287,7 @@ func TestConcurrentUpdatesAndReads(t *testing.T) {
 }
 
 func TestCachePolicy(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.ResidentEntities = 2; l.IdleTimeout = 100 * time.Millisecond })
 	l := newLedger()
 	var refs []Ref
@@ -1276,7 +1315,7 @@ func TestCachePolicy(t *testing.T) {
 }
 
 func TestPendingPerEntity(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.PendingPerEntity = 1 })
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -1304,7 +1343,7 @@ func TestPendingPerEntity(t *testing.T) {
 }
 
 func TestInflightStorageBound(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.InflightStorage = 1 })
 	l := newLedger()
 	refs := []Ref{mustCreate(t, n, "x", l), mustCreate(t, n, "y", l)}
@@ -1321,7 +1360,7 @@ func TestInflightStorageBound(t *testing.T) {
 }
 
 func TestCacheBytes(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.Recoveries = 1 })
 	l := newLedger()
 	ref0 := mustCreate(t, n, "e0", l)
