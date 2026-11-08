@@ -164,23 +164,19 @@ func shed(lru *entity) bool {
 
 func (n *Node) namespace(ctx context.Context) error {
 	for range 2 {
-		obj, err := n.st.Get(ctx, head.NamespaceKey, "", 1<<10)
-		if err == nil {
-			ns, err := head.DecodeNamespace(obj.Body)
-			if err != nil {
-				return newError(CodeCorrupt, "namespace.json: "+err.Error(), nil)
-			}
-			n.ns = ns.Namespace
-			return nil
-		}
-		if store.OutcomeOf(err) != store.NotFound {
-			return storeError(err)
+		if found, err := n.readNamespace(ctx); found || err != nil {
+			return err
 		}
 		page, _, err := n.st.List(ctx, "entities/", "", 1)
 		if err != nil {
 			return storeError(err)
 		}
 		if len(page) > 0 {
+			// namespace.json precedes every entity: another node may have
+			// written both since the GET above.
+			if found, err := n.readNamespace(ctx); found || err != nil {
+				return err
+			}
 			return newError(CodeStateMissing, "entities exist without namespace.json", nil)
 		}
 		body, _ := head.Namespace{Format: head.Format, Namespace: head.NewID(), EntityFormat: head.Format}.Encode()
@@ -190,6 +186,22 @@ func (n *Node) namespace(ctx context.Context) error {
 		}
 	}
 	return newError(CodeUnavailable, "namespace.json is not readable", nil)
+}
+
+// readNamespace sets n.ns from namespace.json and reports whether it exists.
+func (n *Node) readNamespace(ctx context.Context) (bool, error) {
+	obj, err := n.st.Get(ctx, head.NamespaceKey, "", 1<<10)
+	if store.OutcomeOf(err) == store.NotFound {
+		return false, nil
+	} else if err != nil {
+		return false, storeError(err)
+	}
+	ns, err := head.DecodeNamespace(obj.Body)
+	if err != nil {
+		return false, newError(CodeCorrupt, "namespace.json: "+err.Error(), nil)
+	}
+	n.ns = ns.Namespace
+	return true, nil
 }
 
 // probe checks the conditional-write semantics the protocol relies on.

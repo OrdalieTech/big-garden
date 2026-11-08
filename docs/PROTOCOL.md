@@ -163,7 +163,7 @@ Cache policy: before an activation or a genesis build, if `ResidentEntities` oth
 ## 8. Open(cfg)
 
 1. Validate `cfg` (`limits.go`).
-2. `GET namespace.json`. Found: strict decode. Absent: `LIST entities/` limit 1; anything → `state_missing`; else `PUT_IMM` a new descriptor; `PreconditionFailed`/`Unknown` → GET again and use the stored one if it decodes.
+2. `GET namespace.json`. Found: strict decode. Absent: `LIST entities/` limit 1; anything → GET again (another node may have created the namespace and an entity since), still absent → `state_missing`; else `PUT_IMM` a new descriptor; `PreconditionFailed`/`Unknown` → GET again and use the stored one if it decodes.
 3. Probe under `probe/<NewID()>/`: `PUT_IMM` x twice (second must be `PreconditionFailed`); `CAS` y create (ETag `e1`); `CAS` y with `e1` succeeds; `CAS` y with the now stale `e1` must be `PreconditionFailed`; `GET` returns the second body; `DEL` both. Any deviation → `unsupported` (`Unknown` → `unavailable`).
 4. `session = NewID()`. Create `CacheDir/<session-hex>/` with `O_EXCL`, 0700, and hold an exclusive `flock` on a lock file in it. Remove sibling session dirs whose lock can be acquired (older processes); never follow symlinks.
 
