@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,7 +42,7 @@ type Request struct {
 	Seq                    int
 	Method, Path, RawQuery string
 	IfMatch, IfNoneMatch   string
-	Body                   []byte // request body as received (before CorruptRequest)
+	Body                   []byte // request payload as received (before CorruptRequest; aws-chunked decoded)
 	Fault                  Fault
 	Upstream               int // upstream status; 0 if never forwarded or no reply
 	Relayed                bool
@@ -139,14 +140,35 @@ func (r redirect) RoundTrip(req *http.Request) (*http.Response, error) {
 	return r.base.RoundTrip(req)
 }
 
+// unchunk returns the payload of an aws-chunked body: chunks of
+// "<hex size>[;chunk-signature=...]\r\n<data>\r\n" up to a zero-size chunk
+// (trailers ignored). A malformed body is returned as far as it parsed.
+func unchunk(b []byte) []byte {
+	var out []byte
+	for {
+		line, rest, ok := bytes.Cut(b, []byte("\r\n"))
+		size, _, _ := bytes.Cut(line, []byte(";"))
+		n, err := strconv.ParseInt(string(size), 16, 64)
+		if !ok || err != nil || n <= 0 || n > int64(len(rest)) {
+			return out
+		}
+		out = append(out, rest[:n]...)
+		b = bytes.TrimPrefix(rest[n:], []byte("\r\n"))
+	}
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		panic(http.ErrAbortHandler)
 	}
+	payload := bytes.Clone(body)
+	if strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
+		payload = unchunk(payload) // the SDK streams PUTs over HTTPS with a trailing checksum
+	}
 	p.mu.Lock()
 	req := Request{Seq: len(p.journal), Method: r.Method, Path: r.URL.Path, RawQuery: r.URL.RawQuery,
-		IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match"), Body: bytes.Clone(body)}
+		IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match"), Body: payload}
 	if p.plan != nil {
 		req.Fault = p.plan(req)
 	}
