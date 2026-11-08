@@ -86,11 +86,14 @@ func (n *Node) maintain(e *entity) {
 		next.Deltas = slices.Concat(h.Deltas[:i], []head.Ref{ref}, h.Deltas[i+fanout:])
 		c.pages = slices.Concat(e.pages[:1+i], []uint32{out.Pages}, e.pages[1+i+fanout:])
 	}
+	failpoint("maint.put")
 	if n.putObject(ctx, ref.Key, buf.Bytes()) != nil {
 		return
 	}
+	failpoint("maint.cas")
 	c.next, c.object = next, &ref
 	n.publish(e, c) // not committed: the object is abandoned to collection
+	failpoint("maint.done")
 }
 
 // Collect deletes unreachable immutable artifacts of one entity (PLAN §9.2,
