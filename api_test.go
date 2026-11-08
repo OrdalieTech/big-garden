@@ -161,9 +161,6 @@ func TestLimits(t *testing.T) {
 	if l != want {
 		t.Fatalf("defaults:\n got %+v\nwant %+v", l, want)
 	}
-	if l, err := (Limits{BatchMax: 16}).resolve(); err != nil || l.BatchDelay != 2*time.Millisecond {
-		t.Fatalf("batch default delay: %v %v", l.BatchDelay, err)
-	}
 	if _, err := (Limits{EntityBytes: 256 << 20, CacheBytes: 16 << 30}).resolve(); err != nil {
 		t.Fatalf("256 MiB ceiling: %v", err)
 	}
@@ -176,8 +173,6 @@ func TestLimits(t *testing.T) {
 		"entity below one page": {EntityBytes: 100},
 		"result above 64 KiB":   {ResultBytes: 64<<10 + 1},
 		"batch above 16":        {BatchMax: 17},
-		"delay without batch":   {BatchDelay: time.Millisecond},
-		"delay above 2ms":       {BatchMax: 4, BatchDelay: 3 * time.Millisecond},
 		"retention below 1h":    {ReceiptRetention: 59 * time.Minute},
 		"retention above 720h":  {ReceiptRetention: 721 * time.Hour},
 		"commit below attempt":  {StorageAttemptTimeout: 20 * time.Second},

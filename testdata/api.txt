@@ -56,11 +56,11 @@ type Error struct {
 	Message		string
 }
 type Limits struct {
-	EntityBytes, CacheBytes					int64
-	ResultBytes, ResidentEntities, InflightStorage		int
-	PendingPerEntity, Recoveries, BatchMax			int
-	BatchDelay, StorageAttemptTimeout, CommitTimeout	time.Duration
-	IdleTimeout, ReceiptRetention				time.Duration
+	EntityBytes, CacheBytes				int64
+	ResultBytes, ResidentEntities, InflightStorage	int
+	PendingPerEntity, Recoveries, BatchMax		int
+	StorageAttemptTimeout, CommitTimeout		time.Duration
+	IdleTimeout, ReceiptRetention			time.Duration
 }
 type MutationID [24]byte
 type Node struct {

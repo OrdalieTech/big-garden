@@ -14,11 +14,11 @@ import (
 // are rejected by Open. Protocol-format limits (64 KiB heads, 32 deltas,
 // 4 KiB pages) are fixed and not configurable here.
 type Limits struct {
-	EntityBytes, CacheBytes                          int64
-	ResultBytes, ResidentEntities, InflightStorage   int
-	PendingPerEntity, Recoveries, BatchMax           int
-	BatchDelay, StorageAttemptTimeout, CommitTimeout time.Duration
-	IdleTimeout, ReceiptRetention                    time.Duration
+	EntityBytes, CacheBytes                        int64
+	ResultBytes, ResidentEntities, InflightStorage int
+	PendingPerEntity, Recoveries, BatchMax         int
+	StorageAttemptTimeout, CommitTimeout           time.Duration
+	IdleTimeout, ReceiptRetention                  time.Duration
 }
 
 // Defaults and qualified upper bounds (PLAN §11.2, DECISIONS D6).
@@ -30,7 +30,6 @@ const (
 	maxResultBytes       = 64 << 10
 	maxCount             = 1 << 20 // keeps every product below overflow
 	maxBatch             = 16
-	maxBatchDelay        = 2 * time.Millisecond
 	minReceiptRetention  = time.Hour
 	maxReceiptRetention  = 30 * 24 * time.Hour
 	defaultRetention     = time.Hour
@@ -39,7 +38,7 @@ const (
 
 // resolve returns l with defaults applied, or an invalid_argument Error.
 func (l Limits) resolve() (Limits, error) {
-	for _, v := range []int64{l.EntityBytes, l.CacheBytes, int64(l.BatchDelay), int64(l.StorageAttemptTimeout),
+	for _, v := range []int64{l.EntityBytes, l.CacheBytes, int64(l.StorageAttemptTimeout),
 		int64(l.CommitTimeout), int64(l.IdleTimeout), int64(l.ReceiptRetention)} {
 		if v < 0 {
 			return l, invalid("limits must not be negative")
@@ -58,9 +57,6 @@ func (l Limits) resolve() (Limits, error) {
 	orDefault(&l.PendingPerEntity, 64)
 	orDefault(&l.Recoveries, 8)
 	orDefault(&l.BatchMax, 1)
-	if l.BatchMax > 1 {
-		orDefault(&l.BatchDelay, maxBatchDelay)
-	}
 	orDefault(&l.StorageAttemptTimeout, 2*time.Second)
 	orDefault(&l.CommitTimeout, 10*time.Second)
 	orDefault(&l.IdleTimeout, 60*time.Second)
@@ -72,10 +68,6 @@ func (l Limits) resolve() (Limits, error) {
 		return l, invalid(fmt.Sprintf("ResultBytes must be at most %d", maxResultBytes))
 	case l.BatchMax > maxBatch:
 		return l, invalid(fmt.Sprintf("BatchMax must be at most %d", maxBatch))
-	case l.BatchMax == 1 && l.BatchDelay != 0:
-		return l, invalid("BatchDelay requires BatchMax above 1")
-	case l.BatchDelay > maxBatchDelay:
-		return l, invalid("BatchDelay must be at most 2ms")
 	case l.CommitTimeout < l.StorageAttemptTimeout:
 		return l, invalid("CommitTimeout must be at least StorageAttemptTimeout")
 	case l.ReceiptRetention < minReceiptRetention || l.ReceiptRetention > maxReceiptRetention:
