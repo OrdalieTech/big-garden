@@ -43,17 +43,20 @@ func TestRestoreRejects(t *testing.T) {
 		"frame size, resha":   func(h *head.Head, o [][]byte) { o[1][100+6] = 0xff; resha(h, o, 1) },
 		"length":              func(h *head.Head, o [][]byte) { h.Deltas[0].Bytes++ },
 		"missing delta":       func(h *head.Head, o [][]byte) { h.Deltas = h.Deltas[1:]; copy(o[1:], o[2:]) },
-		"swapped deltas":      func(h *head.Head, o [][]byte) { h.Deltas[0], h.Deltas[1] = h.Deltas[1], h.Deltas[0]; o[1], o[2] = o[2], o[1] },
-		"head checksum":       func(h *head.Head, o [][]byte) { h.DatabaseChecksum ^= 1 },
-		"ref post checksum":   func(h *head.Head, o [][]byte) { h.Deltas[1].PostChecksum ^= 1 },
-		"ref pre checksum":    func(h *head.Head, o [][]byte) { h.Deltas[0].PreChecksum ^= 1 },
-		"ref range":           func(h *head.Head, o [][]byte) { h.Deltas[1].MaxSequence++ },
-		"head page count":     func(h *head.Head, o [][]byte) { h.PageCount++ },
-		"head sequence":       func(h *head.Head, o [][]byte) { h.Sequence++ },
-		"head schema":         func(h *head.Head, o [][]byte) { h.Schema++ },
-		"head key":            func(h *head.Head, o [][]byte) { h.Key = "other" },
-		"head incarnation":    func(h *head.Head, o [][]byte) { h.Incarnation[0] ^= 1 },
-		"delta as snapshot":   func(h *head.Head, o [][]byte) { h.Snapshot, o[0] = h.Deltas[0], o[1] },
+		"swapped deltas": func(h *head.Head, o [][]byte) {
+			h.Deltas[0], h.Deltas[1] = h.Deltas[1], h.Deltas[0]
+			o[1], o[2] = o[2], o[1]
+		},
+		"head checksum":     func(h *head.Head, o [][]byte) { h.DatabaseChecksum ^= 1 },
+		"ref post checksum": func(h *head.Head, o [][]byte) { h.Deltas[1].PostChecksum ^= 1 },
+		"ref pre checksum":  func(h *head.Head, o [][]byte) { h.Deltas[0].PreChecksum ^= 1 },
+		"ref range":         func(h *head.Head, o [][]byte) { h.Deltas[1].MaxSequence++ },
+		"head page count":   func(h *head.Head, o [][]byte) { h.PageCount++ },
+		"head sequence":     func(h *head.Head, o [][]byte) { h.Sequence++ },
+		"head schema":       func(h *head.Head, o [][]byte) { h.Schema++ },
+		"head key":          func(h *head.Head, o [][]byte) { h.Key = "other" },
+		"head incarnation":  func(h *head.Head, o [][]byte) { h.Incarnation[0] ^= 1 },
+		"delta as snapshot": func(h *head.Head, o [][]byte) { h.Snapshot, o[0] = h.Deltas[0], o[1] },
 	}
 	for name, fn := range cases {
 		h := f.head
