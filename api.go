@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/OrdalieTech/big-garden/internal/engine"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -66,24 +67,13 @@ type Config struct {
 	Logger   *slog.Logger
 }
 
-// Node is one process's handle on a namespace.
-type Node struct{}
-
 // Tx is the scoped SQL handle of a mutation callback. It is invalid after the
 // callback returns.
-type Tx struct{}
+type Tx struct{ t *engine.Tx }
 
 // View is the scoped read-only SQL handle of a Read callback. It is invalid
 // after the callback returns.
-type View struct{}
-
-// Open validates cfg and opens a Node on its namespace.
-func Open(ctx context.Context, cfg Config) (*Node, error) {
-	if _, err := cfg.validate(); err != nil {
-		return nil, err
-	}
-	return nil, unsupported()
-}
+type View struct{ v *engine.View }
 
 // NewMutationID returns a fresh MutationID stamped with t.
 func NewMutationID(t time.Time) (MutationID, error) {
@@ -97,27 +87,9 @@ func NewMutationID(t time.Time) (MutationID, error) {
 	return id, nil
 }
 
-func (*Node) Owner() Owner { return Owner{} }
-
-func (*Node) Resolve(context.Context, string) (Route, error) { return Route{}, unsupported() }
-
-func (*Node) Create(context.Context, string, Request, func(*Tx) ([]byte, error)) (Ref, Result, error) {
-	return Ref{}, Result{}, unsupported()
-}
-
 func (*Node) Takeover(context.Context, Route) (Route, error) { return Route{}, unsupported() }
 
 func (*Node) Release(context.Context, Ref) error { return unsupported() }
-
-func (*Node) Update(context.Context, Ref, Request, func(*Tx) ([]byte, error)) (Result, error) {
-	return Result{}, unsupported()
-}
-
-func (*Node) Read(context.Context, Ref, uint32, func(*View) ([]byte, error)) (Result, error) {
-	return Result{}, unsupported()
-}
-
-func (*Node) Lookup(context.Context, Ref, MutationID) (Result, error) { return Result{}, unsupported() }
 
 // Migrate moves the schema from Request.Schema to the uint32 argument.
 func (*Node) Migrate(context.Context, Ref, Request, uint32, func(*Tx) error) (Result, error) {
@@ -139,12 +111,16 @@ func (*Node) Collect(context.Context, Ref) error { return unsupported() }
 
 func (*Node) Stats() Stats { return Stats{} }
 
-func (*Node) Close(context.Context) error { return unsupported() }
+func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
+	return v.v.Query(ctx, q, args, fn)
+}
 
-func (*View) Query(context.Context, string, []any, func(*sql.Rows) error) error { return unsupported() }
+func (t *Tx) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
+	return t.t.Query(ctx, q, args, fn)
+}
 
-func (*Tx) Query(context.Context, string, []any, func(*sql.Rows) error) error { return unsupported() }
-
-func (*Tx) Exec(context.Context, string, ...any) (sql.Result, error) { return nil, unsupported() }
+func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	return t.t.Exec(ctx, q, args...)
+}
 
 func unsupported() *Error { return newError(CodeUnsupported, "not implemented yet", nil) }

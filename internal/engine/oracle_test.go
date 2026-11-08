@@ -213,7 +213,7 @@ func (o *oracle) publish(snapshot bool) {
 		if o.img != before {
 			t.Fatalf("replay at %+v, database published %+v", o.img, before)
 		}
-		if o.img, err = apply(bg, o.replay, o.img, obj.Ref, bytes.NewReader(f.objs[len(f.objs)-1])); err != nil {
+		if o.img, _, err = apply(bg, o.replay, o.img, obj.Ref, bytes.NewReader(f.objs[len(f.objs)-1])); err != nil {
 			t.Fatalf("replaying delta %d..%d: %v", obj.Ref.MinSequence, obj.Ref.MaxSequence, err)
 		}
 	}
@@ -262,11 +262,11 @@ func (o *oracle) resetReplay() {
 	}
 	t.Cleanup(func() { o.replay.Close() })
 	o.img = Image{}
-	if o.img, err = apply(bg, o.replay, Image{}, f.head.Snapshot, bytes.NewReader(f.objs[0])); err != nil {
+	if o.img, _, err = apply(bg, o.replay, Image{}, f.head.Snapshot, bytes.NewReader(f.objs[0])); err != nil {
 		t.Fatal(err)
 	}
 	for i, d := range f.head.Deltas {
-		if o.img, err = apply(bg, o.replay, o.img, d, bytes.NewReader(f.objs[i+1])); err != nil {
+		if o.img, _, err = apply(bg, o.replay, o.img, d, bytes.NewReader(f.objs[i+1])); err != nil {
 			t.Fatal(err)
 		}
 	}

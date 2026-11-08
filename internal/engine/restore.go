@@ -30,6 +30,9 @@ const maxFrame = pageSize + pageSize/255 + 16
 // integrity_check must pass. Every validation failure wraps ErrCorrupt.
 func Restore(ctx context.Context, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (*DB, error) {
 	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
+	if h.Tail != nil {
+		refs = append(refs, h.Tail.Ref())
+	}
 	if len(objs) != len(refs) || h.PageCount > maxPages {
 		return nil, errors.New("engine: objects do not match the head or exceed the page limit")
 	}
@@ -37,9 +40,9 @@ func Restore(ctx context.Context, path string, maxPages uint32, h *head.Head, ob
 	if err != nil {
 		return nil, err
 	}
-	img := Image{}
+	img, pages := Image{}, make([]uint32, len(refs))
 	for i, ref := range refs {
-		if img, err = apply(ctx, f, img, ref, objs[i]); err != nil {
+		if img, pages[i], err = apply(ctx, f, img, ref, objs[i]); err != nil {
 			break
 		}
 	}
@@ -57,7 +60,7 @@ func Restore(ctx context.Context, path string, maxPages uint32, h *head.Head, ob
 	if err != nil {
 		return nil, errors.Join(err, removeFiles(path))
 	}
-	d.pub = img
+	d.pub, d.Pages = img, pages
 	if err := d.check(h); err != nil {
 		return nil, errors.Join(err, d.Discard())
 	}
@@ -85,27 +88,28 @@ func (d *DB) check(h *head.Head) error {
 
 // apply applies one verified object to the image in f: a snapshot onto an
 // empty file, a delta onto img. It updates the rolling checksum from the old
-// contents of the pages it replaces or truncates and returns the new image.
-func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.ReaderAt) (Image, error) {
+// contents of the pages it replaces or truncates and returns the new image
+// and the number of page frames the object carried.
+func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.ReaderAt) (Image, uint32, error) {
 	if err := checkObject(r, ref); err != nil {
-		return img, err
+		return img, 0, err
 	}
 	snapshot := ref.MinSequence == 1
 	dec := ltx.NewDecoder(io.NewSectionReader(r, 0, int64(ref.Bytes)))
 	if err := dec.DecodeHeader(); err != nil {
-		return img, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		return img, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	hd := dec.Header()
 	if err := checkHeader(hd, ref); err != nil {
-		return img, err
+		return img, 0, err
 	}
 	if snapshot != (img == Image{}) || (!snapshot && (ref.MinSequence != img.Sequence+1 || ref.PreChecksum != img.Checksum)) {
-		return img, fmt.Errorf("%w: object %d..%d does not follow image at %d", ErrCorrupt, ref.MinSequence, ref.MaxSequence, img.Sequence)
+		return img, 0, fmt.Errorf("%w: object %d..%d does not follow image at %d", ErrCorrupt, ref.MinSequence, ref.MaxSequence, img.Sequence)
 	}
 	sum, count := ltx.Checksum(img.Checksum), img.PageCount
 	var ph ltx.PageHeader
 	data, old := make([]byte, pageSize), make([]byte, pageSize)
-	prev, grown := uint32(0), uint32(0)
+	prev, grown, carried := uint32(0), uint32(0), uint32(0)
 	for {
 		err := dec.DecodePage(&ph, data)
 		if err == io.EOF {
@@ -126,34 +130,34 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 			_, err = f.WriteAt(data, int64(ph.Pgno-1)*pageSize)
 		}
 		if err != nil {
-			return img, err
+			return img, 0, err
 		}
 		sum ^= ltx.ChecksumPage(ph.Pgno, data)
-		prev = ph.Pgno
+		prev, carried = ph.Pgno, carried+1
 		if ph.Pgno > count {
 			grown++
 		}
 	}
 	if hd.Commit > count && grown != hd.Commit-count {
-		return img, fmt.Errorf("%w: object grows to %d pages but carries %d of %d new pages", ErrCorrupt, hd.Commit, grown, hd.Commit-count)
+		return img, 0, fmt.Errorf("%w: object grows to %d pages but carries %d of %d new pages", ErrCorrupt, hd.Commit, grown, hd.Commit-count)
 	}
 	for p := hd.Commit + 1; p <= count; p++ {
 		if _, err := f.ReadAt(old, int64(p-1)*pageSize); err != nil {
-			return img, err
+			return img, 0, err
 		}
 		sum ^= ltx.ChecksumPage(p, old)
 	}
 	if err := f.Truncate(int64(hd.Commit) * pageSize); err != nil {
-		return img, err
+		return img, 0, err
 	}
 	if err := dec.Close(); err != nil {
-		return img, fmt.Errorf("%w: %v", ErrCorrupt, err)
+		return img, 0, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	post := head.Checksum(ltx.ChecksumFlag | sum)
 	if t := dec.Trailer(); head.Checksum(t.PostApplyChecksum) != post || post != ref.PostChecksum {
-		return img, fmt.Errorf("%w: post-apply checksum %s, computed %s, head %s", ErrCorrupt, t.PostApplyChecksum, ltx.Checksum(post), ltx.Checksum(ref.PostChecksum))
+		return img, 0, fmt.Errorf("%w: post-apply checksum %s, computed %s, head %s", ErrCorrupt, t.PostApplyChecksum, ltx.Checksum(post), ltx.Checksum(ref.PostChecksum))
 	}
-	return Image{ref.MaxSequence, hd.Commit, post}, nil
+	return Image{ref.MaxSequence, hd.Commit, post}, carried, nil
 }
 
 // checkHeader verifies an LTX header against the reference that names it.

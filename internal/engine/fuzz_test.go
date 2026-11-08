@@ -47,7 +47,7 @@ func FuzzLTX(f *testing.F) {
 		f.Fatal(err)
 	}
 	defer tf.Close()
-	baseImg, err := apply(bg, tf, Image{}, base, bytes.NewReader(snap))
+	baseImg, _, err := apply(bg, tf, Image{}, base, bytes.NewReader(snap))
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func FuzzLTX(f *testing.F) {
 				t.Fatal(err)
 			}
 		}
-		got, err := apply(bg, file, img, ref, bytes.NewReader(b))
+		got, _, err := apply(bg, file, img, ref, bytes.NewReader(b))
 		if delta {
 			var out bytes.Buffer
 			c, cerr := Compact(bg, &out, []head.Ref{base, ref}, readers([][]byte{snap, b}))
@@ -83,7 +83,7 @@ func FuzzLTX(f *testing.F) {
 				p2 := filepath.Join(t.TempDir(), "compacted")
 				f2, _ := os.OpenFile(p2, os.O_RDWR|os.O_CREATE, 0o600)
 				defer f2.Close()
-				got2, err := apply(bg, f2, Image{}, c.Ref, bytes.NewReader(out.Bytes()))
+				got2, _, err := apply(bg, f2, Image{}, c.Ref, bytes.NewReader(out.Bytes()))
 				a, _ := os.ReadFile(path)
 				b2, _ := os.ReadFile(p2)
 				if err != nil || got2 != got || !bytes.Equal(a, b2) || c.Pages != got.PageCount {

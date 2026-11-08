@@ -6,12 +6,12 @@ The exact steps every operation implements. PLAN.md is the contract and DECISION
 
 - `self` = `(Config.NodeID, session)`; `session` is a fresh `head.NewID()` per `Open`.
 - `GET`, `PUT_IMM`, `CAS`, `LIST`, `DEL` are the `internal/store` methods; outcomes are `store.Outcome`. Keys below are namespace-relative; the S3 adapter prefixes `<Config.Prefix>/`.
-- Reads and `PUT_IMM` retry `Unknown` with full jitter until the operation deadline. `CAS` makes one SDK attempt; an identical hedge (same bytes, same condition) is allowed after a hedge delay (D3). Anything but `OK` from `CAS` goes to `resolve` (§2).
+- Reads and `PUT_IMM` retry `Unknown` with full jitter until the operation deadline (the S3 adapter does this inside `Get` and `PutImmutable`). `CAS` makes one SDK attempt; an identical hedge (same bytes, same condition) is sent once the first has been outstanding for `StorageAttemptTimeout/2` (D3). Anything but `OK` from `CAS` goes to `resolve` (§2).
 - "Strict decode" = `head.Decode` / `DecodeBirth` / `DecodeNamespace`, then identity checks: `namespace` equals the Node's, `key` equals the requested key, `incarnation` equals `Ref.Incarnation` (else `incarnation_mismatch`).
 - Head missing: if `birth.json` exists, `state_missing`; else `not_found`.
 - "Discard" (D10) = close the connection, delete the entity's db, `-wal`, `-shm` files, drop the cached head. The next access rehydrates (§4).
 - "Barrier" = §3 steps 2–3 (fresh conditional head GET). Required before returning any state-dependent answer that is not a successful CAS (replays, `id_conflict`, `schema_mismatch`, `id_expired` by floor, callback errors). If the head changed, redo the operation from its activation step once, then return `route_changed`.
-- Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else.
+- Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else, except two counters derived from `H` and reset with it: the decoded pages of its deltas plus tail, and of its tail alone (the replay pages of §6.7, set by activation and by each committed candidate).
 
 ## 1. Objects and formats
 
@@ -125,7 +125,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 5. Library: `floor' = max(floor, now_ms − retention_ms)`; delete at most 1000 receipts with `operation_id < u64be(floor'+1)`; insert receipt `(ID, bound, result, seq+1)`; update meta `sequence = seq+1`, `expiry_floor_ms = floor'`; `page_count × 4096 > EntityBytes` → rollback, `capacity`; `COMMIT`. From here until resolution, nothing derived from this state leaves the entity.
 6. Capture (D2): page numbers from WAL frame headers; `PRAGMA page_count`; for each named page ≤ page_count, `SELECT data FROM sqlite_dbpage WHERE pgno=?`; update the checksum incrementally from the old pages in the main file (still the published image). Assert that every page in `(H.page_count, page_count]` was captured (compaction exactness, §1); else discard, `corrupt`.
 7. Cap: if `len(H.deltas) = 32`, or replay pages (deltas plus tail, known from encoding or activation) plus this delta's pages exceed `2 × page_count + 256`, publish a snapshot instead: the main file overlaid with the captured pages, `1..seq+1`, no deltas, tail null; go to 9.
-8. Encode the delta to a bounded temp file while hashing. `t` = the delta if `H.tail` is null, else `engine.Compact([H.tail.Ref(), delta])` into another (range `H.tail.min..seq+1`, pre = `H.tail.pre_checksum`).
+8. Encode the delta while hashing (in memory: `PUT_IMM` takes the whole body, and the delta is bounded by `EntityBytes`). `t` = the delta if `H.tail` is null, else `engine.Compact([H.tail.Ref(), delta])` into another (range `H.tail.min..seq+1`, pre = `H.tail.pre_checksum`).
    - Inline: if `t.bytes ≤ InlineBytes` and some ref of `H` has `base_revision ≥ 1`, `next.tail = t` with its bytes; no PUT, `c.object = nil`. The first mutation after genesis therefore always takes the upload path.
    - Upload: otherwise `PUT_IMM ObjectKey(key, inc, H.revision, NewID(), sha)` (retry same bytes; `PreconditionFailed` → GET, compare bytes); append it at level 0, `next.tail = null`, `c.object` = that ref. Failure before any CAS → discard, `unavailable` (definitely not committed).
 9. `next = H` with revision+1, fresh nonce, `sequence = seq+1`, page_count, checksum, and the refs and tail from 7 or 8; `publish`. An inline mutation is the single CAS of this step.
@@ -152,13 +152,13 @@ Implicit takeover (D4) is steps 5–7 from inside Update/Read/Lookup when `owner
 
 `Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10); forget the entity. Ownership is unchanged: this session may activate it again.
 
-`Close(ctx)`: stop admissions (`closed`); per resident entity, settle `unresolved` within ctx and discard; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
+`Close(ctx)`: stop admissions (`closed`); per resident entity, settle `unresolved` within ctx (and at most `CommitTimeout` in total) and discard; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
 
 ## 8. Open(cfg)
 
 1. Validate `cfg` (`limits.go`).
 2. `GET namespace.json`. Found: strict decode. Absent: `LIST entities/` limit 1; anything → `state_missing`; else `PUT_IMM` a new descriptor; `PreconditionFailed`/`Unknown` → GET again and use the stored one if it decodes.
-3. Probe under `probe/<NewID()>/`: `PUT_IMM` x twice (second must be `PreconditionFailed`); `CAS` y create; `CAS` y with a stale ETag must be `PreconditionFailed`; `GET` returns the last body; `DEL` both. Any deviation → `unsupported`.
+3. Probe under `probe/<NewID()>/`: `PUT_IMM` x twice (second must be `PreconditionFailed`); `CAS` y create (ETag `e1`); `CAS` y with `e1` succeeds; `CAS` y with the now stale `e1` must be `PreconditionFailed`; `GET` returns the second body; `DEL` both. Any deviation → `unsupported` (`Unknown` → `unavailable`).
 4. `session = NewID()`. Create `CacheDir/<session-hex>/` with `O_EXCL`, 0700, and hold an exclusive `flock` on a lock file in it. Remove sibling session dirs whose lock can be acquired (older processes); never follow symlinks.
 
 ## 9. Maintenance (owner, under the gate, `unresolved = nil`)

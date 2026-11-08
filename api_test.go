@@ -52,6 +52,13 @@ func TestAPIFrozen(t *testing.T) {
 					continue
 				}
 				d.Doc, d.Body = nil, nil
+				for _, fl := range []*ast.FieldList{d.Recv, d.Type.Params, d.Type.Results} {
+					if fl != nil { // parameter names are not part of the API
+						for _, f := range fl.List {
+							f.Names = nil
+						}
+					}
+				}
 				render(d)
 			case *ast.GenDecl:
 				for _, s := range d.Specs {
@@ -188,7 +195,10 @@ func TestLimits(t *testing.T) {
 func TestOpenValidatesConfig(t *testing.T) {
 	ok := Config{S3: s3.New(s3.Options{Region: "x"}), Bucket: "b", Prefix: "a/b", NodeID: "n", CacheDir: "/tmp/x"}
 	var e *Error
-	if _, err := Open(context.Background(), ok); !errors.As(err, &e) || e.Code != CodeUnsupported {
+	// A valid config passes validation and reaches storage, which is unreachable here.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := Open(ctx, ok); !errors.As(err, &e) || e.Code != CodeUnavailable {
 		t.Fatalf("valid config: %v", err)
 	}
 	for name, mutate := range map[string]func(*Config){

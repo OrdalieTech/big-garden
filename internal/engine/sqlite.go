@@ -76,6 +76,10 @@ type DB struct {
 	conn *sql.Conn
 	main *os.File // read-only; holds the published image between checkpoints
 	pub  Image    // image of the main file (the last checkpointed, published state)
+
+	// Pages holds, after Restore, the page frames of each restored object
+	// (snapshot, deltas, tail): the replay pages of PROTOCOL §6 step 7.
+	Pages []uint32
 }
 
 const schemaSQL = `

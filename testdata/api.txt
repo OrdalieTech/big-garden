@@ -14,6 +14,8 @@ const CodeSchemaMismatch Code = "schema_mismatch"
 const CodeStateMissing Code = "state_missing"
 const CodeUnavailable Code = "unavailable"
 const CodeUnsupported Code = "unsupported"
+func (*Error) Error() string
+func (*Error) Unwrap() error
 func (*Node) Close(context.Context) error
 func (*Node) Collect(context.Context, Ref) error
 func (*Node) Create(context.Context, string, Request, func(*Tx) ([]byte, error)) (Ref, Result, error)
@@ -32,11 +34,9 @@ func (*Node) Update(context.Context, Ref, Request, func(*Tx) ([]byte, error)) (R
 func (*Tx) Exec(context.Context, string, ...any) (sql.Result, error)
 func (*Tx) Query(context.Context, string, []any, func(*sql.Rows) error) error
 func (*View) Query(context.Context, string, []any, func(*sql.Rows) error) error
-func (e *Error) Error() string
-func (e *Error) Unwrap() error
-func NewMutationID(t time.Time) (MutationID, error)
-func Open(ctx context.Context, cfg Config) (*Node, error)
-func Preferred(key string, nodeIDs []string) (string, error)
+func NewMutationID(time.Time) (MutationID, error)
+func Open(context.Context, Config) (*Node, error)
+func Preferred(string, []string) (string, error)
 type Code string
 type Config struct {
 	S3		*s3.Client
@@ -63,7 +63,8 @@ type Limits struct {
 	IdleTimeout, ReceiptRetention				time.Duration
 }
 type MutationID [24]byte
-type Node struct{}
+type Node struct {
+}
 type Owner struct {
 	NodeID	string
 	Session	[16]byte
