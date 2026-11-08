@@ -303,14 +303,28 @@ var ledgerModel = porcupine.Model{
 
 // operations converts one entity's acknowledged and unknown adds and its
 // acknowledged strong reads; definitely failed adds and unanswered reads
-// had no effect and are left out.
+// had no effect and are left out. An unknown add whose ID was acknowledged
+// later (the recovery retry) is bounded by the earliest such acknowledgment
+// and takes its answer: the ID's single commit precedes that reply, and
+// whether the unknown attempt was that commit or a replay, the model answers
+// the count at the commit. This keeps porcupine's search from branching on
+// long-open unknown adds without allowing any history it would reject.
 func operations(ops []hop, key string) []porcupine.Operation {
+	acked := map[string]hop{}
+	for _, o := range ops {
+		if a, ok := acked[o.ID]; o.Key == key && o.Op == "add" && o.Class == "ack" && (!ok || o.End < a.End) {
+			acked[o.ID] = o
+		}
+	}
 	var out []porcupine.Operation
 	for _, o := range ops {
 		if o.Key != key || o.Class == "failed" || (o.Op == "read" && o.Class != "ack") {
 			continue
 		}
 		po := pout{Known: o.Class == "ack", Value: o.Value}
+		if a, ok := acked[o.ID]; ok && o.Op == "add" && o.Class == "unknown" && a.End > o.Start {
+			po, o.End = pout{Known: true, Value: a.Value}, a.End
+		}
 		if o.Op == "read" {
 			po = readOut(o.IDs)
 		}
@@ -369,6 +383,32 @@ func TestLinearizabilityChecker(t *testing.T) {
 		res, _ := linearizable(c.ops)
 		if want := map[bool]porcupine.CheckResult{true: porcupine.Ok, false: porcupine.Illegal}[c.ok]; res != want {
 			t.Errorf("%s: %s, want %s", c.name, res, want)
+		}
+	}
+	// operations bounds an unknown add by its ID's later acknowledgment
+	hadd := func(id, class, value string, start, end int64) hop {
+		return hop{Op: "add", Key: "k", ID: id, Class: class, Value: value, Start: start, End: end}
+	}
+	hread := func(start, end int64, ids ...string) hop {
+		return hop{Client: 1, Op: "read", Key: "k", Class: "ack", IDs: ids, Start: start, End: end}
+	}
+	for _, c := range []struct {
+		name string
+		ok   bool
+		ops  []hop
+	}{
+		{"unknown committed, retry replays", true, []hop{hadd("a", "unknown", "", 0, math.MaxInt64), hadd("b", "ack", "1", 5, 8),
+			hread(20, 30, "b", "a"), hadd("a", "ack", "2", 40, 50)}},
+		{"unknown not committed, retry commits", true, []hop{hadd("a", "unknown", "", 0, math.MaxInt64), hread(20, 30),
+			hadd("a", "ack", "1", 40, 50)}},
+		{"stale read after the retry's ack", false, []hop{hadd("a", "unknown", "", 0, math.MaxInt64), hadd("a", "ack", "1", 40, 50),
+			hread(60, 70)}},
+		{"retry answers another position", false, []hop{hadd("a", "unknown", "", 0, math.MaxInt64), hread(20, 30, "a"),
+			hadd("b", "ack", "2", 35, 38), hadd("a", "ack", "2", 40, 50)}},
+	} {
+		res, _ := linearizable(operations(c.ops, "k"))
+		if want := map[bool]porcupine.CheckResult{true: porcupine.Ok, false: porcupine.Illegal}[c.ok]; res != want {
+			t.Errorf("operations %s: %s, want %s", c.name, res, want)
 		}
 	}
 }
