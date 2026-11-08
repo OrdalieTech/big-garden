@@ -382,14 +382,85 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			}
 			inc = head.NewID()
 		}
-		ref, res, err := n.genesis(ctx, e, key, req, bound, inc, birth == nil, build)
-		if err != errRestart {
-			return ref, res, err
+		// PROTOCOL §5 steps 4–8
+		if err := n.cache(ctx, e); err != nil {
+			return Ref{}, Result{}, err
 		}
+		db, result, err := func() (*engine.DB, []byte, error) {
+			defer n.unreserve() // also on a callback panic
+			return build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
+		}()
+		if err != nil {
+			return Ref{}, Result{}, err
+		}
+		e.db = db
+		e.bytes.Store(db.Bytes())
+		op := head.OpID(req.ID)
+		var buf bytes.Buffer
+		snap, err := db.Snapshot(&buf)
+		if err != nil {
+			e.discard()
+			return Ref{}, Result{}, engineError(err)
+		}
+		failpoint("capture")
+		// From the birth attempt on, birth.json may exist, and only this request
+		// can resume it (D5): a failure is outcome_unknown, never a code that
+		// invites a retry under another ID (§5 step 5).
+		unknown := func(err error) (Ref, Result, error) {
+			var pe *Error
+			if errors.As(err, &pe) && (pe.Code == CodeUnavailable || pe.Code == CodeCorrupt || pe.Code == CodeCapacity) {
+				err = &Error{Code: CodeOutcomeUnknown, Operation: req.ID, Message: "create outcome unknown: " + pe.Message, cause: pe}
+			}
+			return Ref{}, Result{}, withOp(err, req.ID)
+		}
+		if birth == nil {
+			attempt := head.NewID()
+			body, err := head.Birth{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, OperationID: op,
+				InputHash: bound, Schema: req.Schema, Attempt: attempt}.Encode()
+			if err == nil {
+				err = n.st.PutImmutable(ctx, head.BirthKey(key), body)
+			}
+			if store.OutcomeOf(err) == store.PreconditionFailed {
+				b, berr := n.birth(ctx, key)
+				switch {
+				case berr != nil:
+					err = berr
+				case b == nil:
+					err = newError(CodeUnavailable, "birth.json not readable after a conflict", nil)
+				case b.Attempt == attempt:
+					err = nil
+				case b.OperationID == op && b.InputHash == bound:
+					e.discard()
+					continue // the same request won the birth: restart with it
+				default:
+					err = newError(CodeStateMissing, "another create won the key", nil)
+				}
+			}
+			if err != nil {
+				e.discard()
+				return unknown(storeError(err))
+			}
+		}
+		ref := snap.Ref
+		ref.Key = head.ObjectKey(key, inc, 0, head.NewID(), ref.SHA256)
+		if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
+			e.discard()
+			return unknown(err)
+		}
+		self := n.self
+		next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
+			Owner: &self, Epoch: 1, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
+			PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
+		rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
+		if err != nil {
+			return unknown(err)
+		}
+		if rec != nil { // another genesis carrying our receipt
+			return Ref{key, e.h.Incarnation}, Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
+		}
+		return Ref{key, inc}, Result{Value: result, Version: Version{inc, next.Sequence}}, nil
 	}
 }
-
-var errRestart = errors.New("restart create")
 
 // createExists answers a Create whose key already has a head (§5 step 2).
 func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound head.Digest, body []byte) (Ref, Result, error) {
@@ -446,87 +517,6 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 			return nil
 		}
 	}
-}
-
-// genesis runs PROTOCOL §5 steps 4–8.
-func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, bound head.Digest, inc head.ID, writeBirth bool,
-	build builder) (Ref, Result, error) {
-	if err := n.cache(ctx, e); err != nil {
-		return Ref{}, Result{}, err
-	}
-	db, result, err := func() (*engine.DB, []byte, error) {
-		defer n.unreserve() // also on a callback panic
-		return build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
-	}()
-	if err != nil {
-		return Ref{}, Result{}, err
-	}
-	e.db = db
-	e.bytes.Store(db.Bytes())
-	op := head.OpID(req.ID)
-	var buf bytes.Buffer
-	snap, err := db.Snapshot(&buf)
-	if err != nil {
-		e.discard()
-		return Ref{}, Result{}, engineError(err)
-	}
-	failpoint("capture")
-	// From the birth attempt on, birth.json may exist, and only this request
-	// can resume it (D5): a failure is outcome_unknown, never a code that
-	// invites a retry under another ID (§5 step 5).
-	unknown := func(err error) (Ref, Result, error) {
-		var pe *Error
-		if errors.As(err, &pe) && (pe.Code == CodeUnavailable || pe.Code == CodeCorrupt || pe.Code == CodeCapacity) {
-			err = &Error{Code: CodeOutcomeUnknown, Operation: req.ID, Message: "create outcome unknown: " + pe.Message, cause: pe}
-		}
-		return Ref{}, Result{}, withOp(err, req.ID)
-	}
-	if writeBirth {
-		attempt := head.NewID()
-		body, err := head.Birth{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, OperationID: op,
-			InputHash: bound, Schema: req.Schema, Attempt: attempt}.Encode()
-		if err == nil {
-			err = n.st.PutImmutable(ctx, head.BirthKey(key), body)
-		}
-		if store.OutcomeOf(err) == store.PreconditionFailed {
-			b, berr := n.birth(ctx, key)
-			switch {
-			case berr != nil:
-				err = berr
-			case b == nil:
-				err = newError(CodeUnavailable, "birth.json not readable after a conflict", nil)
-			case b.Attempt == attempt:
-				err = nil
-			case b.OperationID == op && b.InputHash == bound:
-				e.discard()
-				return Ref{}, Result{}, errRestart
-			default:
-				err = newError(CodeStateMissing, "another create won the key", nil)
-			}
-		}
-		if err != nil {
-			e.discard()
-			return unknown(storeError(err))
-		}
-	}
-	ref := snap.Ref
-	ref.Key = head.ObjectKey(key, inc, 0, head.NewID(), ref.SHA256)
-	if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
-		e.discard()
-		return unknown(err)
-	}
-	self := n.self
-	next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
-		Owner: &self, Epoch: 1, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
-		PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
-	rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
-	if err != nil {
-		return unknown(err)
-	}
-	if rec != nil { // another genesis carrying our receipt
-		return Ref{key, e.h.Incarnation}, Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
-	}
-	return Ref{key, inc}, Result{Value: result, Version: Version{inc, next.Sequence}}, nil
 }
 
 func withOp(err error, id MutationID) error {
