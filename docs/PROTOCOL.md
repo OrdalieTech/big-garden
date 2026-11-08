@@ -156,7 +156,7 @@ Implicit takeover (D4) is steps 5–7 from inside Update/Read/Lookup when `owner
 
 Cache policy: before an activation or a genesis build, if `ResidentEntities` other entities are resident, discard the least recently admitted one that is idle and settled (never a busy one; wait up to 1 s, and never past the caller's deadline, then `capacity`). Then reserve `4×EntityBytes + 1 MiB` (§4 step 1) against `CacheBytes`, which also counts the other reserves in progress and the database and WAL files of every resident entity (a busy entity with its size when last seen idle or settled): while it does not fit, discard the least recently admitted idle, settled entity; if none is left (all pinned), wait up to 1 s (within the caller's deadline), then `capacity`. The reserve is released once the file is built; the file then counts as resident bytes. A sweeper discards settled caches idle for `IdleTimeout`. Both are D10 discards: ownership is unchanged.
 
-`Close(ctx)`: stop admissions (`closed`); per resident entity, settle `unresolved` within ctx (and at most `CommitTimeout` in total) and discard; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
+`Close(ctx)`: stop admissions (`closed`); wait for maintenance in flight, lock each entity and settle its `unresolved`, all within ctx (and at most `CommitTimeout` in total), and discard; an entity still busy at the deadline counts as unresolved; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
 
 ## 8. Open(cfg)
 

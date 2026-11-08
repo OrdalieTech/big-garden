@@ -358,12 +358,20 @@ func (n *Node) Close(ctx context.Context) error {
 		es = append(es, e)
 	}
 	n.mu.Unlock()
-	n.wg.Wait()
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout)
 	defer cancel()
+	idle := make(chan struct{})
+	go func() { n.wg.Wait(); close(idle) }()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+	}
 	unknown := false
 	for _, e := range es {
-		e.mu.Lock()
+		if e.mu.lock(ctx) != nil { // still busy: it may hold an unresolved candidate
+			unknown = true
+			continue
+		}
 		if e.unresolved != nil {
 			n.resolve(ctx, e, e.unresolved)
 			unknown = unknown || e.unresolved != nil
@@ -371,6 +379,8 @@ func (n *Node) Close(ctx context.Context) error {
 		e.discard()
 		e.mu.Unlock()
 	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.lock != nil {
 		os.RemoveAll(n.dir)
 		n.lock.Close()

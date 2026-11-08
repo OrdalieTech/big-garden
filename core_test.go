@@ -1283,6 +1283,54 @@ func TestCloseReportsUnresolved(t *testing.T) {
 	l.verify(t, mem, "a")
 }
 
+// TestCloseHonorsContext: Close stops waiting for a busy entity when its
+// ctx ends, concurrent Closes are safe, and Resolve is closed afterwards.
+func TestCloseHonorsContext(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var armed atomic.Bool
+	armed.Store(true)
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if armed.Load() && a.Key == head.HeadKey("k") && (a.Op == "cas" || a.Op == "get") {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "stuck", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	n.cfg.Limits.CommitTimeout = 5 * time.Second
+	held := make(chan struct{})
+	go func() { // a long settle holds the entity mutex
+		ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+		defer cancel()
+		close(held)
+		n.Update(ctx, ref, req, put("b", "2"))
+	}()
+	<-held
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(bg, 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Go(func() { errs[i] = n.Close(ctx) })
+	}
+	wg.Wait()
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("Close took %v", d)
+	}
+	wantCode(t, errs[0], CodeOutcomeUnknown)
+	wantCode(t, errs[1], CodeOutcomeUnknown)
+	_, err = n.Resolve(bg, "k")
+	wantCode(t, err, CodeClosed)
+	armed.Store(false)
+}
+
 func TestMaintenance(t *testing.T) {
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)

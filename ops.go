@@ -217,6 +217,9 @@ func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 	if err := head.ValidKey(key); err != nil {
 		return Route{}, invalid(err.Error())
 	}
+	if n.isClosed() {
+		return Route{}, newError(CodeClosed, "", nil)
+	}
 	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
