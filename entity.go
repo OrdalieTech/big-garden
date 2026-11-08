@@ -35,6 +35,7 @@ type entity struct {
 	pages      []uint32
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
+	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.
@@ -56,6 +57,7 @@ func (e *entity) discard() {
 		e.db.Discard()
 	}
 	e.db, e.h, e.etag, e.pages = nil, nil, "", nil
+	e.bytes.Store(0)
 }
 
 func imageOf(h *head.Head) engine.Image {
@@ -176,6 +178,9 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 		e.discard()
 	}
 	e.h, e.etag = cur, etag // kept even without a local image: the next access activates or revalidates it
+	if e.db != nil {
+		e.bytes.Store(e.db.Bytes())
+	}
 }
 
 // resolve runs PROTOCOL §2 resolve(c) until ctx ends.
@@ -283,14 +288,10 @@ func sleep(ctx context.Context, i int) error {
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting
 // with the current head if an object vanished or changed under it.
 func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag string) error {
-	if !n.room(e) {
-		return newError(CodeCapacity, "ResidentEntities entities are busy", nil)
+	if err := n.cache(e); err != nil {
+		return err
 	}
-	need := 4*n.cfg.Limits.EntityBytes + 1<<20
-	if !n.reserve(need) {
-		return newError(CodeCapacity, "cache bytes exhausted", nil)
-	}
-	defer n.unreserve(need)
+	defer n.unreserve()
 	for {
 		refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
 		objs := make([]io.ReaderAt, len(refs), len(refs)+1)
@@ -347,6 +348,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 		n.counters.activations.Add(1)
 		e.db, e.h, e.etag = db, h, etag
 		e.pages = db.Pages
+		e.bytes.Store(db.Bytes())
 		return nil
 	}
 }

@@ -386,6 +386,17 @@ func (d *DB) Checkpoint(o Object) error {
 	return nil
 }
 
+// Bytes is the size of the database and -wal files (0 for a missing file).
+func (d *DB) Bytes() int64 {
+	var n int64
+	for _, s := range []string{"", "-wal"} {
+		if st, err := os.Stat(d.path + s); err == nil {
+			n += st.Size()
+		}
+	}
+	return n
+}
+
 // Discard closes the connection and deletes the database, -wal and -shm
 // files (DECISIONS D10). The DB is unusable afterwards.
 func (d *DB) Discard() error {

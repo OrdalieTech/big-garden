@@ -263,20 +263,69 @@ func (n *Node) isClosed() bool {
 	return n.closed
 }
 
-// reserve claims cache bytes for one activation (PROTOCOL §4 step 1).
-func (n *Node) reserve(b int64) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.reserved+b > n.cfg.Limits.CacheBytes {
-		return false
+// buildBytes is the cache reserve of one activation or genesis build.
+func (n *Node) buildBytes() int64 { return 4*n.cfg.Limits.EntityBytes + 1<<20 }
+
+// cache makes room for e to become resident and reserves buildBytes for
+// building its file (PROTOCOL §4 step 1, §7 cache policy); the caller
+// releases the reserve with unreserve once the file is built.
+func (n *Node) cache(e *entity) error {
+	if !n.room(e) {
+		return newError(CodeCapacity, "ResidentEntities entities are busy", nil)
 	}
-	n.reserved += b
-	return true
+	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
+		if i == 100 {
+			return newError(CodeCapacity, "cache bytes held by entities in use", nil)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil
 }
 
-func (n *Node) unreserve(b int64) {
+// fit reserves buildBytes for self if it fits in CacheBytes beside the other
+// reserves and the files of the other resident entities, discarding idle,
+// settled entities least recently admitted first until it does. A busy
+// entity is pinned and counts with its last seen size. It never blocks on an
+// entity mutex.
+func (n *Node) fit(self *entity) bool {
 	n.mu.Lock()
-	n.reserved -= b
+	defer n.mu.Unlock()
+	for {
+		used, lru := n.reserved, (*entity)(nil)
+		var lruUsed time.Time
+		for _, e := range n.entities {
+			if e == self || !e.mu.TryLock() {
+				used += e.bytes.Load()
+				continue
+			}
+			if e.db != nil {
+				e.bytes.Store(e.db.Bytes())
+				if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
+					lru, lruUsed = e, e.used
+				}
+			}
+			used += e.bytes.Load()
+			e.mu.Unlock()
+		}
+		if used+n.buildBytes() <= n.cfg.Limits.CacheBytes {
+			n.reserved += n.buildBytes()
+			return true
+		}
+		if lru == nil || !lru.mu.TryLock() {
+			return false
+		}
+		if lru.db == nil || lru.unresolved != nil {
+			lru.mu.Unlock()
+			return false
+		}
+		lru.discard()
+		lru.mu.Unlock()
+	}
+}
+
+func (n *Node) unreserve() {
+	n.mu.Lock()
+	n.reserved -= n.buildBytes()
 	n.mu.Unlock()
 }
 

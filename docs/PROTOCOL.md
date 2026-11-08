@@ -95,7 +95,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 
 ## 4. Activation (cold restore of exactly head `H`, PLAN §9.3)
 
-1. Reserve cache bytes (`4×EntityBytes + 1 MiB`); else `capacity`.
+1. Reserve cache bytes (`4×EntityBytes + 1 MiB`) under the cache policy (§7); else `capacity`.
 2. GET snapshot and deltas (≤ 4 concurrent), `max = ref.bytes`. The tail needs no GET: its bytes are in `H`. Check length and SHA-256. `NotFound` or mismatch: GET head again; if it changed, restart with the new head (collection race); else `state_missing` (missing) or `corrupt` (mismatch).
 3. Into a new private file (`O_EXCL`, 0600) in the session cache dir: apply the snapshot, then each delta in order, then the tail as `Tail.Ref()` over `tail.data`. Per object: `MinTXID/MaxTXID` = ref range, `PreApplyChecksum` = running checksum, decoder close succeeds, truncate to `Commit` pages, recomputed checksum = trailer post-checksum = `ref.post_checksum`.
 4. Check `page_count = H.page_count` and checksum = `H.database_checksum`.
@@ -153,7 +153,7 @@ Implicit takeover (D4) is steps 5–7 from inside Update/Read/Lookup when `owner
 
 `Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10); forget the entity (its struct stays registered, so its mutex keeps serializing the key). Ownership is unchanged: this session may activate it again.
 
-Cache policy: before an activation or a genesis build, if `ResidentEntities` other entities are resident, discard the least recently admitted one that is idle and settled (never a busy one; wait up to 1 s, then `capacity`). A sweeper discards settled caches idle for `IdleTimeout`. Both are D10 discards: ownership is unchanged.
+Cache policy: before an activation or a genesis build, if `ResidentEntities` other entities are resident, discard the least recently admitted one that is idle and settled (never a busy one; wait up to 1 s, then `capacity`). Then reserve `4×EntityBytes + 1 MiB` (§4 step 1) against `CacheBytes`, which also counts the other reserves in progress and the database and WAL files of every resident entity (a busy entity with its size when last seen idle or settled): while it does not fit, discard the least recently admitted idle, settled entity; if none is left (all pinned), wait up to 1 s, then `capacity`. The reserve is released once the file is built; the file then counts as resident bytes. A sweeper discards settled caches idle for `IdleTimeout`. Both are D10 discards: ownership is unchanged.
 
 `Close(ctx)`: stop admissions (`closed`); per resident entity, settle `unresolved` within ctx (and at most `CommitTimeout` in total) and discard; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
 

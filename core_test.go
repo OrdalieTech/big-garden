@@ -1286,3 +1286,47 @@ func TestInflightStorageBound(t *testing.T) {
 	}
 	l.verify(t, mem, "a")
 }
+
+func TestCacheBytes(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", func(l *Limits) { l.Recoveries = 1 })
+	l := newLedger()
+	ref0 := mustCreate(t, n, "e0", l)
+	mustPut(t, n, ref0, "a", randText(16<<10), l)
+	size := n.Stats().CacheBytes
+	if size <= 0 {
+		t.Fatalf("a resident entity accounts %d cache bytes", size)
+	}
+	n.cfg.Limits.CacheBytes = n.buildBytes() + size/2 // one build, and no resident entity beside it
+	ref1 := mustCreate(t, n, "e1", l)                  // genesis evicts e0
+	mustPut(t, n, ref1, "a", randText(16<<10), l)
+	if s := n.Stats(); s.ResidentEntities != 1 || s.CacheBytes > n.cfg.Limits.CacheBytes {
+		t.Fatalf("stats %+v", s)
+	}
+	readAll(t, n, ref0) // activation evicts e1
+	if s := n.Stats(); s.ResidentEntities != 1 {
+		t.Fatalf("stats %+v", s)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error)
+	go func() {
+		_, err := n.Update(bg, ref0, newReq(t, "pinned", 1), func(tx *Tx) ([]byte, error) {
+			close(started)
+			<-release
+			return put("b", "pinned")(tx)
+		})
+		done <- err
+	}()
+	<-started // e0 is in use: its bytes are pinned
+	_, err := n.Read(bg, ref1, 1, func(v *View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeCapacity)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	l.ack(ref0, "b", "pinned")
+	if got := readAll(t, n, ref1); got["a"] == "" {
+		t.Fatal("e1 lost its row")
+	}
+	l.verify(t, mem, "a")
+}
