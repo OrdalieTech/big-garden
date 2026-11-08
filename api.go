@@ -87,10 +87,6 @@ func NewMutationID(t time.Time) (MutationID, error) {
 	return id, nil
 }
 
-func (*Node) Export(context.Context, Ref, io.Writer) (Version, error) {
-	return Version{}, unsupported()
-}
-
 func (*Node) Import(context.Context, string, Request, io.Reader) (Ref, Result, error) {
 	return Ref{}, Result{}, unsupported()
 }

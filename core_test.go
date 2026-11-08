@@ -1,12 +1,16 @@
 package garden
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -966,4 +970,50 @@ func TestCollect(t *testing.T) {
 	err := other.Collect(bg, Ref{"k", [16]byte{9}})
 	wantCode(t, err, CodeIncarnationMismatch)
 	l.verify(t, mem, "a")
+}
+
+func TestExport(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	mustPut(t, n, ref, "b", "2", l) // the export includes the inline tail
+	var out bytes.Buffer
+	v, err := n.Export(bg, ref, &out)
+	if err != nil || v.Sequence != 3 || v.Incarnation != ref.Incarnation {
+		t.Fatalf("export %+v %v", v, err)
+	}
+	tr := tar.NewReader(&out)
+	var names []string
+	var m manifest
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(tr)
+		names = append(names, hdr.Name)
+		if hdr.Typeflag != tar.TypeReg || hdr.Mode != 0o600 || hdr.ModTime.Unix() != 0 {
+			t.Fatalf("entry %+v", hdr)
+		}
+		switch hdr.Name {
+		case "manifest.json":
+			if err := json.Unmarshal(body, &m); err != nil {
+				t.Fatal(err)
+			}
+		case "snapshot.ltx":
+			if uint64(len(body)) != m.Bytes || sha256.Sum256(body) != m.SHA256 {
+				t.Fatal("snapshot differs from its manifest")
+			}
+		}
+	}
+	h, _ := headAt(t, mem, "k")
+	if strings.Join(names, ",") != "manifest.json,snapshot.ltx" || m.Sequence != 3 || m.DatabaseChecksum != h.DatabaseChecksum ||
+		m.PageCount != h.PageCount || m.Key != "k" {
+		t.Fatalf("archive %v manifest %+v", names, m)
+	}
 }
