@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -177,8 +178,7 @@ func (s *S3) list(ctx context.Context, prefix, after string, limit int) ([]Entry
 	last := after
 	for _, o := range out.Contents {
 		k := aws.ToString(o.Key)
-		if len(page) == limit || len(k) < len(s.prefix+prefix) || k[:len(s.prefix+prefix)] != s.prefix+prefix ||
-			k[len(s.prefix):] <= last || o.Size == nil {
+		if len(page) == limit || !strings.HasPrefix(k, s.prefix+prefix) || k[len(s.prefix):] <= last || o.Size == nil {
 			return nil, false, s.done(opList, 0, 0, failed("list", prefix, Failed, "malformed listing"))
 		}
 		last = k[len(s.prefix):]
@@ -246,7 +246,6 @@ func classify(op, key string, err error) error {
 	if ae := (interface{ ErrorCode() string })(nil); errors.As(err, &ae) {
 		code = ae.ErrorCode()
 	}
-	write := op == "put" || op == "cas"
 	o := Failed
 	switch st := re.HTTPStatusCode(); {
 	case st == 304 && op == "get":
@@ -255,7 +254,7 @@ func classify(op, key string, err error) error {
 		o = PreconditionFailed // If-Match on a missing key
 	case st == 404 && code == "NoSuchKey" && (op == "get" || op == "delete"):
 		o = NotFound
-	case st == 412 && write, st == 409 && op == "cas":
+	case st == 412 && (op == "put" || op == "cas"), st == 409 && op == "cas":
 		o = PreconditionFailed
 	case st < 300, st == 408, st == 409, st == 429, st >= 500:
 		o = Unknown
