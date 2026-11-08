@@ -95,15 +95,25 @@ const (
 	minioTmpfsSize = "1g"
 )
 
+// RemoteEnv, set (to anything) together with GARDEN_TEST_MINIO, runs the
+// MinIO tests against the remote endpoint of RemoteFromEnv instead.
+const RemoteEnv = "GARDEN_TEST_REMOTE"
+
 // MinIO returns a fresh prefix on the local MinIO fixture, starting the
-// container if needed. It skips t only when GARDEN_TEST_MINIO is unset; a
-// fixture that cannot start fails the test.
+// container if needed, or with GARDEN_TEST_REMOTE on the remote endpoint,
+// where missing configuration fails the test with
+// blocked_missing_remote_configuration. It skips t only when
+// GARDEN_TEST_MINIO is unset; a fixture that cannot start fails the test.
 func MinIO(t testing.TB) Endpoint {
 	t.Helper()
 	if os.Getenv(MinIOEnv) == "" {
 		t.Skip(MinIOEnv + " is not set")
 	}
-	e, err := StartMinIO(context.Background())
+	start := StartMinIO
+	if os.Getenv(RemoteEnv) != "" {
+		start = func(context.Context) (Endpoint, error) { return RemoteFromEnv() }
+	}
+	e, err := start(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -189,3 +189,17 @@ func TestMemCASRace(t *testing.T) {
 		etag = etags[winner]
 	}
 }
+
+// TestUnchunk: the proxy journal records the payload of aws-chunked PUTs,
+// signed or unsigned, with or without trailers.
+func TestUnchunk(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"3\r\nabc\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n", "abc"},
+		{"2;chunk-signature=ff\r\nab\r\n1;chunk-signature=ee\r\nc\r\n0;chunk-signature=dd\r\n\r\n", "abc"},
+		{"a\r\n0123456789\r\n0\r\n\r\n", "0123456789"},
+	} {
+		if got := string(unchunk([]byte(c.in))); got != c.want {
+			t.Errorf("unchunk(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
