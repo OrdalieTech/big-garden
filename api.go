@@ -87,17 +87,6 @@ func NewMutationID(t time.Time) (MutationID, error) {
 	return id, nil
 }
 
-func (*Node) Takeover(context.Context, Route) (Route, error) { return Route{}, unsupported() }
-
-func (*Node) Release(context.Context, Ref) error { return unsupported() }
-
-// Migrate moves the schema from Request.Schema to the uint32 argument.
-func (*Node) Migrate(context.Context, Ref, Request, uint32, func(*Tx) error) (Result, error) {
-	return Result{}, unsupported()
-}
-
-func (*Node) Evict(context.Context, Ref) error { return unsupported() }
-
 func (*Node) Export(context.Context, Ref, io.Writer) (Version, error) {
 	return Version{}, unsupported()
 }

@@ -47,8 +47,10 @@ func binding(kind byte, from, to uint32, hash [32]byte) head.Digest {
 }
 
 // enter returns the entity of key with its mutex held and any unresolved
-// candidate settled first (PROTOCOL §2 rule 5).
-func (n *Node) enter(key string, id MutationID) (*entity, error) {
+// candidate settled first (PROTOCOL §2 rule 5). If it stays unresolved, the
+// same operation ID (or every caller, for a nil id) gets outcome_unknown and
+// others unavailable.
+func (n *Node) enter(key string, id *MutationID) (*entity, error) {
 	e, err := n.entity(key)
 	if err != nil {
 		return nil, err
@@ -60,8 +62,8 @@ func (n *Node) enter(key string, id MutationID) (*entity, error) {
 		cancel()
 		if e.unresolved != nil {
 			e.mu.Unlock()
-			if c.op != nil && *c.op == head.OpID(id) {
-				return nil, &Error{Code: CodeOutcomeUnknown, Operation: id, Message: "earlier attempt still unresolved"}
+			if id == nil || (c.op != nil && *c.op == head.OpID(*id)) {
+				return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "earlier attempt still unresolved"}
 			}
 			return nil, newError(CodeUnavailable, "an earlier publication is unresolved", nil)
 		}
@@ -207,7 +209,7 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, MutationID{})
+	e, err := n.enter(ref.Key, &MutationID{})
 	if err != nil {
 		return Result{}, err
 	}
@@ -231,7 +233,7 @@ func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (Result, erro
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, id)
+	e, err := n.enter(ref.Key, &id)
 	if err != nil {
 		return Result{}, err
 	}
@@ -265,7 +267,7 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 		return Ref{}, Result{}, err
 	}
 	bound := binding(1, req.Schema, req.Schema, req.Hash)
-	e, err := n.enter(key, req.ID)
+	e, err := n.enter(key, &req.ID)
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -450,11 +452,24 @@ func withOp(err error, id MutationID) error {
 
 // Update runs fn as one mutation of ref (PROTOCOL §6, B = 1).
 func (n *Node) Update(ctx context.Context, ref Ref, req Request, fn func(*Tx) ([]byte, error)) (Result, error) {
+	return n.mutate(ctx, ref, req, 2, req.Schema, fn)
+}
+
+// Migrate moves the schema from Request.Schema to the uint32 argument.
+func (n *Node) Migrate(ctx context.Context, ref Ref, req Request, to uint32, fn func(*Tx) error) (Result, error) {
+	if to <= req.Schema {
+		return Result{}, invalid("Migrate must raise the schema")
+	}
+	return n.mutate(ctx, ref, req, 3, to, func(tx *Tx) ([]byte, error) { return nil, fn(tx) })
+}
+
+// mutate is Update (kind 2) and Migrate (kind 3, schema req.Schema -> to).
+func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to uint32, fn func(*Tx) ([]byte, error)) (Result, error) {
 	if err := n.checkRequest(ref.Key, req); err != nil {
 		return Result{}, err
 	}
-	bound := binding(2, req.Schema, req.Schema, req.Hash)
-	e, err := n.enter(ref.Key, req.ID)
+	bound := binding(kind, req.Schema, to, req.Hash)
+	e, err := n.enter(ref.Key, &req.ID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -469,7 +484,7 @@ func (n *Node) Update(ctx context.Context, ref Ref, req Request, fn func(*Tx) ([
 		var result []byte
 		if verdict == nil && res == nil {
 			floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
-			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema, FloorMs: uint64(floor)},
+			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor)},
 				scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { return fn(&Tx{t}) }, &cb))
 			if err != nil && (cb == nil || cb == errResultTooLarge) {
 				e.discard()
@@ -490,7 +505,7 @@ func (n *Node) Update(ctx context.Context, ref Ref, req Request, fn func(*Tx) ([
 			}
 			return Result{}, verdict
 		}
-		return n.publishUpdate(ctx, e, req, bound, result, seq)
+		return n.publishUpdate(ctx, e, req, bound, to, result, seq)
 	}
 	return Result{}, &Error{Code: CodeRouteChanged, Operation: req.ID, Message: "the head changed twice during the operation"}
 }
@@ -520,7 +535,7 @@ func (n *Node) admit(e *entity, req Request, bound head.Digest) (*Result, error)
 
 // publishUpdate captures and publishes a locally committed mutation
 // (PROTOCOL §6 steps 6–10).
-func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound head.Digest, result []byte, seq uint64) (Result, error) {
+func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound head.Digest, schema uint32, result []byte, seq uint64) (Result, error) {
 	h, op := e.h, head.OpID(req.ID)
 	fail := func(err error) (Result, error) { e.discard(); return Result{}, withOp(err, req.ID) }
 	var buf bytes.Buffer
@@ -529,7 +544,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		return fail(engineError(err))
 	}
 	next := *h
-	next.Revision, next.Nonce, next.Sequence = h.Revision+1, head.NewID(), seq
+	next.Revision, next.Nonce, next.Sequence, next.Schema = h.Revision+1, head.NewID(), seq, schema
 	next.PageCount, next.DatabaseChecksum = delta.PageCount, delta.Ref.PostChecksum
 	c := &candidate{base: h, baseETag: e.etag, op: &op, bound: bound}
 	if len(h.Deltas) == head.MaxDeltas || uint64(e.replay)+uint64(delta.Pages) > 2*uint64(delta.PageCount)+256 {

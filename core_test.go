@@ -687,3 +687,105 @@ func statDir(p string) (bool, error) {
 	fi, err := os.Lstat(p)
 	return err == nil && fi.IsDir(), err
 }
+
+func TestOwnershipAndMigrate(t *testing.T) {
+	mem := storetest.NewMem()
+	a := testNode(t, mem, "a", nil)
+	b := testNode(t, mem, "b", nil)
+	l := newLedger()
+	ref := mustCreate(t, a, "k", l)
+	mustPut(t, a, ref, "a", "1", l)
+	mustPut(t, a, ref, "b", "2", l) // inline tail carried by the takeover
+	route, err := b.Resolve(bg, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := route
+	stale.Epoch--
+	_, err = b.Takeover(bg, stale)
+	wantCode(t, err, CodeRouteChanged)
+	got, err := b.Takeover(bg, route)
+	if err != nil || got.Owner != b.Owner() || got.Epoch != route.Epoch+1 {
+		t.Fatalf("takeover %+v %v", got, err)
+	}
+	if again, err := b.Takeover(bg, route); err != nil || again != got {
+		t.Fatalf("takeover by the owner is a no-op: %+v %v", again, err)
+	}
+	mustPut(t, b, ref, "c", "3", l)
+	_, err = a.Update(bg, ref, newReq(t, "fenced", 1), put("x", "x")) // cached head: the CAS fails
+	if e := wantCode(t, err, CodeNotOwner); e.Route == nil || e.Route.Owner != b.Owner() {
+		t.Fatalf("route %+v", e.Route)
+	}
+	_, err = a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeNotOwner)
+
+	// release, then the unowned entity is claimable
+	if err := b.Release(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Release(bg, ref); err != nil {
+		t.Fatalf("release by a non-owner is nil: %v", err)
+	}
+	_, err = b.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeNotOwner)
+	route, _ = a.Resolve(bg, "k")
+	if route.Owner != (Owner{}) {
+		t.Fatalf("released route %+v", route)
+	}
+	if _, err := a.Takeover(bg, route); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, a, ref); got["c"] != "3" || got["b"] != "2" {
+		t.Fatalf("read after takeovers %v", got)
+	}
+
+	// evict keeps ownership; the next access rehydrates
+	if err := a.Evict(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	mustPut(t, a, ref, "d", "4", l)
+
+	// migrate
+	_, err = a.Migrate(bg, ref, newReq(t, "m0", 1), 1, func(*Tx) error { return nil })
+	wantCode(t, err, CodeInvalidArgument)
+	mreq := newReq(t, "m", 1)
+	res, err := a.Migrate(bg, ref, mreq, 2, func(tx *Tx) error {
+		_, err := tx.Exec(bg, "ALTER TABLE kv ADD COLUMN n INTEGER")
+		return err
+	})
+	if err != nil || len(res.Value) != 0 {
+		t.Fatalf("migrate %+v %v", res, err)
+	}
+	if again, err := a.Migrate(bg, ref, mreq, 2, func(*Tx) error { return nil }); err != nil || !again.Replayed {
+		t.Fatalf("migrate replay %+v %v", again, err)
+	}
+	_, err = a.Update(bg, ref, newReq(t, "old schema", 1), put("e", "5"))
+	wantCode(t, err, CodeSchemaMismatch)
+	if _, err := a.Read(bg, ref, 2, func(*View) ([]byte, error) { return nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := headAt(t, mem, "k")
+	if h.Schema != 2 {
+		t.Fatalf("head schema %d", h.Schema)
+	}
+}
+
+func TestCloseReportsUnresolved(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var armed atomic.Bool
+	armed.Store(true)
+	failHeadCAS(mem, "k", &armed)
+	_, err := n.Update(bg, ref, newReq(t, "u", 1), put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	err = n.Evict(bg, ref)
+	wantCode(t, err, CodeOutcomeUnknown)
+	wantCode(t, n.Close(bg), CodeOutcomeUnknown)
+	_, err = n.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeClosed)
+	armed.Store(false)
+	l.verify(t, mem, "a")
+}
