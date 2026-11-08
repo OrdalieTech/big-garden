@@ -45,17 +45,13 @@ func (n *Node) maintain(e *entity) {
 	c := &candidate{base: h, baseETag: e.etag}
 	var buf bytes.Buffer
 	var ref head.Ref
-	place := func(r head.Ref) head.Ref {
-		r.Key, r.BaseRevision = head.ObjectKey(h.Key, h.Incarnation, h.Revision, head.NewID(), r.SHA256), h.Revision
-		return r
-	}
 	if e.replay() > uint64(h.PageCount)+256 {
 		snap, err := e.db.Snapshot(&buf)
 		if err != nil || snap.Ref.PostChecksum != h.DatabaseChecksum || snap.Ref.MaxSequence != h.Sequence {
 			e.discard()
 			return
 		}
-		ref = place(snap.Ref)
+		ref = placed(h, snap.Ref)
 		next.Snapshot, next.Deltas, next.Tail, c.pages = ref, []head.Ref{}, nil, []uint32{snap.Pages}
 	} else {
 		i := 0
@@ -81,7 +77,7 @@ func (n *Node) maintain(e *entity) {
 		if err != nil {
 			return
 		}
-		ref = place(out.Ref)
+		ref = placed(h, out.Ref)
 		ref.Level = run[0].Level + 1
 		next.Deltas = slices.Concat(h.Deltas[:i], []head.Ref{ref}, h.Deltas[i+fanout:])
 		c.pages = slices.Concat(e.pages[:1+i], []uint32{out.Pages}, e.pages[1+i+fanout:])
@@ -94,6 +90,12 @@ func (n *Node) maintain(e *entity) {
 	c.next, c.object = next, &ref
 	n.publish(e, c) // not committed: the object is abandoned to collection
 	failpoint("maint.done")
+}
+
+// placed keys r as a new object based on h's revision.
+func placed(h *head.Head, r head.Ref) head.Ref {
+	r.Key, r.BaseRevision = head.ObjectKey(h.Key, h.Incarnation, h.Revision, head.NewID(), r.SHA256), h.Revision
+	return r
 }
 
 // Collect deletes unreachable immutable artifacts of one entity (PLAN §9.2,
