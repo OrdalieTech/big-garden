@@ -36,7 +36,7 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 	if err := head.ValidKey(observed.Ref.Key); err != nil {
 		return Route{}, invalid(err.Error())
 	}
-	e, err := n.enter(observed.Ref.Key, &MutationID{})
+	e, err := n.enter(ctx, observed.Ref.Key, &MutationID{})
 	if err != nil {
 		return Route{}, err
 	}
@@ -84,7 +84,7 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 	if err := head.ValidKey(ref.Key); err != nil {
 		return invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, nil)
+	e, err := n.enter(ctx, ref.Key, nil)
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func (n *Node) Evict(ctx context.Context, ref Ref) error {
 	if err := head.ValidKey(ref.Key); err != nil {
 		return invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, nil)
+	e, err := n.enter(ctx, ref.Key, nil)
 	if err != nil {
 		return err
 	}

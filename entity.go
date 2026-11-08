@@ -26,7 +26,7 @@ const maxHeadBytes = 64 << 10
 // decoded page frames of each of h's snapshot, deltas and tail (the replay
 // pages of PROTOCOL §6 step 7 and §9); it is derived from h and reset with it.
 type entity struct {
-	mu         sync.Mutex
+	mu         gate
 	key        string
 	h          *head.Head
 	etag       string
@@ -37,6 +37,30 @@ type entity struct {
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
 	since      atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)
+}
+
+// gate is the entity mutex (D8); lock also gives up when ctx ends.
+type gate chan struct{}
+
+func (g gate) Lock()   { g <- struct{}{} }
+func (g gate) Unlock() { <-g }
+
+func (g gate) TryLock() bool {
+	select {
+	case g <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g gate) lock(ctx context.Context) error {
+	select {
+	case g <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.
@@ -306,7 +330,7 @@ func sleep(ctx context.Context, i int) error {
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting
 // with the current head if an object vanished or changed under it.
 func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag string) error {
-	if err := n.cache(e); err != nil {
+	if err := n.cache(ctx, e); err != nil {
 		return err
 	}
 	defer n.unreserve()

@@ -53,10 +53,11 @@ func binding(kind byte, from, to uint32, hash [32]byte) head.Digest {
 }
 
 // enter returns the entity of key with its mutex held and any unresolved
-// candidate settled first (PROTOCOL §2 rule 5). If it stays unresolved, the
-// same operation ID (or every caller, for a nil id) gets outcome_unknown and
-// others unavailable.
-func (n *Node) enter(key string, id *MutationID) (*entity, error) {
+// candidate settled first (PROTOCOL §2 rule 5), both within ctx. If it stays
+// unresolved, the same operation ID (or every caller, for a nil id) gets
+// outcome_unknown and others unavailable; a mutation whose ctx ends while
+// queued gets outcome_unknown, since the candidate may be its own.
+func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, error) {
 	e, err := n.entity(key)
 	if err != nil {
 		return nil, err
@@ -65,15 +66,21 @@ func (n *Node) enter(key string, id *MutationID) (*entity, error) {
 		e.waiting.Add(-1)
 		return nil, newError(CodeCapacity, "too many operations queued on the entity", nil)
 	}
-	e.mu.Lock()
+	err = e.mu.lock(ctx)
 	e.waiting.Add(-1)
+	if err != nil {
+		if id == nil || *id != (MutationID{}) {
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: *cmp.Or(id, &MutationID{}), Message: "deadline while queued", cause: err}
+		}
+		return nil, newError(CodeUnavailable, "deadline while queued", err)
+	}
 	e.used = time.Now()
 	if n.isClosed() {
 		e.mu.Unlock()
 		return nil, newError(CodeClosed, "", nil)
 	}
 	if c := e.unresolved; c != nil {
-		ctx, cancel := n.commitContext()
+		ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout) // cut short: c stays unresolved
 		n.resolve(ctx, e, c)
 		cancel()
 		if e.unresolved != nil {
@@ -231,7 +238,7 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, &MutationID{})
+	e, err := n.enter(ctx, ref.Key, &MutationID{})
 	if err != nil {
 		return Result{}, err
 	}
@@ -256,7 +263,7 @@ func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, &id)
+	e, err := n.enter(ctx, ref.Key, &id)
 	if err != nil {
 		return Result{}, err
 	}
@@ -317,7 +324,7 @@ type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
 // create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
 func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (ref Ref, res Result, err error) {
 	defer func() { n.observe(key, false, res, err) }()
-	e, err := n.enter(key, &req.ID)
+	e, err := n.enter(ctx, key, &req.ID)
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -425,7 +432,7 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 // genesis runs PROTOCOL §5 steps 4–8.
 func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, bound head.Digest, inc head.ID, writeBirth bool,
 	build builder) (Ref, Result, error) {
-	if err := n.cache(e); err != nil {
+	if err := n.cache(ctx, e); err != nil {
 		return Ref{}, Result{}, err
 	}
 	db, result, err := build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
@@ -529,7 +536,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		return Result{}, err
 	}
 	bound := binding(kind, req.Schema, to, req.Hash)
-	e, err := n.enter(ref.Key, &req.ID)
+	e, err := n.enter(ctx, ref.Key, &req.ID)
 	if err != nil {
 		return Result{}, err
 	}

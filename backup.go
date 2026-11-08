@@ -38,7 +38,7 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Version{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, &MutationID{})
+	e, err := n.enter(ctx, ref.Key, &MutationID{})
 	if err != nil {
 		return Version{}, err
 	}

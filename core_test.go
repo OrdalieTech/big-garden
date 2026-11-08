@@ -954,6 +954,58 @@ func TestReproposeAfterRecovery(t *testing.T) {
 	l.verify(t, mem, "a")
 }
 
+// TestDeadlineEndsWaiting: a caller's deadline bounds both its wait for the
+// entity mutex and its settle of an unresolved candidate (PLAN §8.4).
+func TestDeadlineEndsWaiting(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var armed atomic.Bool
+	armed.Store(true)
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if armed.Load() && a.Key == head.HeadKey("k") && (a.Op == "cas" || a.Op == "get") {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "stuck", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	n.cfg.Limits.CommitTimeout = 5 * time.Second
+	short := func() (time.Duration, error) {
+		ctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_, err := n.Update(ctx, ref, newReq(t, "short", 1), put("c", "3"))
+		return time.Since(start), err
+	}
+	if d, err := short(); d > time.Second { // the settle runs under the caller's deadline
+		t.Fatalf("settle took %v: %v", d, err)
+	}
+	held := make(chan struct{})
+	go func() { // a long settle holds the entity mutex
+		ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+		defer cancel()
+		close(held)
+		n.Update(ctx, ref, req, put("b", "2"))
+	}()
+	<-held
+	time.Sleep(20 * time.Millisecond)
+	d, err := short()
+	if d > time.Second {
+		t.Fatalf("queued caller waited %v", d)
+	}
+	wantCode(t, err, CodeOutcomeUnknown) // queued: the candidate might have been its own
+	armed.Store(false)
+	if _, err := n.Update(bg, ref, req, put("b", "2")); err != nil {
+		t.Fatal(err)
+	}
+	l.ack(ref, "b", "2")
+	l.verify(t, mem, "a")
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer

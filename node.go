@@ -82,14 +82,28 @@ func (n *Node) sweeper() {
 
 // room makes room for self to become resident under ResidentEntities,
 // waiting briefly while every resident entity is busy.
-func (n *Node) room(self *entity) bool {
+func (n *Node) room(ctx context.Context, self *entity) bool {
 	for i := 0; i < 100; i++ {
 		if n.evict(time.Time{}, n.cfg.Limits.ResidentEntities, self) {
 			return true
 		}
-		time.Sleep(10 * time.Millisecond)
+		if pause(ctx) != nil {
+			return false
+		}
 	}
 	return false
+}
+
+// pause waits 10 ms or until ctx ends.
+func pause(ctx context.Context) error {
+	t := time.NewTimer(10 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // evict discards resident, idle, settled entities last used before cutoff.
@@ -254,7 +268,7 @@ func (n *Node) entity(key string) (*entity, error) {
 	}
 	e := n.entities[key]
 	if e == nil {
-		e = &entity{key: key}
+		e = &entity{key: key, mu: make(gate, 1)}
 		n.entities[key] = e
 	}
 	return e, nil
@@ -272,15 +286,14 @@ func (n *Node) buildBytes() int64 { return 4*n.cfg.Limits.EntityBytes + 1<<20 }
 // cache makes room for e to become resident and reserves buildBytes for
 // building its file (PROTOCOL §4 step 1, §7 cache policy); the caller
 // releases the reserve with unreserve once the file is built.
-func (n *Node) cache(e *entity) error {
-	if !n.room(e) {
-		return newError(CodeCapacity, "ResidentEntities entities are busy", nil)
+func (n *Node) cache(ctx context.Context, e *entity) error {
+	if !n.room(ctx, e) {
+		return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
 	}
 	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
-		if i == 100 {
-			return newError(CodeCapacity, "cache bytes held by entities in use", nil)
+		if i == 100 || pause(ctx) != nil {
+			return newError(CodeCapacity, "cache bytes held by entities in use", ctx.Err())
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	return nil
 }
