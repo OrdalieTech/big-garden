@@ -34,19 +34,12 @@ type Limits struct {
 	IdleTimeout, ReceiptRetention                  time.Duration
 }
 
-// Defaults and qualified upper bounds (PLAN §11.2, DECISIONS D6).
+// Qualified upper bounds (PLAN §11.2, DECISIONS D6).
 const (
-	defaultEntityBytes   = 64 << 20
-	maxEntityBytes       = head.MaxPages * head.PageSize // 256 MiB
-	defaultCacheBytes    = 8 << 30
-	defaultResultBytes   = 16 << 10
-	maxResultBytes       = 64 << 10
-	maxCount             = 1 << 20 // keeps every product below overflow
-	maxBatch             = 16
-	minReceiptRetention  = time.Hour
-	maxReceiptRetention  = 30 * 24 * time.Hour
-	defaultRetention     = time.Hour
-	recoveryHeadroomMult = 4 // database + snapshot download + replay deltas below 2x live (§9.1)
+	maxEntityBytes = head.MaxPages * head.PageSize // 256 MiB
+	maxResultBytes = 64 << 10
+	maxCount       = 1 << 20 // keeps every product below overflow
+	maxBatch       = 16
 )
 
 // resolve returns l with defaults applied, or an invalid_argument Error.
@@ -62,9 +55,9 @@ func (l Limits) resolve() (Limits, error) {
 			return l, invalid(fmt.Sprintf("count limits must be within 0..%d", maxCount))
 		}
 	}
-	orDefault(&l.EntityBytes, int64(defaultEntityBytes))
-	orDefault(&l.CacheBytes, int64(defaultCacheBytes))
-	orDefault(&l.ResultBytes, defaultResultBytes)
+	orDefault(&l.EntityBytes, 64<<20)
+	orDefault(&l.CacheBytes, 8<<30)
+	orDefault(&l.ResultBytes, 16<<10)
 	orDefault(&l.ResidentEntities, 256)
 	orDefault(&l.InflightStorage, 64)
 	orDefault(&l.PendingPerEntity, 64)
@@ -73,7 +66,7 @@ func (l Limits) resolve() (Limits, error) {
 	orDefault(&l.StorageAttemptTimeout, 2*time.Second)
 	orDefault(&l.CommitTimeout, 10*time.Second)
 	orDefault(&l.IdleTimeout, 60*time.Second)
-	orDefault(&l.ReceiptRetention, defaultRetention)
+	orDefault(&l.ReceiptRetention, time.Hour)
 	switch {
 	case l.EntityBytes < head.PageSize || l.EntityBytes > maxEntityBytes:
 		return l, invalid(fmt.Sprintf("EntityBytes must be within %d..%d", head.PageSize, maxEntityBytes))
@@ -83,9 +76,9 @@ func (l Limits) resolve() (Limits, error) {
 		return l, invalid(fmt.Sprintf("BatchMax must be at most %d", maxBatch))
 	case l.CommitTimeout < l.StorageAttemptTimeout:
 		return l, invalid("CommitTimeout must be at least StorageAttemptTimeout")
-	case l.ReceiptRetention < minReceiptRetention || l.ReceiptRetention > maxReceiptRetention:
+	case l.ReceiptRetention < time.Hour || l.ReceiptRetention > 720*time.Hour:
 		return l, invalid("ReceiptRetention must be within 1h..720h")
-	case l.CacheBytes/int64(l.Recoveries) < recoveryHeadroomMult*l.EntityBytes+1<<20:
+	case l.CacheBytes/int64(l.Recoveries) < 4*l.EntityBytes+1<<20: // buildBytes: database + download + deltas below 2x live (§9.1)
 		return l, invalid("CacheBytes cannot hold Recoveries concurrent activations of EntityBytes")
 	}
 	return l, nil
