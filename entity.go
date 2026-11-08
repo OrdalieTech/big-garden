@@ -226,11 +226,19 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown", cause: ctx.Err()}
 		}
 		obj, err := n.st.Get(ctx, head.HeadKey(e.key), "", maxHeadBytes)
-		var cur *head.Head
 		switch store.OutcomeOf(err) {
 		case store.OK:
-			if cur, err = n.decodeHead(obj.Body, e.key, head.ID{}); err != nil {
+			cur, err := n.decodeHead(obj.Body, e.key, head.ID{})
+			switch {
+			case err != nil:
 				return nil, err
+			case slices.Contains(c.nonces, cur.Nonce):
+				n.settle(e, c, cur, obj.ETag)
+				return nil, nil
+			case c.base == nil || cur.Revision > c.base.Revision:
+				return n.dead(ctx, e, c, cur, obj.ETag)
+			case cur.Nonce != c.base.Nonce:
+				return nil, newError(CodeCorrupt, "head revision went backwards", nil)
 			}
 		case store.NotFound:
 			if c.base != nil {
@@ -238,16 +246,6 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 			}
 		default:
 			continue
-		}
-		if cur != nil && slices.Contains(c.nonces, cur.Nonce) {
-			n.settle(e, c, cur, obj.ETag)
-			return nil, nil
-		}
-		if cur != nil && (c.base == nil || cur.Revision > c.base.Revision) {
-			return n.dead(ctx, e, c, cur, obj.ETag)
-		}
-		if cur != nil && cur.Nonce != c.base.Nonce {
-			return nil, newError(CodeCorrupt, "head revision went backwards", nil)
 		}
 		if len(c.nonces) < limit { // D12: re-propose with a fresh nonce under the same condition
 			c.next.Nonce = head.NewID()
