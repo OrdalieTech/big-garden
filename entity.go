@@ -120,9 +120,13 @@ func (n *Node) cas(ctx context.Context, e *entity, c *candidate) (string, error)
 	if err != nil {
 		return "", newError(CodeCorrupt, "candidate head: "+err.Error(), nil)
 	}
+	failpoint("cas.before")
 	tag, errs, err := store.Hedge(ctx, n.cfg.Limits.StorageAttemptTimeout/2, func(ctx context.Context) (string, error) {
 		return n.st.PutCAS(ctx, head.HeadKey(e.key), body, c.baseETag)
 	})
+	if err == nil {
+		failpoint("cas.after")
+	}
 	c.unsure = c.unsure || slices.ContainsFunc(errs, func(err error) bool { return store.OutcomeOf(err) != store.Failed })
 	return tag, err
 }

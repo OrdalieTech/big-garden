@@ -164,7 +164,10 @@ func (n *Node) barrier(ctx context.Context, e *entity) (changed bool, err error)
 func (n *Node) putObject(ctx context.Context, key string, body []byte) error {
 	n.staging.Add(int64(len(body)))
 	defer n.staging.Add(-int64(len(body)))
+	failpoint("put.before")
+	failpoint("put.mid")
 	err := n.st.PutImmutable(ctx, key, body)
+	failpoint("put.after")
 	if store.OutcomeOf(err) == store.PreconditionFailed {
 		obj, gerr := n.st.Get(ctx, key, "", int64(len(body)))
 		if gerr == nil && !bytes.Equal(obj.Body, body) {
@@ -293,12 +296,14 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 			return nil, nil, engineError(err)
 		}
 		var cb error
+		failpoint("sql.before")
 		result, _, err := db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema},
-			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { return fn(&Tx{t}) }, &cb))
+			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
 		if err != nil {
 			db.Discard()
 			return nil, nil, callbackError(err, cb)
 		}
+		failpoint("sql.after")
 		return db, result, nil
 	})
 }
@@ -437,6 +442,7 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		e.discard()
 		return Ref{}, Result{}, engineError(err)
 	}
+	failpoint("capture")
 	if writeBirth {
 		attempt := head.NewID()
 		body, err := head.Birth{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, OperationID: op,
@@ -531,8 +537,9 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		var result []byte
 		if verdict == nil && res == nil {
 			floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
+			failpoint("sql.before")
 			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor)},
-				scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { return fn(&Tx{t}) }, &cb))
+				scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
 			if err != nil && (cb == nil || cb == errResultTooLarge) {
 				e.discard()
 				return Result{}, withOp(callbackError(err, cb), req.ID)
@@ -552,6 +559,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 			}
 			return Result{}, verdict
 		}
+		failpoint("sql.after")
 		return n.publishUpdate(ctx, e, req, bound, to, result, seq)
 	}
 	return Result{}, &Error{Code: CodeRouteChanged, Operation: req.ID, Message: "the head changed twice during the operation"}
@@ -590,6 +598,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 	if err != nil {
 		return fail(engineError(err))
 	}
+	failpoint("capture")
 	next := *h
 	next.Revision, next.Nonce, next.Sequence, next.Schema = h.Revision+1, head.NewID(), seq, schema
 	next.PageCount, next.DatabaseChecksum = delta.PageCount, delta.Ref.PostChecksum
