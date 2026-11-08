@@ -26,7 +26,7 @@ const maxHeadBytes = 64 << 10
 // decoded page frames of each of h's snapshot, deltas and tail (the replay
 // pages of PROTOCOL §6 step 7 and §9); it is derived from h and reset with it.
 type entity struct {
-	mu         sync.Mutex
+	mu         gate
 	key        string
 	h          *head.Head
 	etag       string
@@ -34,9 +34,34 @@ type entity struct {
 	unresolved *candidate
 	pages      []uint32
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
 	since      atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)
+}
+
+// gate is the entity mutex (D8); lock also gives up when ctx ends.
+type gate chan struct{}
+
+func (g gate) Lock()   { g <- struct{}{} }
+func (g gate) Unlock() { <-g }
+
+func (g gate) TryLock() bool {
+	select {
+	case g <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (g gate) lock(ctx context.Context) error {
+	select {
+	case g <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.
@@ -157,7 +182,6 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 		e.discard()
 		e.unresolved = nil
 		e.since.Store(0)
-		e.since.Store(0)
 		return nil, storeError(err)
 	}
 	rec, err = n.resolve(ctx, e, c)
@@ -194,6 +218,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 
 // resolve runs PROTOCOL §2 resolve(c) until ctx ends.
 func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Receipt, error) {
+	limit := len(c.nonces) + 2 // D12: two re-proposals per call
 	for i := 0; ; i++ {
 		if i > 0 && sleep(ctx, i) != nil {
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown", cause: ctx.Err()}
@@ -222,7 +247,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		if cur != nil && cur.Nonce != c.base.Nonce {
 			return nil, newError(CodeCorrupt, "head revision went backwards", nil)
 		}
-		if len(c.nonces) < 3 { // D12: re-propose with a fresh nonce under the same condition
+		if len(c.nonces) < limit { // D12: re-propose with a fresh nonce under the same condition
 			c.next.Nonce = head.NewID()
 			c.nonces = append(c.nonces, c.next.Nonce)
 			if etag, err := n.cas(ctx, e, c); err == nil {
@@ -248,16 +273,21 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 			return nil, err // e.unresolved stays: a later operation resolves again
 		}
 		r, ok, err := e.db.Receipt(*c.op)
-		if err != nil {
+		m, merr := e.db.Meta()
+		if err = errors.Join(err, merr); err != nil {
 			e.discard()
 			return nil, engineError(err)
 		}
 		if ok && r.InputHash != c.bound {
 			e.unresolved = nil
 			e.since.Store(0)
-			e.since.Store(0)
-			e.since.Store(0)
 			return nil, &Error{Code: CodeIDConflict, Operation: opOf(c), Message: "operation ID used with another input"}
+		}
+		if !ok && tsOf(opOf(c)) <= int64(m.FloorMs) { // a newer owner may have pruned our receipt
+			e.discard()
+			e.unresolved = nil
+			e.since.Store(0)
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "receipt floor passed during publication"}
 		}
 		committed, rec = ok, &r
 	case c.object != nil: // maintenance: committed only if its object is referenced
@@ -301,7 +331,13 @@ func sleep(ctx context.Context, i int) error {
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting
 // with the current head if an object vanished or changed under it.
 func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag string) error {
-	if err := n.cache(e); err != nil {
+	select {
+	case n.recoveries <- struct{}{}:
+		defer func() { <-n.recoveries }()
+	case <-ctx.Done():
+		return newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
+	}
+	if err := n.cache(ctx, e); err != nil {
 		return err
 	}
 	defer n.unreserve()

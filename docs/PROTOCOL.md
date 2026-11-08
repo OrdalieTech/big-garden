@@ -11,6 +11,7 @@ The exact steps every operation implements. PLAN.md is the contract and DECISION
 - Head missing: if `birth.json` exists, `state_missing`; else `not_found`.
 - "Discard" (D10) = close the connection, delete the entity's db, `-wal`, `-shm` files, drop the cached head. The next access rehydrates (§4).
 - "Barrier" = §3 steps 2–3 (fresh conditional head GET). Required before returning any state-dependent answer that is not a successful CAS (replays, `id_conflict`, `schema_mismatch`, `id_expired` by floor, callback errors). If the head changed, redo the operation from its activation step once, then return `route_changed`.
+- "Lock" = take the entity mutex within the caller's ctx (PLAN §8.4: a deadline ends the caller's waiting). A deadline while queued returns `outcome_unknown` to a request with an operation ID (the unresolved candidate may be its own; Release and Evict too) and `unavailable` to reads and Takeover. "Settle `unresolved`" runs `resolve` under the caller's ctx capped by `CommitTimeout`; cut short, the candidate simply stays unresolved.
 - Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else, except the decoded page frames of each of `H`'s snapshot, deltas and tail, derived from `H` and reset with it (the replay pages of §6.7 and §9; set by activation and by each committed candidate), and the time of the last admission (cache policy only).
 
 ## 1. Objects and formats
@@ -71,10 +72,10 @@ A candidate is `{base *Head (nil for genesis), baseETag, next Head, nonces []ID,
 2. Strict decode `cur`. If `cur.nonce ∈ c.nonces`: committed; `e.H, e.E = cur, etag`; `unresolved = nil`.
 3. If `base == nil` or `cur.revision > base.revision`, every proposal is dead (their condition can never hold again). Then:
    - `c.object` is referenced by `cur`: committed (only our transition could introduce it). The tail is not an object and never proves anything here. A maintenance candidate (object, no op) whose object is not referenced is not committed.
-   - else `c.op != nil` (always the case for an inline-tail mutation): hydrate `cur` (§4) and look up the receipt: same `bound` → committed (return the stored result); other `bound` → `id_conflict`; absent → not committed.
+   - else `c.op != nil` (always the case for an inline-tail mutation): hydrate `cur` (§4) and look up the receipt: same `bound` → committed (return the stored result); other `bound` → `id_conflict`; absent with `ts(op) ≤ meta.expiry_floor_ms` of `cur`'s image → a newer owner may have pruned the receipt (or a snapshot or compaction dropped our object), so the outcome is unknown for good: discard; `unresolved = nil` (every proposal is dead); return `outcome_unknown` (a retry then gets `id_expired`); absent otherwise → not committed.
    - else takeover: committed iff `cur.owner == self`; release: done iff `cur.owner != self`.
    - Not committed: discard; `unresolved = nil`; return `not_owner` with `cur`'s Route if `cur.owner != self`, else `route_changed`.
-4. `cur` is still the base (same nonce, or still absent): if `len(c.nonces) < 3`, set `next.nonce = NewID()`, append it, `CAS(encode(next), baseETag)`; `OK` → committed. Back off, loop.
+4. `cur` is still the base (same nonce, or still absent): if this call of `resolve` has sent fewer than two re-proposals (so a publication sends at most three proposals, and each later `resolve` at most two more), set `next.nonce = NewID()`, append it, `CAS(encode(next), baseETag)`; `OK` → committed. Back off, loop.
 5. Deadline: return `outcome_unknown`; `e.unresolved` stays set. Any other failure while `e.unresolved` stays set (a head that fails strict decode, hydration for the receipt check failing with `unavailable`, `capacity` or `corrupt`) is also returned as `outcome_unknown`, never as a code that means "not committed"; only rule 1's `state_missing` keeps its own code. Every later operation on the entity runs `resolve(e.unresolved)` first; while it stays unresolved, the same operation ID gets `outcome_unknown`, others `unavailable`.
 
 After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(TRUNCATE)` and verify an empty WAL; on any failure discard (the result stays a success). If `cur` is not our candidate head and differs in sequence or checksum from the local image, discard.
@@ -95,7 +96,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 
 ## 4. Activation (cold restore of exactly head `H`, PLAN §9.3)
 
-1. Reserve cache bytes (`4×EntityBytes + 1 MiB`) under the cache policy (§7); else `capacity`.
+1. Take one of `Limits.Recoveries` activation slots, waiting within the caller's ctx (else `capacity`). Reserve cache bytes (`4×EntityBytes + 1 MiB`) under the cache policy (§7); else `capacity`.
 2. GET snapshot and deltas (≤ 4 concurrent), `max = ref.bytes`. The tail needs no GET: its bytes are in `H`. Check length and SHA-256. `NotFound` or mismatch: GET head again; if it changed, restart with the new head (collection race); else `state_missing` (missing) or `corrupt` (mismatch).
 3. Into a new private file (`O_EXCL`, 0600) in the session cache dir: apply the snapshot, then each delta in order, then the tail as `Tail.Ref()` over `tail.data`. Per object: `MinTXID/MaxTXID` = ref range, `PreApplyChecksum` = running checksum, decoder close succeeds, truncate to `Commit` pages, recomputed checksum = trailer post-checksum = `ref.post_checksum`.
 4. Check `page_count = H.page_count` and checksum = `H.database_checksum`.
@@ -111,8 +112,8 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
    - Exists with the same ID and bound (D5 resume): `LIST entities/<h>/objects/`; any key that does not parse under `ObjectPrefix(key, birth.incarnation)` or has base revision > 0 → `state_missing`. (Complete with D16: a head with data beyond genesis always references an object at base ≥ 1, since a tail requires one.) `inc = birth.incarnation`.
    - Exists otherwise: `id_conflict` if same ID, else `state_missing`.
    - Absent: `LIST entities/<h>/` limit 1; anything → `state_missing`. `inc = NewID()`.
-4. Build genesis locally (D11): create the db file (`rwc`, the only such open), pragmas as §4.5, reserved tables, meta `(1, ns, key, inc, req.Schema, 1, 0)`. Library `BEGIN IMMEDIATE`; mutation mode; `fn(tx)`; callback error → rollback, discard, return it. Library: insert receipt `(ID, bound, result, 1)`; `COMMIT`; checkpoint TRUNCATE.
-5. If birth was absent: `PUT_IMM birth {1, ns, key, inc, ID, bound, schema, attempt=NewID()}`. `PreconditionFailed`: `GET birth`; our attempt → continue; same ID and bound → continue with its incarnation only if it equals `inc`, else discard and restart at 3; otherwise discard, `state_missing`.
+4. Build genesis locally (D11): create the db file (`rwc`, the only such open), pragmas as §4.5, reserved tables, meta `(1, ns, key, inc, req.Schema, 1, 0)`. Library `BEGIN IMMEDIATE`; mutation mode; `fn(tx)`; callback error → rollback, discard, return it. Library: insert receipt `(ID, bound, result, 1)`; `COMMIT`. Like every mutation, the WAL is checkpointed only once the publication committed (§2, after committed).
+5. If birth was absent: `PUT_IMM birth {1, ns, key, inc, ID, bound, schema, attempt=NewID()}`. `PreconditionFailed`: `GET birth`; our attempt → continue; same ID and bound (a concurrent create of the same request won) → discard and restart at 3, which resumes its birth (D5); otherwise discard, `state_missing`. From the birth `PUT_IMM` on (from step 4 for a D5 resume), `birth.json` may exist and only this request can resume it: any later `unavailable`, `capacity` or `corrupt` failure of the create (this `PUT_IMM`, the snapshot `PUT_IMM`, a definitely failed genesis CAS) is returned as `outcome_unknown` with `Operation = ID`.
 6. Encode the snapshot LTX (1..1); `PUT_IMM ObjectKey(key, inc, 0, NewID(), sha)`; `PreconditionFailed` → GET, compare bytes.
 7. `next` = genesis head (revision 1, epoch 1, owner self, sequence 1, schema, page_count, checksum, snapshot ref level 0, no deltas, no tail). `publish` with `base = nil`.
 8. Return `Ref{key, inc}`, `Result{result, Version{inc, 1}}`. A `resolve` that finds another genesis carrying our receipt returns its stored result.
@@ -151,11 +152,13 @@ Implicit takeover (D4) is steps 5–7 from inside Update/Read/Lookup when `owner
 
 `Release(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); use `H` if owned, else `GET head`; `owner ≠ self` → return nil. `next = H` with owner null, epoch+1 (tail preserved); `publish`; then discard. Dead with `cur.owner ≠ self` → nil.
 
-`Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10); forget the entity (its struct stays registered, so its mutex keeps serializing the key). Ownership is unchanged: this session may activate it again.
+`Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10); forget the entity. Ownership is unchanged: this session may activate it again.
 
-Cache policy: before an activation or a genesis build, if `ResidentEntities` other entities are resident, discard the least recently admitted one that is idle and settled (never a busy one; wait up to 1 s, then `capacity`). Then reserve `4×EntityBytes + 1 MiB` (§4 step 1) against `CacheBytes`, which also counts the other reserves in progress and the database and WAL files of every resident entity (a busy entity with its size when last seen idle or settled): while it does not fit, discard the least recently admitted idle, settled entity; if none is left (all pinned), wait up to 1 s, then `capacity`. The reserve is released once the file is built; the file then counts as resident bytes. A sweeper discards settled caches idle for `IdleTimeout`. Both are D10 discards: ownership is unchanged.
+Entity lifetime (PLAN §11.2): every operation (and each maintenance step) holds a reference to the entity struct, counted under the node mutex. When an operation ends with `unresolved = nil` and a cached head this session does not own, it drops that head (and any local image). When the last reference goes, or the sweeper finds it unreferenced, an entity that is neither resident nor unresolved leaves the node's map; the next operation on the key starts from a new struct. Since a struct leaves only while no operation holds it, one mutex still serializes every operation on the key.
 
-`Close(ctx)`: stop admissions (`closed`); per resident entity, settle `unresolved` within ctx (and at most `CommitTimeout` in total) and discard; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
+Cache policy: before an activation or a genesis build, if `ResidentEntities` other entities are resident (a busy entity counts only if it has a cache file), discard the least recently admitted one that is idle and settled (never a busy one; wait up to 1 s, and never past the caller's deadline, then `capacity`). Then reserve `4×EntityBytes + 1 MiB` (§4 step 1) against `CacheBytes`, which also counts the other reserves in progress and the database and WAL files of every resident entity (a busy entity with its size when last seen idle or settled): while it does not fit, discard the least recently admitted idle, settled entity; if none is left (all pinned), wait up to 1 s (within the caller's deadline), then `capacity`. The reserve is released once the file is built; the file then counts as resident bytes. A sweeper discards settled caches idle for `IdleTimeout`. Both are D10 discards: ownership is unchanged.
+
+`Close(ctx)`: stop admissions (`closed`); wait for maintenance in flight, lock each entity and settle its `unresolved`, all within ctx (and at most `CommitTimeout` in total), and discard; an entity still busy at the deadline counts as unresolved; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
 
 ## 8. Open(cfg)
 
@@ -185,9 +188,9 @@ Snapshot: when replay pages (deltas plus tail) exceed `page_count + 256`: checkp
 
 `Export(ref, w)`:
 1. Lock; §3 steps 1–4 (validated head `H`, local image).
-2. Encode a snapshot LTX `1..H.sequence` of the checkpointed image into a temp file; its post-checksum must equal `H.database_checksum`.
+2. Encode a snapshot LTX `1..H.sequence` of the checkpointed image in memory; its post-checksum must equal `H.database_checksum`.
 3. `manifest.json`, canonical JSON ≤ 64 KiB: `format` 1, `namespace`, `key`, `incarnation`, `sequence`, `schema`, `codec`, `page_size`, `page_count`, `database_checksum`, `sha256`, `bytes`.
-4. `archive/tar`: `manifest.json` then `snapshot.ltx`, regular files, mode 0600, zero times, then the end-of-archive blocks. Return `Version{inc, H.sequence}`. Any write error: return it; the partial output is not a backup.
+4. Unlock (the snapshot and manifest are in memory, so a slow writer never blocks the entity). `archive/tar`: `manifest.json` then `snapshot.ltx`, regular files, mode 0600, zero times, then the end-of-archive blocks. Return `Version{inc, H.sequence}`. Any write error: return it; the partial output is not a backup.
 
 `Import(key, req, r)`:
 1. Read the tar strictly: exactly `manifest.json` then `snapshot.ltx`, regular files, sizes within 64 KiB and `EntityBytes`-derived bounds, then end of archive and nothing but zero padding to EOF.

@@ -45,6 +45,7 @@ func (n *Node) observe(key string, read bool, res Result, err error) {
 	c := &n.counters
 	var e *Error
 	switch {
+	case err == nil && res.Version.Sequence == 0: // a callback panic is unwinding: count nothing
 	case err == nil && read:
 		c.reads.Add(1)
 	case err == nil && res.Replayed:
@@ -120,12 +121,12 @@ func (n *Node) Stats() Stats {
 			s.OldestUnresolved = max(s.OldestUnresolved, time.Since(time.Unix(0, t)))
 		}
 		s.QueuedRequests += e.waiting.Load()
-		if e.mu.TryLock() { // a busy entity is resident by definition
+		if e.mu.TryLock() {
 			if e.db != nil {
 				s.ResidentEntities++
 			}
 			e.mu.Unlock()
-		} else {
+		} else if e.bytes.Load() > 0 { // busy: resident only with a file
 			s.ResidentEntities++
 		}
 	}

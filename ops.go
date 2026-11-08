@@ -53,31 +53,40 @@ func binding(kind byte, from, to uint32, hash [32]byte) head.Digest {
 }
 
 // enter returns the entity of key with its mutex held and any unresolved
-// candidate settled first (PROTOCOL §2 rule 5). If it stays unresolved, the
-// same operation ID (or every caller, for a nil id) gets outcome_unknown and
-// others unavailable.
-func (n *Node) enter(key string, id *MutationID) (*entity, error) {
+// candidate settled first (PROTOCOL §2 rule 5), both within ctx. If it stays
+// unresolved, the same operation ID (or every caller, for a nil id) gets
+// outcome_unknown and others unavailable; a mutation whose ctx ends while
+// queued gets outcome_unknown, since the candidate may be its own.
+func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, error) {
 	e, err := n.entity(key)
 	if err != nil {
 		return nil, err
 	}
 	if e.waiting.Add(1) > int64(n.cfg.Limits.PendingPerEntity) {
 		e.waiting.Add(-1)
+		n.drop(e)
 		return nil, newError(CodeCapacity, "too many operations queued on the entity", nil)
 	}
-	e.mu.Lock()
+	err = e.mu.lock(ctx)
 	e.waiting.Add(-1)
+	if err != nil {
+		n.drop(e)
+		if id == nil || *id != (MutationID{}) {
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: *cmp.Or(id, &MutationID{}), Message: "deadline while queued", cause: err}
+		}
+		return nil, newError(CodeUnavailable, "deadline while queued", err)
+	}
 	e.used = time.Now()
 	if n.isClosed() {
-		e.mu.Unlock()
+		n.leave(e)
 		return nil, newError(CodeClosed, "", nil)
 	}
 	if c := e.unresolved; c != nil {
-		ctx, cancel := n.commitContext()
+		ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout) // cut short: c stays unresolved
 		n.resolve(ctx, e, c)
 		cancel()
 		if e.unresolved != nil {
-			e.mu.Unlock()
+			n.leave(e)
 			if id == nil || (c.op != nil && *c.op == head.OpID(*id)) {
 				return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "earlier attempt still unresolved"}
 			}
@@ -92,23 +101,8 @@ func (n *Node) enter(key string, id *MutationID) (*entity, error) {
 // GET; otherwise a cached head owned by this session is used as is.
 func (n *Node) owned(ctx context.Context, e *entity, ref Ref, fresh bool) error {
 	if fresh || e.h == nil || !n.mine(e.h) || e.db == nil {
-		obj, err := n.st.Get(ctx, head.HeadKey(e.key), e.etag, maxHeadBytes)
-		switch store.OutcomeOf(err) {
-		case store.NotModified:
-		case store.OK:
-			cur, err := n.decodeHead(obj.Body, e.key, ref.Incarnation)
-			if err != nil {
-				return err
-			}
-			if e.db != nil && (e.db.Published() != imageOf(cur) || !n.mine(cur)) {
-				e.discard()
-			}
-			e.h, e.etag = cur, obj.ETag
-		case store.NotFound:
-			e.discard()
-			return n.missing(ctx, e.key)
-		default:
-			return storeError(err)
+		if err := n.fetch(ctx, e, ref.Incarnation, e.etag); err != nil {
+			return err
 		}
 	}
 	if e.h.Incarnation != ref.Incarnation {
@@ -210,6 +204,9 @@ func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 	if err := head.ValidKey(key); err != nil {
 		return Route{}, invalid(err.Error())
 	}
+	if n.isClosed() {
+		return Route{}, newError(CodeClosed, "", nil)
+	}
 	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
@@ -231,11 +228,11 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, &MutationID{})
+	e, err := n.enter(ctx, ref.Key, &MutationID{})
 	if err != nil {
 		return Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	if err := n.owned(ctx, e, ref, true); err != nil {
 		return Result{}, err
 	}
@@ -256,11 +253,11 @@ func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ref.Key, &id)
+	e, err := n.enter(ctx, ref.Key, &id)
 	if err != nil {
 		return Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	return n.lookup(ctx, e, ref, id)
 }
 
@@ -286,6 +283,9 @@ func (n *Node) lookup(ctx context.Context, e *entity, ref Ref, id MutationID) (R
 
 // Create makes a new entity at key (PROTOCOL §5).
 func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx) ([]byte, error)) (Ref, Result, error) {
+	if ctx == nil || fn == nil {
+		return Ref{}, Result{}, invalid("nil context or callback")
+	}
 	if err := cmp.Or(checkRequest(key, req), n.checkClock(req)); err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -296,14 +296,20 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 			return nil, nil, engineError(err)
 		}
 		var cb error
+		built := false
+		defer func() { // also on a callback panic
+			if !built {
+				db.Discard()
+			}
+		}()
 		failpoint("sql.before")
 		result, _, err := db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema},
 			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
 		if err != nil {
-			db.Discard()
 			return nil, nil, callbackError(err, cb)
 		}
 		failpoint("sql.after")
+		built = true
 		return db, result, nil
 	})
 }
@@ -317,11 +323,11 @@ type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
 // create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
 func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (ref Ref, res Result, err error) {
 	defer func() { n.observe(key, false, res, err) }()
-	e, err := n.enter(key, &req.ID)
+	e, err := n.enter(ctx, key, &req.ID)
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
@@ -425,11 +431,13 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 // genesis runs PROTOCOL §5 steps 4–8.
 func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, bound head.Digest, inc head.ID, writeBirth bool,
 	build builder) (Ref, Result, error) {
-	if err := n.cache(e); err != nil {
+	if err := n.cache(ctx, e); err != nil {
 		return Ref{}, Result{}, err
 	}
-	db, result, err := build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
-	n.unreserve()
+	db, result, err := func() (*engine.DB, []byte, error) {
+		defer n.unreserve() // also on a callback panic
+		return build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
+	}()
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -443,6 +451,16 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		return Ref{}, Result{}, engineError(err)
 	}
 	failpoint("capture")
+	// From the birth attempt on, birth.json may exist, and only this request
+	// can resume it (D5): a failure is outcome_unknown, never a code that
+	// invites a retry under another ID (§5 step 5).
+	unknown := func(err error) (Ref, Result, error) {
+		var pe *Error
+		if errors.As(err, &pe) && (pe.Code == CodeUnavailable || pe.Code == CodeCorrupt || pe.Code == CodeCapacity) {
+			err = &Error{Code: CodeOutcomeUnknown, Operation: req.ID, Message: "create outcome unknown: " + pe.Message, cause: pe}
+		}
+		return Ref{}, Result{}, withOp(err, req.ID)
+	}
 	if writeBirth {
 		attempt := head.NewID()
 		body, err := head.Birth{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, OperationID: op,
@@ -468,14 +486,14 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		}
 		if err != nil {
 			e.discard()
-			return Ref{}, Result{}, storeError(err)
+			return unknown(storeError(err))
 		}
 	}
 	ref := snap.Ref
 	ref.Key = head.ObjectKey(key, inc, 0, head.NewID(), ref.SHA256)
 	if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
 		e.discard()
-		return Ref{}, Result{}, err
+		return unknown(err)
 	}
 	self := n.self
 	next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
@@ -483,7 +501,7 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 		PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
 	rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
 	if err != nil {
-		return Ref{}, Result{}, withOp(err, req.ID)
+		return unknown(err)
 	}
 	if rec != nil { // another genesis carrying our receipt
 		return Ref{key, e.h.Incarnation}, Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
@@ -519,11 +537,11 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		return Result{}, err
 	}
 	bound := binding(kind, req.Schema, to, req.Hash)
-	e, err := n.enter(ref.Key, &req.ID)
+	e, err := n.enter(ctx, ref.Key, &req.ID)
 	if err != nil {
 		return Result{}, err
 	}
-	defer e.mu.Unlock()
+	defer n.leave(e)
 	for redo := 0; redo < 2; redo++ {
 		if err := n.owned(ctx, e, ref, redo > 0); err != nil {
 			return Result{}, withOp(err, req.ID)

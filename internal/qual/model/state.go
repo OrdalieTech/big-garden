@@ -179,8 +179,9 @@ type Cand struct {
 	Genesis    bool
 	Req        int8 // request index + 1 whose receipt it carries; 0 = none
 	NN         int8
-	Att        ID // object it introduces; 0 = none
-	Nonces     [3]ID
+	Lim        int8 // D12: NN may grow to Lim in the current resolve call
+	Att        ID   // object it introduces; 0 = none
+	Nonces     [maxNonces]ID
 	Base, Next Head
 }
 

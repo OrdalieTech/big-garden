@@ -463,6 +463,50 @@ func TestCreateResumeD5(t *testing.T) {
 	wantCode(t, err, CodeStateMissing)
 }
 
+// TestCreateAfterBirthIsUnknown: once birth.json may exist, only the same
+// request can finish the create (D5), so every later failure is
+// outcome_unknown and the same-request retry completes.
+func TestCreateAfterBirthIsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault func(a storetest.Attempt) bool
+		fate  storetest.MemFault
+	}{
+		{"birth reply lost", func(a storetest.Attempt) bool { return a.Op == "put" && a.Key == head.BirthKey("k") },
+			storetest.MemFault{LoseReply: true}},
+		{"snapshot put refused", func(a storetest.Attempt) bool { return a.Op == "put" && strings.HasSuffix(a.Key, ".ltx") },
+			storetest.MemFault{Reject: store.Failed}},
+		{"genesis cas refused", func(a storetest.Attempt) bool { return a.Op == "cas" && a.Key == head.HeadKey("k") },
+			storetest.MemFault{Reject: store.Failed}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := newStore(t)
+			n := testNode(t, mem, "a", nil)
+			var armed atomic.Bool
+			armed.Store(true)
+			mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+				if armed.Load() && tc.fault(a) {
+					return tc.fate
+				}
+				return storetest.MemFault{}
+			})
+			req := newReq(t, "create", 1)
+			_, _, err := n.Create(bg, "k", req, createKV)
+			if e := wantCode(t, err, CodeOutcomeUnknown); e.Operation != req.ID {
+				t.Fatalf("operation %x", e.Operation)
+			}
+			armed.Store(false)
+			ref, res, err := n.Create(bg, "k", req, createKV)
+			if err != nil || string(res.Value) != "created" {
+				t.Fatalf("same-request retry %+v %v", res, err)
+			}
+			l := newLedger()
+			mustPut(t, n, ref, "a", "1", l)
+			l.verify(t, mem, "a")
+		})
+	}
+}
+
 func TestMissingHeadFailsClosed(t *testing.T) {
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
@@ -831,6 +875,200 @@ func TestResolveBranches(t *testing.T) {
 	})
 }
 
+// TestResolvePrunedReceipt: an inline mutation applies, its reply is lost,
+// and before resolve reads the head another owner advances the expiry floor
+// past the ID, pruning the receipt. Resolve must not call it not committed.
+func TestResolvePrunedReceipt(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	other := testNode(t, mem, "b", nil)
+	other.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	hold := make(chan struct{})
+	var state atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		switch {
+		case a.Op == "cas" && a.Key == head.HeadKey("k") && state.CompareAndSwap(0, 1):
+			return storetest.MemFault{LoseReply: true}
+		case a.Op == "get" && a.Key == head.HeadKey("k") && state.CompareAndSwap(1, 2):
+			return storetest.MemFault{Hold: hold}
+		}
+		return storetest.MemFault{}
+	})
+	go func() {
+		defer close(hold)
+		for state.Load() != 2 {
+			time.Sleep(time.Millisecond)
+		}
+		route, err := other.Resolve(bg, "k")
+		if err == nil {
+			_, err = other.Takeover(bg, route)
+		}
+		req := newReq(t, "advance the floor", 1)
+		req.ID, _ = NewMutationID(time.Now().Add(2 * time.Hour))
+		if err == nil {
+			_, err = other.Update(bg, ref, req, put("c", "3"))
+		}
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	req := newReq(t, "applied", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	if e := wantCode(t, err, CodeOutcomeUnknown); e.Operation != req.ID {
+		t.Fatalf("operation %x", e.Operation)
+	}
+	if got := readAll(t, other, ref); got["b"] != "2" { // it did commit
+		t.Fatalf("rows %v", got)
+	}
+	_, err = other.Lookup(bg, ref, req.ID)
+	wantCode(t, err, CodeIDExpired)
+}
+
+// TestReproposeAfterRecovery: the D12 proposal cap is per resolve call, so a
+// candidate whose first proposals all got 503s commits once S3 recovers.
+func TestReproposeAfterRecovery(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var cas atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if a.Op == "cas" && a.Key == head.HeadKey("k") && cas.Add(1) <= 4 {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "ambiguous", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	mustPut(t, n, ref, "c", "3", l) // settles the candidate first: it commits
+	res, err := n.Lookup(bg, ref, req.ID)
+	if err != nil || !res.Replayed || res.Version.Sequence != 3 {
+		t.Fatalf("lookup %+v %v", res, err)
+	}
+	l.ack(ref, "b", "2")
+	l.verify(t, mem, "a")
+}
+
+// TestDeadlineEndsWaiting: a caller's deadline bounds both its wait for the
+// entity mutex and its settle of an unresolved candidate (PLAN §8.4).
+func TestDeadlineEndsWaiting(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var armed atomic.Bool
+	armed.Store(true)
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if armed.Load() && a.Key == head.HeadKey("k") && (a.Op == "cas" || a.Op == "get") {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "stuck", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	n.cfg.Limits.CommitTimeout = 5 * time.Second
+	short := func() (time.Duration, error) {
+		ctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		_, err := n.Update(ctx, ref, newReq(t, "short", 1), put("c", "3"))
+		return time.Since(start), err
+	}
+	if d, err := short(); d > time.Second { // the settle runs under the caller's deadline
+		t.Fatalf("settle took %v: %v", d, err)
+	}
+	held := make(chan struct{})
+	go func() { // a long settle holds the entity mutex
+		ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+		defer cancel()
+		close(held)
+		n.Update(ctx, ref, req, put("b", "2"))
+	}()
+	<-held
+	time.Sleep(20 * time.Millisecond)
+	d, err := short()
+	if d > time.Second {
+		t.Fatalf("queued caller waited %v", d)
+	}
+	wantCode(t, err, CodeOutcomeUnknown) // queued: the candidate might have been its own
+	armed.Store(false)
+	if _, err := n.Update(bg, ref, req, put("b", "2")); err != nil {
+		t.Fatal(err)
+	}
+	l.ack(ref, "b", "2")
+	l.verify(t, mem, "a")
+}
+
+// TestCreateCallbackPanic: a panicking Create callback releases its cache
+// reservation and file and is not counted as a success.
+func TestCreateCallbackPanic(t *testing.T) {
+	n := testNode(t, newStore(t), "a", nil)
+	for range 5 {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("no panic")
+				}
+			}()
+			n.Create(bg, "k", newReq(t, "create", 1), func(*Tx) ([]byte, error) { panic("boom") })
+		}()
+	}
+	n.mu.Lock()
+	reserved := n.reserved
+	n.mu.Unlock()
+	if entries, _ := os.ReadDir(n.dir); reserved != 0 || len(entries) != 1 {
+		t.Fatalf("reserved %d, cache dir %v", reserved, entries)
+	}
+	if st := n.Stats(); st.Mutations != 0 || st.CacheBytes != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+	mustCreate(t, n, "k", nil)
+	_, _, err := n.Create(bg, "k2", newReq(t, "nil", 1), nil)
+	wantCode(t, err, CodeInvalidArgument)
+}
+
+// blockingWriter blocks every Write until release is closed.
+type blockingWriter struct{ entered, release chan struct{} }
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	select {
+	case w.entered <- struct{}{}:
+	default:
+	}
+	<-w.release
+	return len(p), nil
+}
+
+// TestExportWriterDoesNotBlockEntity: Export writes to the caller's writer
+// without holding the entity mutex.
+func TestExportWriterDoesNotBlockEntity(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	w := &blockingWriter{make(chan struct{}, 1), make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { _, err := n.Export(bg, ref, w); done <- err }()
+	<-w.entered
+	ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+	defer cancel()
+	_, err := n.Update(ctx, ref, newReq(t, "during export", 1), put("a", "1"))
+	close(w.release)
+	if err != nil {
+		t.Fatalf("update behind a blocked export: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -1043,6 +1281,150 @@ func TestCloseReportsUnresolved(t *testing.T) {
 	wantCode(t, err, CodeClosed)
 	armed.Store(false)
 	l.verify(t, mem, "a")
+}
+
+// TestCloseHonorsContext: Close stops waiting for a busy entity when its
+// ctx ends, concurrent Closes are safe, and Resolve is closed afterwards.
+func TestCloseHonorsContext(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var armed atomic.Bool
+	armed.Store(true)
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if armed.Load() && a.Key == head.HeadKey("k") && (a.Op == "cas" || a.Op == "get") {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "stuck", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	n.cfg.Limits.CommitTimeout = 5 * time.Second
+	held := make(chan struct{})
+	go func() { // a long settle holds the entity mutex
+		ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+		defer cancel()
+		close(held)
+		n.Update(ctx, ref, req, put("b", "2"))
+	}()
+	<-held
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(bg, 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Go(func() { errs[i] = n.Close(ctx) })
+	}
+	wg.Wait()
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("Close took %v", d)
+	}
+	wantCode(t, errs[0], CodeOutcomeUnknown)
+	wantCode(t, errs[1], CodeOutcomeUnknown)
+	_, err = n.Resolve(bg, "k")
+	wantCode(t, err, CodeClosed)
+	armed.Store(false)
+}
+
+// TestRecoveriesBound: at most Limits.Recoveries activations run at once.
+func TestRecoveriesBound(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	var refs []Ref
+	for i := range 6 {
+		refs = append(refs, mustCreate(t, n, fmt.Sprint("k", i), nil))
+	}
+	var inflight, peak atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if a.Op != "get" || !strings.HasSuffix(a.Key, ".ltx") {
+			return storetest.MemFault{}
+		}
+		peak.Store(max(peak.Load(), inflight.Add(1)))
+		hold := make(chan struct{})
+		time.AfterFunc(50*time.Millisecond, func() { inflight.Add(-1); close(hold) })
+		return storetest.MemFault{Hold: hold}
+	})
+	cold := testNode(t, mem, "a", func(l *Limits) { l.Recoveries = 2 })
+	var wg sync.WaitGroup
+	for _, ref := range refs {
+		wg.Go(func() { readAll(t, cold, ref) })
+	}
+	wg.Wait()
+	if p := peak.Load(); p < 1 || p > 2 {
+		t.Fatalf("peak concurrent activations %d, want at most 2", p)
+	}
+}
+
+// TestEntityMapBounded: operations on entities this node does not hold
+// leave no in-memory entry behind (PLAN §11.2).
+func TestEntityMapBounded(t *testing.T) {
+	mem := newStore(t)
+	owner := testNode(t, mem, "owner", nil)
+	var refs []Ref
+	for i := range 20 {
+		refs = append(refs, mustCreate(t, owner, fmt.Sprint("k", i), nil))
+	}
+	n := testNode(t, mem, "a", nil)
+	for i := range 1000 {
+		_, err := n.Read(bg, refs[i%len(refs)], 1, func(*View) ([]byte, error) { return nil, nil })
+		wantCode(t, err, CodeNotOwner)
+	}
+	_, err := n.Read(bg, Ref{Key: "missing"}, 1, func(*View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeNotFound)
+	entries := func() int {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		return len(n.entities)
+	}
+	if got := entries(); got != 0 {
+		t.Fatalf("%d entries after misrouted reads", got)
+	}
+	l := newLedger()
+	ref := mustCreate(t, n, "mine", l)
+	mustPut(t, n, ref, "a", "1", l)
+	if got := entries(); got != 1 { // resident
+		t.Fatalf("%d entries", got)
+	}
+	err = n.Evict(bg, ref)
+	n.wg.Wait() // the maintenance step after the Update holds the entity too
+	if err != nil || entries() != 0 {
+		t.Fatalf("evict %v, %d entries", err, entries())
+	}
+	l.verify(t, mem, "a")
+}
+
+// TestBusyColdEntityNotResident: an entity busy without a cache file does
+// not count against ResidentEntities.
+func TestBusyColdEntityNotResident(t *testing.T) {
+	mem := newStore(t)
+	creator := testNode(t, mem, "a", nil)
+	x, y := mustCreate(t, creator, "x", nil), mustCreate(t, creator, "y", nil)
+	creator.Close(bg)
+	n := testNode(t, mem, "a", func(l *Limits) { l.ResidentEntities = 1 })
+	hold := make(chan struct{})
+	var state atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if a.Op == "get" && a.Key == head.HeadKey("x") && state.CompareAndSwap(0, 1) {
+			return storetest.MemFault{Hold: hold}
+		}
+		return storetest.MemFault{}
+	})
+	done := make(chan struct{})
+	go func() { defer close(done); readAll(t, n, x) }()
+	for state.Load() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	if st := n.Stats(); st.ResidentEntities != 0 {
+		t.Errorf("busy cold entity counted resident: %+v", st)
+	}
+	readAll(t, n, y)
+	close(hold)
+	<-done
 }
 
 func TestMaintenance(t *testing.T) {

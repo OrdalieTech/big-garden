@@ -290,6 +290,11 @@ func (x *px) run(ev, res uint8) {
 		case i >= 0:
 			x.resolved()
 			x.subret(sConflict)
+		case x.c.Reqs[c.Req-1].TS <= cur.Img.Floor: // the receipt may have been pruned: unknown for good
+			x.discard()
+			x.resolved()
+			x.p.Cur, x.p.Code = cur, cUnknown
+			x.subret(sDead)
 		default:
 			x.dead(cur)
 		}
@@ -606,9 +611,9 @@ func (x *px) run(ev, res uint8) {
 		case ev == evTimeout && p.Put < 1:
 			p.Put++
 			x.wait(pcCrPutBirth, x.birthMsg())
-		case ev == evTimeout:
+		case ev == evTimeout: // birth.json may exist: only this request can resume it (D5)
 			x.discard()
-			x.finish(out{code: cUnavailable, def: true})
+			x.finish(out{code: cUnknown})
 		case res == rOK:
 			x.crUpload()
 		default:
@@ -618,8 +623,6 @@ func (x *px) run(ev, res uint8) {
 		b := p.RBirth
 		switch {
 		case res == rOK && b.Att == p.BAtt:
-			x.crUpload()
-		case res == rOK && b.Req == p.Req+1 && b.Inc == p.Inc:
 			x.crUpload()
 		case res == rOK && b.Req == p.Req+1 && p.Loops < 1: // restart at step 3 with its incarnation
 			p.Loops++
@@ -637,7 +640,7 @@ func (x *px) run(ev, res uint8) {
 				return
 			}
 			x.discard()
-			x.finish(out{code: cUnavailable, def: true})
+			x.finish(out{code: cUnknown}) // after the birth, as above
 			return
 		}
 		next := Head{Inc: p.Inc, Rev: 1, Nonce: x.fresh(), Owner: int8(x.n + 1), Sess: x.self(),
@@ -695,6 +698,7 @@ func (x *px) start() {
 func (x *px) settle(next uint8) {
 	x.p.Res = 0
 	if x.m.Unres {
+		x.m.C.Lim = min(x.m.C.NN+2, maxNonces) // two re-proposals per later resolve call (model bound: maxNonces)
 		x.p.Ret = next
 		x.getHead(pcResGet)
 		return
@@ -724,7 +728,7 @@ func (x *px) settled() bool {
 func (x *px) subFail() {
 	switch x.p.Res {
 	case sDead:
-		x.finish(out{code: x.p.Code, def: true})
+		x.finish(out{code: x.p.Code, def: x.p.Code != cUnknown})
 	case sConflict:
 		x.finish(out{code: cIDConflict, img: x.p.Cur.Img, hasImg: true, def: true})
 	case sUnknown:
@@ -765,7 +769,7 @@ func (x *px) cas(c *Cand) Msg {
 // publish is PROTOCOL §2: mark the candidate unresolved, then one CAS.
 func (x *px) publish(c Cand, ret uint8) {
 	c.Next.Cand = x.fresh()
-	c.Nonces, c.NN = [3]ID{c.Next.Nonce}, 1
+	c.Nonces, c.NN, c.Lim = [maxNonces]ID{c.Next.Nonce}, 1, 3
 	x.m.Unres, x.m.C = true, c
 	if c.Kind == x.p.Kind {
 		x.p.CID, x.p.Applied = c.Next.Cand, false
@@ -817,10 +821,14 @@ func (x *px) resolveGot(res uint8) {
 	}
 }
 
+// maxNonces bounds the proposals of one candidate in the model: the three of
+// its publication and two from each of up to two later resolve calls.
+const maxNonces = 7
+
 // repropose is the D12 fence: same head, fresh nonce, same condition.
 func (x *px) repropose() {
 	c := &x.m.C
-	if c.NN < 3 {
+	if c.NN < c.Lim {
 		c.Next.Nonce = x.fresh()
 		c.Nonces[c.NN] = c.Next.Nonce
 		c.NN++

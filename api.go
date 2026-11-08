@@ -97,5 +97,3 @@ func (t *Tx) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows)
 func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
 	return t.t.Exec(ctx, q, args...)
 }
-
-func unsupported() *Error { return newError(CodeUnsupported, "not implemented yet", nil) }

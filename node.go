@@ -26,12 +26,13 @@ type Node struct {
 	lock *os.File // holds the flock on dir
 	now  func() time.Time
 
-	mu       sync.Mutex
-	entities map[string]*entity
-	reserved int64        // cache bytes reserved by activations in progress
-	staging  atomic.Int64 // bytes of objects being uploaded (Stats)
-	logged   atomic.Int64 // unix nanos of the last log line (rate limit)
-	closed   bool
+	mu         sync.Mutex
+	entities   map[string]*entity
+	reserved   int64         // cache bytes reserved by activations in progress
+	recoveries chan struct{} // one token per activation in progress (Limits.Recoveries)
+	staging    atomic.Int64  // bytes of objects being uploaded (Stats)
+	logged     atomic.Int64  // unix nanos of the last log line (rate limit)
+	closed     bool
 
 	done            chan struct{} // closed by Close: stops the sweeper
 	counters        counters
@@ -50,7 +51,8 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now}
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now,
+		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	if err := n.namespace(ctx); err != nil {
 		return nil, err
 	}
@@ -82,47 +84,73 @@ func (n *Node) sweeper() {
 
 // room makes room for self to become resident under ResidentEntities,
 // waiting briefly while every resident entity is busy.
-func (n *Node) room(self *entity) bool {
+func (n *Node) room(ctx context.Context, self *entity) bool {
 	for i := 0; i < 100; i++ {
 		if n.evict(time.Time{}, n.cfg.Limits.ResidentEntities, self) {
 			return true
 		}
-		time.Sleep(10 * time.Millisecond)
+		if pause(ctx) != nil {
+			return false
+		}
 	}
 	return false
 }
 
+// pause waits 10 ms or until ctx ends.
+func pause(ctx context.Context) error {
+	t := time.NewTimer(10 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // evict discards resident, idle, settled entities last used before cutoff.
-// With keep > 0 it instead discards the least recently used one if at
-// least keep entities other than self are resident (busy ones count), and
-// reports whether there is room for self. It never blocks on an entity mutex.
+// With keep > 0 it also discards the least recently used one if at least
+// keep entities other than self are resident, and reports whether there is
+// room for self.
 func (n *Node) evict(cutoff time.Time, keep int, self *entity) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	resident, lru := 0, (*entity)(nil)
-	var lruUsed time.Time
+	resident, _, lru := n.scan(cutoff, self)
+	return keep == 0 || resident < keep || shed(lru)
+}
+
+// scan walks the entities other than self under n.mu, never blocking on an
+// entity mutex: it discards the idle, settled resident ones last used before
+// cutoff and forgets unneeded ones. It returns the number of resident
+// entities (a busy one only with a file), their cache bytes (a busy one with
+// its last seen size) and the least recently admitted idle, settled one.
+func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, lru *entity) {
+	var at time.Time
 	for _, e := range n.entities {
-		if e == self {
+		if e == self || !e.mu.TryLock() {
+			if b := e.bytes.Load(); b > 0 {
+				resident, used = resident+1, used+b
+			}
 			continue
 		}
-		if !e.mu.TryLock() {
-			resident++
-			continue
-		}
-		if e.db != nil && e.unresolved == nil && keep == 0 && e.used.Before(cutoff) {
+		if e.db != nil && e.unresolved == nil && e.used.Before(cutoff) {
 			e.discard()
 		}
 		if e.db != nil {
-			resident++
-			if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
-				lru, lruUsed = e, e.used
+			e.bytes.Store(e.db.Bytes())
+			resident, used = resident+1, used+e.bytes.Load()
+			if e.unresolved == nil && (lru == nil || e.used.Before(at)) {
+				lru, at = e, e.used
 			}
 		}
+		n.forget(e)
 		e.mu.Unlock()
 	}
-	if keep == 0 || resident < keep {
-		return true
-	}
+	return resident, used, lru
+}
+
+// shed discards lru if it is still resident, idle and settled.
+func shed(lru *entity) bool {
 	if lru == nil || !lru.mu.TryLock() {
 		return false
 	}
@@ -254,10 +282,39 @@ func (n *Node) entity(key string) (*entity, error) {
 	}
 	e := n.entities[key]
 	if e == nil {
-		e = &entity{key: key}
+		e = &entity{key: key, mu: make(gate, 1)}
 		n.entities[key] = e
 	}
+	e.refs++
 	return e, nil
+}
+
+// leave ends an operation on e: it drops a head this session does not own
+// (the next access GETs it anyway), unlocks e and drops the reference.
+func (n *Node) leave(e *entity) {
+	if e.unresolved == nil && e.h != nil && !n.mine(e.h) {
+		e.discard()
+	}
+	e.mu.Unlock()
+	n.drop(e)
+}
+
+// drop releases one reference to e and forgets e once no operation holds it
+// and it is neither resident nor unresolved (PLAN §11.2).
+func (n *Node) drop(e *entity) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if e.refs--; e.refs == 0 && e.mu.TryLock() {
+		n.forget(e)
+		e.mu.Unlock()
+	}
+}
+
+// forget removes e from the map if nothing needs it; n.mu and e.mu are held.
+func (n *Node) forget(e *entity) {
+	if e.refs == 0 && e.db == nil && e.unresolved == nil && n.entities[e.key] == e {
+		delete(n.entities, e.key)
+	}
 }
 
 func (n *Node) isClosed() bool {
@@ -272,15 +329,14 @@ func (n *Node) buildBytes() int64 { return 4*n.cfg.Limits.EntityBytes + 1<<20 }
 // cache makes room for e to become resident and reserves buildBytes for
 // building its file (PROTOCOL §4 step 1, §7 cache policy); the caller
 // releases the reserve with unreserve once the file is built.
-func (n *Node) cache(e *entity) error {
-	if !n.room(e) {
-		return newError(CodeCapacity, "ResidentEntities entities are busy", nil)
+func (n *Node) cache(ctx context.Context, e *entity) error {
+	if !n.room(ctx, e) {
+		return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
 	}
 	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
-		if i == 100 {
-			return newError(CodeCapacity, "cache bytes held by entities in use", nil)
+		if i == 100 || pause(ctx) != nil {
+			return newError(CodeCapacity, "cache bytes held by entities in use", ctx.Err())
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	return nil
 }
@@ -294,35 +350,14 @@ func (n *Node) fit(self *entity) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
-		used, lru := n.reserved, (*entity)(nil)
-		var lruUsed time.Time
-		for _, e := range n.entities {
-			if e == self || !e.mu.TryLock() {
-				used += e.bytes.Load()
-				continue
-			}
-			if e.db != nil {
-				e.bytes.Store(e.db.Bytes())
-				if e.unresolved == nil && (lru == nil || e.used.Before(lruUsed)) {
-					lru, lruUsed = e, e.used
-				}
-			}
-			used += e.bytes.Load()
-			e.mu.Unlock()
-		}
-		if used+n.buildBytes() <= n.cfg.Limits.CacheBytes {
+		_, used, lru := n.scan(time.Time{}, self)
+		if n.reserved+used+n.buildBytes() <= n.cfg.Limits.CacheBytes {
 			n.reserved += n.buildBytes()
 			return true
 		}
-		if lru == nil || !lru.mu.TryLock() {
+		if !shed(lru) {
 			return false
 		}
-		if lru.db == nil || lru.unresolved != nil {
-			lru.mu.Unlock()
-			return false
-		}
-		lru.discard()
-		lru.mu.Unlock()
 	}
 }
 
@@ -345,12 +380,20 @@ func (n *Node) Close(ctx context.Context) error {
 		es = append(es, e)
 	}
 	n.mu.Unlock()
-	n.wg.Wait()
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout)
 	defer cancel()
+	idle := make(chan struct{})
+	go func() { n.wg.Wait(); close(idle) }()
+	select {
+	case <-idle:
+	case <-ctx.Done():
+	}
 	unknown := false
 	for _, e := range es {
-		e.mu.Lock()
+		if e.mu.lock(ctx) != nil { // still busy: it may hold an unresolved candidate
+			unknown = true
+			continue
+		}
 		if e.unresolved != nil {
 			n.resolve(ctx, e, e.unresolved)
 			unknown = unknown || e.unresolved != nil
@@ -358,6 +401,8 @@ func (n *Node) Close(ctx context.Context) error {
 		e.discard()
 		e.mu.Unlock()
 	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.lock != nil {
 		os.RemoveAll(n.dir)
 		n.lock.Close()
