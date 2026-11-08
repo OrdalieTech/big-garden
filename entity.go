@@ -21,9 +21,9 @@ import (
 const maxHeadBytes = 64 << 10
 
 // entity is the in-memory state of one key (DECISIONS D8): the cached head,
-// its ETag, the connection and the unresolved candidate. replay and tail
-// cache the decoded page counts of the head's deltas plus tail, and of the
-// tail alone (PROTOCOL §6 step 7); they are derived from h and reset with it.
+// its ETag, the connection and the unresolved candidate. pages caches the
+// decoded page frames of each of h's snapshot, deltas and tail (the replay
+// pages of PROTOCOL §6 step 7 and §9); it is derived from h and reset with it.
 type entity struct {
 	mu         sync.Mutex
 	key        string
@@ -31,12 +31,10 @@ type entity struct {
 	etag       string
 	db         *engine.DB
 	unresolved *candidate
-	replay     uint32
-	tail       uint32
+	pages      []uint32
 }
 
-// candidate is one publication (PROTOCOL §2). replay and tail are the page
-// counts that go with next.
+// candidate is one publication (PROTOCOL §2). pages goes with next.
 type candidate struct {
 	base     *head.Head
 	baseETag string
@@ -45,8 +43,7 @@ type candidate struct {
 	object   *head.Ref
 	op       *head.OpID
 	bound    head.Digest
-	replay   uint32
-	tail     uint32
+	pages    []uint32
 }
 
 // discard closes and deletes the cache file and drops the cached head (D10).
@@ -54,7 +51,7 @@ func (e *entity) discard() {
 	if e.db != nil {
 		e.db.Discard()
 	}
-	e.db, e.h, e.etag, e.replay, e.tail = nil, nil, "", 0, 0
+	e.db, e.h, e.etag, e.pages = nil, nil, "", nil
 }
 
 func imageOf(h *head.Head) engine.Image {
@@ -154,7 +151,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 		return
 	}
 	if slices.Contains(c.nonces, cur.Nonce) {
-		e.replay, e.tail = c.replay, c.tail
+		e.pages = c.pages
 		o := engine.Object{Ref: head.Ref{MaxSequence: cur.Sequence, PostChecksum: cur.DatabaseChecksum}, PageCount: cur.PageCount}
 		if e.db.Published() != imageOf(cur) && e.db.Checkpoint(o) != nil {
 			e.discard()
@@ -216,7 +213,7 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 	case c.object != nil && slices.ContainsFunc(append([]head.Ref{cur.Snapshot}, cur.Deltas...),
 		func(r head.Ref) bool { return r.Key == c.object.Key }):
 		committed = true
-	case c.op != nil:
+	case c.op != nil: // the tail is not an object: an inline mutation always lands here
 		e.discard()
 		if err := n.activate(ctx, e, cur, etag); err != nil {
 			return nil, err // e.unresolved stays: a later operation resolves again
@@ -231,6 +228,7 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 			return nil, &Error{Code: CodeIDConflict, Operation: opOf(c), Message: "operation ID used with another input"}
 		}
 		committed, rec = ok, &r
+	case c.object != nil: // maintenance: committed only if its object is referenced
 	case c.next.Owner != nil: // takeover
 		committed = n.mine(cur)
 	default: // release
@@ -328,13 +326,18 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 			return engineError(err)
 		}
 		e.db, e.h, e.etag = db, h, etag
-		e.replay, e.tail = 0, 0
-		for _, p := range db.Pages[1:] {
-			e.replay += p
-		}
-		if h.Tail != nil {
-			e.tail = db.Pages[len(db.Pages)-1]
-		}
+		e.pages = db.Pages
 		return nil
 	}
+}
+
+// replay is the decoded page count of the deltas plus the tail.
+func (e *entity) replay() uint64 {
+	var r uint64
+	for i, p := range e.pages {
+		if i > 0 {
+			r += uint64(p)
+		}
+	}
+	return r
 }

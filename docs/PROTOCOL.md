@@ -11,7 +11,7 @@ The exact steps every operation implements. PLAN.md is the contract and DECISION
 - Head missing: if `birth.json` exists, `state_missing`; else `not_found`.
 - "Discard" (D10) = close the connection, delete the entity's db, `-wal`, `-shm` files, drop the cached head. The next access rehydrates (§4).
 - "Barrier" = §3 steps 2–3 (fresh conditional head GET). Required before returning any state-dependent answer that is not a successful CAS (replays, `id_conflict`, `schema_mismatch`, `id_expired` by floor, callback errors). If the head changed, redo the operation from its activation step once, then return `route_changed`.
-- Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else, except two counters derived from `H` and reset with it: the decoded pages of its deltas plus tail, and of its tail alone (the replay pages of §6.7, set by activation and by each committed candidate).
+- Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else, except the decoded page frames of each of `H`'s snapshot, deltas and tail, derived from `H` and reset with it (the replay pages of §6.7 and §9; set by activation and by each committed candidate).
 
 ## 1. Objects and formats
 
@@ -69,7 +69,7 @@ A candidate is `{base *Head (nil for genesis), baseETag, next Head, nonces []ID,
 1. `GET head` (no `If-None-Match`). `Unknown`: back off, loop. `NotFound` with `base != nil`: `state_missing`, keep `unresolved`. `NotFound` with `base == nil`: go to 4.
 2. Strict decode `cur`. If `cur.nonce ∈ c.nonces`: committed; `e.H, e.E = cur, etag`; `unresolved = nil`.
 3. If `base == nil` or `cur.revision > base.revision`, every proposal is dead (their condition can never hold again). Then:
-   - `c.object` is referenced by `cur`: committed (only our transition could introduce it). The tail is not an object and never proves anything here.
+   - `c.object` is referenced by `cur`: committed (only our transition could introduce it). The tail is not an object and never proves anything here. A maintenance candidate (object, no op) whose object is not referenced is not committed.
    - else `c.op != nil` (always the case for an inline-tail mutation): hydrate `cur` (§4) and look up the receipt: same `bound` → committed (return the stored result); other `bound` → `id_conflict`; absent → not committed.
    - else takeover: committed iff `cur.owner == self`; release: done iff `cur.owner != self`.
    - Not committed: discard; `unresolved = nil`; return `not_owner` with `cur`'s Route if `cur.owner != self`, else `route_changed`.

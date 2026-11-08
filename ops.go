@@ -127,7 +127,7 @@ func (n *Node) claim(e *entity) error {
 	next := *e.h
 	self := n.self
 	next.Owner, next.Epoch, next.Revision, next.Nonce = &self, next.Epoch+1, next.Revision+1, head.NewID()
-	_, err := n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next, replay: e.replay, tail: e.tail})
+	_, err := n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next, pages: e.pages})
 	return err
 }
 
@@ -436,7 +436,7 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 	next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
 		Owner: &self, Epoch: 1, Sequence: 1, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
 		PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
-	rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound})
+	rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
 	if err != nil {
 		return Ref{}, Result{}, withOp(err, req.ID)
 	}
@@ -551,7 +551,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 	next.Revision, next.Nonce, next.Sequence, next.Schema = h.Revision+1, head.NewID(), seq, schema
 	next.PageCount, next.DatabaseChecksum = delta.PageCount, delta.Ref.PostChecksum
 	c := &candidate{base: h, baseETag: e.etag, op: &op, bound: bound}
-	if len(h.Deltas) == head.MaxDeltas || uint64(e.replay)+uint64(delta.Pages) > 2*uint64(delta.PageCount)+256 {
+	if len(h.Deltas) == head.MaxDeltas || e.replay()+uint64(delta.Pages) > 2*uint64(delta.PageCount)+256 {
 		buf.Reset() // snapshot on cap (§6 step 7)
 		snap, err := e.db.Snapshot(&buf)
 		if err != nil {
@@ -559,7 +559,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		}
 		ref := snap.Ref
 		ref.Key, ref.BaseRevision = head.ObjectKey(h.Key, h.Incarnation, h.Revision, head.NewID(), ref.SHA256), h.Revision
-		next.Snapshot, next.Deltas, next.Tail, c.object = ref, []head.Ref{}, nil, &ref
+		next.Snapshot, next.Deltas, next.Tail, c.object, c.pages = ref, []head.Ref{}, nil, &ref, []uint32{snap.Pages}
 		if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
 			return fail(err)
 		}
@@ -574,12 +574,12 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 			}
 			tbytes = out.Bytes()
 		}
-		c.replay = e.replay - e.tail + t.Pages
+		c.pages = append(slices.Clone(e.pages[:1+len(h.Deltas)]), t.Pages) // the tail, or the new last delta
 		uploaded := slices.ContainsFunc(append([]head.Ref{h.Snapshot}, h.Deltas...), func(r head.Ref) bool { return r.BaseRevision >= 1 })
 		if t.Ref.Bytes <= head.InlineBytes && uploaded {
 			r := t.Ref
-			next.Tail, c.tail = &head.Tail{SHA256: r.SHA256, Bytes: r.Bytes, MinSequence: r.MinSequence, MaxSequence: r.MaxSequence,
-				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbytes}, t.Pages
+			next.Tail = &head.Tail{SHA256: r.SHA256, Bytes: r.Bytes, MinSequence: r.MinSequence, MaxSequence: r.MaxSequence,
+				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbytes}
 		} else {
 			ref := t.Ref
 			ref.Key, ref.BaseRevision = head.ObjectKey(h.Key, h.Incarnation, h.Revision, head.NewID(), ref.SHA256), h.Revision
