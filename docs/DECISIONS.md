@@ -130,3 +130,11 @@ The library replicates pages, not SQL, so any extension whose state lives in the
 - **Vector search.** Package `vec` (`vec.Register` for `Extend`) provides `vec_f32`, `vec_distance_l2`, `vec_distance_cosine`, `vec_dot` and `vec_length` over little-endian float32 BLOBs, the float32 format of sqlite-vec, so stored vectors stay readable by sqlite-vec elsewhere. KNN is `ORDER BY vec_distance_cosine(col, ?) LIMIT k`, a scan as sqlite-vec's `vec0` does. `BenchmarkKNN` (k = 10, cosine, one entity, in-memory store, i7-10510U, `CGO_ENABLED=0`): 384 dimensions 10k rows (20 MiB) 16.0 ms, 50k (98 MiB) 81.7 ms; 768 dimensions 10k (39 MiB) 30.1 ms, 50k (196 MiB) 147.3 ms per query. About a third of the time is the distance loop, much of the rest is SQLite's row scan and page reads (the engine's page cache is 1 MiB, so a scan rereads the file from the OS cache).
 
 Cost: +9 nonblank noncomment production lines in the root package (2,408 → 2,417), +83 in `internal/engine` (1,018 → 1,101), 110 in `vec`. The review fixes (foreign keys to reserved tables, no replaced built-ins, activation on an extension-free connection, `REINDEX`): +39 in `internal/engine` (1,101 → 1,140).
+
+## D20. Public API amendments from M9
+
+M9 built two examples (`examples/counter`, `examples/kvregistry`) on the public API only; these are the amendments their findings required.
+
+- **The stored schema on `schema_mismatch`.** A caller had no way to learn an entity's stored schema, so a rolling upgrade had to guess whether to `Migrate` (the entity is older than the code) or defer to a newer Node (the entity is newer). `Error` gains one field, `Schema uint32`, set on every `schema_mismatch`: the stored schema for `Read`, `Update` and `Migrate` (with `At`, the version at which it was observed), the archive's schema for `Import`. A Node learns it from the call it was making anyway, under ownership, so it is never stale; `Route` stays an ownership observation (adding the schema there would make a `Migrate` look like a route change to `Takeover`). (`TestSchemaMismatchReportsStored`.)
+
+Cost: +3 nonblank noncomment production lines in the root package (2,418 → 2,421).

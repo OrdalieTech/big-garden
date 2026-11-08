@@ -54,6 +54,7 @@ type Error struct {
 	Operation	MutationID
 	Route		*Route
 	At		Version
+	Schema		uint32
 	RetryAfter	time.Duration
 	Message		string
 }

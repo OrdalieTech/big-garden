@@ -249,7 +249,8 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 		return Result{}, err
 	}
 	if e.h.Schema != schema {
-		return Result{}, &Error{Code: CodeSchemaMismatch, At: Version{e.h.Incarnation, e.h.Sequence}, Message: "stored schema differs"}
+		return Result{}, &Error{Code: CodeSchemaMismatch, At: Version{e.h.Incarnation, e.h.Sequence}, Schema: e.h.Schema,
+			Message: "stored schema differs"}
 	}
 	var cb error
 	v, err := e.db.Read(scoped(n.cfg.Limits.ResultBytes, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
@@ -632,7 +633,8 @@ func (n *Node) admit(e *entity, req Request, bound head.Digest) (*Result, error)
 	case ok:
 		return nil, &Error{Code: CodeIDConflict, Operation: req.ID, Message: "operation ID used with another input"}
 	case m.Schema != req.Schema:
-		return nil, &Error{Code: CodeSchemaMismatch, Operation: req.ID, At: Version{e.h.Incarnation, e.h.Sequence}, Message: "stored schema differs"}
+		return nil, &Error{Code: CodeSchemaMismatch, Operation: req.ID, At: Version{e.h.Incarnation, e.h.Sequence}, Schema: m.Schema,
+			Message: "stored schema differs"}
 	}
 	return nil, nil
 }

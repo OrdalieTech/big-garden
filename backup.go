@@ -102,7 +102,7 @@ func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader)
 		return Ref{}, Result{}, err
 	}
 	if req.Schema != m.Schema {
-		return Ref{}, Result{}, &Error{Code: CodeSchemaMismatch, Operation: req.ID, Message: "archive schema differs"}
+		return Ref{}, Result{}, &Error{Code: CodeSchemaMismatch, Operation: req.ID, Schema: m.Schema, Message: "archive schema differs"}
 	}
 	src := head.Head{Namespace: m.Namespace, Key: m.Key, Incarnation: m.Incarnation, Sequence: m.Sequence, Schema: m.Schema,
 		PageCount: m.PageCount, DatabaseChecksum: m.DatabaseChecksum, Snapshot: head.Ref{SHA256: m.SHA256, Bytes: m.Bytes,

@@ -35,6 +35,7 @@ type Error struct {
 	Operation  MutationID
 	Route      *Route        // nil if unavailable/not relevant
 	At         Version       // validated observation point, if available
+	Schema     uint32        // schema_mismatch: the stored schema (Import: the archive's)
 	RetryAfter time.Duration // hint, never permission to change operation identity
 	Message    string        // bounded, sanitized explanation
 	cause      error         // private; context cause or sanitized lower-layer error

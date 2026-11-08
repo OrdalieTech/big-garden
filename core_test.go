@@ -1817,3 +1817,31 @@ func TestExportAfterActivation(t *testing.T) {
 		export("restart", testNode(t, mem, "b", nil)) // same NodeID: implicit takeover (D4)
 	}
 }
+
+// TestSchemaMismatchReportsStored: a schema_mismatch Error carries the
+// stored schema (the archive's for Import), so a rolling upgrade can choose
+// between Migrate and deferring to a newer Node without guessing (D20).
+func TestSchemaMismatchReportsStored(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	ref := mustCreate(t, n, "k", nil)
+	if _, err := n.Migrate(bg, ref, newReq(t, "m", 1), 3, func(*Tx) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	_, err := n.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+	if e := wantCode(t, err, CodeSchemaMismatch); e.Schema != 3 {
+		t.Fatalf("read: stored schema %d", e.Schema)
+	}
+	_, err = n.Update(bg, ref, newReq(t, "u", 4), put("a", "1"))
+	if e := wantCode(t, err, CodeSchemaMismatch); e.Schema != 3 {
+		t.Fatalf("update: stored schema %d", e.Schema)
+	}
+	var archive bytes.Buffer
+	if _, err := n.Export(bg, ref, &archive); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = n.Import(bg, "dst", newReq(t, "i", 1), &archive)
+	if e := wantCode(t, err, CodeSchemaMismatch); e.Schema != 3 {
+		t.Fatalf("import: archive schema %d", e.Schema)
+	}
+}
