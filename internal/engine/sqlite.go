@@ -301,18 +301,23 @@ func (d *DB) exec(q string, args ...any) error {
 	return err
 }
 
-// inTx runs fn in a library transaction (BEGIN IMMEDIATE ... COMMIT).
-func (d *DB) inTx(fn func() error) error {
+// inTx runs fn in a library transaction (BEGIN IMMEDIATE ... COMMIT). On an
+// error or a panic of fn it restores library mode and rolls back.
+func (d *DB) inTx(fn func() error) (err error) {
 	if err := d.exec("BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
-	if err := fn(); err != nil {
-		return errors.Join(err, d.rollback())
+	committed := false
+	defer func() { // also runs on a callback panic
+		if !committed {
+			err = withCleanup(err, d.setMode(library), d.rollback())
+		}
+	}()
+	if err = fn(); err == nil {
+		err = d.exec("COMMIT")
 	}
-	if err := d.exec("COMMIT"); err != nil {
-		return errors.Join(err, d.rollback())
-	}
-	return nil
+	committed = err == nil
+	return err
 }
 
 // rollback ends the library transaction. SQLite may already have rolled it
@@ -386,60 +391,53 @@ func (d *DB) Receipt(id head.OpID) (Receipt, bool, error) {
 // the final update finds no row and the mutation fails instead of committing
 // library metadata without the application's changes.
 func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq uint64, err error) {
-	if err := d.exec("BEGIN IMMEDIATE"); err != nil {
-		return nil, 0, err
-	}
-	committed := false
-	defer func() { // also runs on a callback panic
-		if !committed {
-			err = withCleanup(err, d.setMode(library), d.rollback())
+	err = d.inTx(func() error {
+		m, err := d.Meta()
+		if err != nil {
+			return err
 		}
-	}()
-	m, err := d.Meta()
-	if err != nil {
-		return nil, 0, err
-	}
-	seq, floor := m.Sequence+1, max(m.FloorMs, c.FloorMs)
-	if seq > head.MaxInt || floor >= head.MaxInt || c.Schema == 0 {
-		return nil, 0, errors.New("engine: sequence, floor or schema out of range")
-	}
-	var below [8]byte
-	binary.BigEndian.PutUint64(below[:], floor+1)
-	if err := d.exec(`DELETE FROM _state_receipts WHERE operation_id IN (SELECT operation_id
+		floor := max(m.FloorMs, c.FloorMs)
+		if seq = m.Sequence + 1; seq > head.MaxInt || floor >= head.MaxInt || c.Schema == 0 {
+			return errors.New("engine: sequence, floor or schema out of range")
+		}
+		var below [8]byte
+		binary.BigEndian.PutUint64(below[:], floor+1)
+		if err := d.exec(`DELETE FROM _state_receipts WHERE operation_id IN (SELECT operation_id
 		FROM _state_receipts WHERE operation_id < ? ORDER BY operation_id LIMIT ?)`, below[:], pruneBatch); err != nil {
-		return nil, 0, err
-	}
-	if err := d.exec("INSERT INTO _state_receipts VALUES (?, ?, x'', ?)", c.ID[:], c.Bound[:], seq); err != nil {
-		return nil, 0, err
-	}
-	if err := d.exec("UPDATE _state_meta SET schema = ?, sequence = ?, expiry_floor_ms = ?", c.Schema, seq, floor); err != nil {
-		return nil, 0, err
-	}
-	if err := d.setMode(mutation); err != nil {
-		return nil, 0, err
-	}
-	tx := &Tx{scope{conn: d.conn}}
-	if result, err = runScoped(&tx.scope, func() ([]byte, error) { return fn(tx) }); err != nil {
-		return nil, 0, err
-	}
-	if err := d.setMode(library); err != nil {
-		return nil, 0, err
-	}
-	if err := d.schemaOwned(); err != nil {
-		return nil, 0, err
-	}
-	res, err := d.conn.ExecContext(context.Background(), "UPDATE _state_receipts SET result = ? WHERE operation_id = ?",
-		append([]byte{}, result...), c.ID[:])
+			return err
+		}
+		if err := d.exec("INSERT INTO _state_receipts VALUES (?, ?, x'', ?)", c.ID[:], c.Bound[:], seq); err != nil {
+			return err
+		}
+		if err := d.exec("UPDATE _state_meta SET schema = ?, sequence = ?, expiry_floor_ms = ?", c.Schema, seq, floor); err != nil {
+			return err
+		}
+		if err := d.setMode(mutation); err != nil {
+			return err
+		}
+		tx := &Tx{scope{conn: d.conn}}
+		if result, err = runScoped(&tx.scope, func() ([]byte, error) { return fn(tx) }); err != nil {
+			return err
+		}
+		if err := d.setMode(library); err != nil {
+			return err
+		}
+		if err := d.schemaOwned(); err != nil {
+			return err
+		}
+		res, err := d.conn.ExecContext(context.Background(), "UPDATE _state_receipts SET result = ? WHERE operation_id = ?",
+			append([]byte{}, result...), c.ID[:])
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return fmt.Errorf("engine: transaction rolled back during the callback (%d rows, %v)", n, err)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, 0, err
 	}
-	if n, err := res.RowsAffected(); err != nil || n != 1 {
-		return nil, 0, fmt.Errorf("engine: transaction rolled back during the callback (%d rows, %v)", n, err)
-	}
-	if err := d.exec("COMMIT"); err != nil {
-		return nil, 0, err
-	}
-	committed = true
 	return result, seq, nil
 }
 
