@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,9 +21,14 @@ import (
 )
 
 // failpoints are the commit boundaries of PLAN §16 rows 1-3 (garden's
-// failpoint() calls) plus "reply", after the response reached the parent.
+// failpoint() calls) plus "reply", after the response reached the parent,
+// and two network faults through a storetest.Proxy after which the parent
+// kills a node that answered outcome_unknown: "net.lost" (head CAS applied,
+// reply lost, head unreadable) and "net.late" (head CAS held, head
+// unreadable; the held CAS applies after the kill, before the restart in odd
+// runs and after the restarted node's retry in even runs).
 var failpoints = []string{"sql.before", "sql.inside", "sql.after", "capture",
-	"put.before", "put.mid", "put.after", "cas.before", "cas.after", "reply"}
+	"put.before", "put.mid", "put.after", "cas.before", "cas.after", "reply", "net.lost", "net.late"}
 
 var (
 	buildOnce sync.Once
@@ -57,7 +63,8 @@ type proc struct {
 }
 
 func start(t *testing.T, ep storetest.Endpoint, cache, failpoint string) *proc {
-	cmd := exec.Command(nodeBinary(t), "-url", ep.URL, "-bucket", ep.Bucket, "-prefix", ep.Prefix, "-cache", cache)
+	cmd := exec.Command(nodeBinary(t), "-url", ep.URL, "-bucket", ep.Bucket, "-prefix", ep.Prefix, "-cache", cache,
+		"-commit-timeout", "1s")
 	cmd.Env = append(os.Environ(), "AWS_ACCESS_KEY_ID="+ep.AccessKey, "AWS_SECRET_ACCESS_KEY="+ep.SecretKey,
 		"GARDEN_FAILPOINT="+failpoint)
 	cmd.Stderr = os.Stderr
@@ -174,13 +181,51 @@ type tally struct{ killed, acked, unknown, replayed int }
 func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) (tl tally) {
 	t.Helper()
 	cache := t.TempDir()
+	mode, k, _ := strings.Cut(failpoint, ":")
+	armAt, _ := strconv.Atoi(k)
+	var px *storetest.Proxy
+	hold := make(chan struct{})
+	if strings.HasPrefix(mode, "net.") {
+		var err error
+		if px, err = storetest.NewProxy(ep.URL); err != nil {
+			t.Fatal(err)
+		}
+		defer px.Close()
+		defer func() {
+			select {
+			case <-hold:
+			default:
+				close(hold)
+			}
+		}()
+		ep.URL, failpoint = px.URL(), ""
+	}
+	release := func() { close(hold); px.Wait() }
 	p := start(t, ep, cache, failpoint)
 	var ops []*op
 	inc := ""
 	do := func(r Req) bool {
 		o := &op{req: r}
+		if px != nil && len(ops) == armAt {
+			px.SetPlan(func(r storetest.Request) storetest.Fault {
+				switch {
+				case !strings.HasSuffix(r.Path, "/head.json"):
+				case r.Method == "GET":
+					return storetest.Fault{Status: 503, Code: "SlowDown"}
+				case r.Method == "PUT" && mode == "net.lost":
+					return storetest.Fault{Drop: true}
+				case r.Method == "PUT":
+					return storetest.Fault{Hold: hold}
+				}
+				return storetest.Fault{}
+			})
+		}
 		ops = append(ops, o)
 		resp, alive := p.call(t, r)
+		if px != nil && alive && resp.Code == "outcome_unknown" {
+			p.cmd.Process.Kill()
+			alive = false
+		}
 		switch {
 		case !alive:
 			o.outcome = "unknown"
@@ -208,6 +253,12 @@ func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) 
 		t.Logf("%s: definite failure %s: %s", failpoint, last.resp.Code, last.resp.Err)
 	}
 
+	if px != nil {
+		px.SetPlan(nil)
+		if mode == "net.late" && reuse {
+			release()
+		}
+	}
 	// restart with an empty cache; retry every unknown with the same ID and input
 	if !reuse {
 		cache = t.TempDir()
@@ -244,6 +295,14 @@ func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) 
 		} else {
 			committed[r.ID] = true
 		}
+	}
+	if mode == "net.late" && !reuse && inc != "" {
+		release() // the held CAS applies late, after the retry fenced it
+		r := Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: "after-late"}
+		if resp := call(r); !resp.OK {
+			t.Fatalf("%s: add after the late apply: %s %s", failpoint, resp.Code, resp.Err)
+		}
+		committed[r.ID] = true
 	}
 	if inc == "" { // the create definitely failed: nothing may exist
 		resp := call(Req{Op: "create", Key: "k", ID: newID()})

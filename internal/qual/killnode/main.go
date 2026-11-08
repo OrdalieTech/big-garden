@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	garden "github.com/OrdalieTech/big-garden"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
@@ -51,10 +52,12 @@ func main() {
 	flag.StringVar(&ep.Prefix, "prefix", "", "prefix")
 	flag.StringVar(&cache, "cache", "", "cache directory")
 	flag.StringVar(&node, "node", "node", "node ID")
+	commit := flag.Duration("commit-timeout", 0, "Limits.CommitTimeout (0: default)")
 	flag.Parse()
 	ep.Region, ep.AccessKey, ep.SecretKey = "us-east-1", os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	ctx := context.Background()
-	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(nil), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: node, CacheDir: cache})
+	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(nil), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: node, CacheDir: cache,
+		Limits: garden.Limits{CommitTimeout: *commit, StorageAttemptTimeout: min(*commit, 2*time.Second)}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(2)

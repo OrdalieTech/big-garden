@@ -82,6 +82,10 @@ func NewProxy(upstream string) (*Proxy, error) {
 	return p, nil
 }
 
+// URL is the proxy's own endpoint, for a client (e.g. in another process)
+// that signs requests for it directly.
+func (p *Proxy) URL() string { return "http://" + p.ln.Addr().String() }
+
 // Close stops the listener and waits for every forwarded request.
 func (p *Proxy) Close() {
 	p.srv.Close()
