@@ -807,6 +807,7 @@ func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 						m.panic, err = p, errPanic
 					}
 				}()
+				failpoint("sql.member")
 				return m.fn(&Tx{t})
 			}, &cb))
 		switch {
