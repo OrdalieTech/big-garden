@@ -16,6 +16,12 @@
 // and ReceiptRetention is a case parameter; pruning deletes at most one receipt
 // per transaction instead of 1000.
 //
+// Group commit (D18, PROTOCOL §6 Batches) is bounded to two members: a
+// request with More names the queued Update an invocation may take behind it.
+// The leader's process runs the member's admission against the local state
+// that includes the leader's commit, and one candidate carries both (Req = op,
+// More = the committed member); each member's outcome is reported separately.
+//
 // Invariants: every head write is checked as a transition (G1 lineage, G3
 // authority, G5 one effect per ID, G6 genesis and chain, G7 monotonicity, G8
 // no resurrection); every state is checked for G1 (acknowledged effects in the
@@ -180,6 +186,7 @@ type Cand struct {
 	Req        int8 // request index + 1 whose receipt it carries; 0 = none
 	NN         int8
 	Lim        int8 // D12: NN may grow to Lim in the current resolve call
+	More       int8 // D18: the batch member's request index + 1 committed with Req; 0 = none
 	Att        ID   // object it introduces; 0 = none
 	Nonces     [maxNonces]ID
 	Base, Next Head
@@ -204,7 +211,12 @@ type Proc struct {
 	Acked, Resume, Flag      bool
 	Act                      ID // nonce of the head being activated
 	Put, Tk, Loops           int8
-	Seq                      int8 // result sequence of a committed candidate
+	Seq                      int8 // result sequence of a committed candidate (the leader's, D18)
+	Mb                       int8 // D18 batch member request index + 1 (0 = none)
+	MbCode                   uint8
+	MbSeq                    int8
+	Taken, Proof             bool  // member taken into the batch; committed by the leader's receipt (§2 rule 3)
+	Hold                     Image // image the member's held verdict was computed from
 	PendSeq                  int8
 	Pend                     uint8
 	CID, BAtt, Inc           ID
@@ -257,6 +269,7 @@ type Req struct {
 	Tries             int8  // maximum invocations (retries reuse ID and hash)
 	ID, Hash, TS      int8
 	Schema, To, Input int8
+	More              int8 // D18: request index + 1 that may be queued behind this Update (batch of 2)
 }
 
 // Variant selects the correct protocol or one deliberately broken control.
@@ -274,6 +287,7 @@ const (
 	D5NoIdentity
 	RetargetCompaction
 	TailWithoutObject
+	BatchLeaderReceipt
 	numVariants
 )
 
@@ -281,6 +295,7 @@ var variantNames = [...]string{
 	"correct", "unconditional-head-write", "owner-check-then-publish", "cached-strong-read",
 	"premature-ack", "floorless-receipt-pruning", "age-only-gc", "hedge-without-resolve",
 	"d5-resume-without-identity", "compaction-retargeted", "inline-tail-without-object",
+	"batch-ack-on-leader-receipt",
 }
 
 func (v Variant) String() string { return variantNames[v] }

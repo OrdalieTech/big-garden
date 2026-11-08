@@ -22,6 +22,9 @@ const (
 	tLoss                      // A entity: administrative deletion of head.json
 )
 
+// batchBit in an invocation's B: the request's More member is queued behind it (D18).
+const batchBit = 0x80
+
 func deadlinePC(pc uint8) bool {
 	switch pc {
 	case pcPubCheck, pcPubCas, pcResGet, pcResCas, pcResHyd:
@@ -63,6 +66,9 @@ func Enabled(c *Case, s *State, buf []Tr) []Tr {
 			for n := 0; n < c.Nodes; n++ {
 				if q.Nodes&(1<<n) != 0 && s.Procs[n][q.Ent][lane(q.Kind)].Kind == 0 {
 					buf = append(buf, Tr{tInvoke, uint8(r), uint8(n)})
+					if mb := q.More - 1; q.More != 0 && s.Used[mb] < c.Reqs[mb].Tries && c.Reqs[mb].Nodes&(1<<n) != 0 {
+						buf = append(buf, Tr{tInvoke, uint8(r), uint8(n) | batchBit}) // D18: member queued behind it
+					}
 				}
 			}
 		}
@@ -132,10 +138,14 @@ func step(c *Case, v Variant, s *State, t Tr, cov *coverage) (bound uint8, viol 
 	switch t.K {
 	case tInvoke:
 		q := c.Reqs[t.A]
-		n, e, l := int(t.B), int(q.Ent), lane(q.Kind)
+		n, e, l := int(t.B&^batchBit), int(q.Ent), lane(q.Kind)
 		p := &s.Procs[n][e][l]
 		*p = Proc{Kind: q.Kind, Req: int8(t.A)}
 		s.Used[t.A]++
+		if t.B&batchBit != 0 {
+			p.Mb = q.More
+			s.Used[q.More-1]++
+		}
 		if s.Ents[e].HasHead && reportsState(q.Kind) {
 			p.Seen[0], p.NSeen = s.Ents[e].Head.Img, 1
 		}
@@ -256,9 +266,12 @@ func Describe(c *Case, s *State, t Tr) string {
 	switch t.K {
 	case tInvoke:
 		q := c.Reqs[t.A]
-		d := fmt.Sprintf("client invokes r%d %s on n%d (entity %d", t.A, kindNames[q.Kind], t.B, q.Ent)
+		d := fmt.Sprintf("client invokes r%d %s on n%d (entity %d", t.A, kindNames[q.Kind], t.B&^batchBit, q.Ent)
 		if q.ID != 0 {
 			d += fmt.Sprintf(", id %d hash %d ts %d", q.ID, q.Hash, q.TS)
+		}
+		if t.B&batchBit != 0 {
+			d += fmt.Sprintf("; r%d is queued behind it and joins its batch", q.More-1)
 		}
 		return d + ")"
 	case tApply, tDeliver, tDrop:

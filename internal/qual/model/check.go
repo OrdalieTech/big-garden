@@ -9,6 +9,9 @@ import (
 func (x *px) finish(o out) {
 	x.fin = [2]uint8{x.r.Kind, o.code}
 	x.report(o)
+	if x.p.Mb != 0 {
+		x.member(o)
+	}
 	for _, w := range x.p.W {
 		if w != 0 {
 			x.orphan(int(w - 1))
@@ -34,7 +37,8 @@ func (x *px) report(o out) {
 		if p.Applied {
 			x.fail("definite failure: %s returned %s although its candidate #%d committed", x.name(), codeNames[o.code], p.CID)
 		}
-		if g.NFailed == maxFailed {
+		if failedHas(g, p.CID) { // a D18 batch reports one candidate per member
+		} else if g.NFailed == maxFailed {
 			x.bound(boundFailed)
 		} else {
 			g.Failed[g.NFailed] = p.CID
@@ -89,6 +93,66 @@ func (x *px) report(o out) {
 			x.fail("G4: schema_mismatch on a matching image")
 		}
 	}
+}
+
+func failedHas(g *Ghost, cid ID) bool {
+	for _, f := range g.Failed[:g.NFailed] {
+		if f == cid {
+			return true
+		}
+	}
+	return false
+}
+
+// member delivers the D18 batch member's outcome once the leader's is known
+// (PROTOCOL §6 Batches) and checks it like any client outcome. A member that
+// was never taken (the leader stopped before its local commit) stays queued:
+// its invocation is returned to the pool.
+func (x *px) member(o out) {
+	p := x.p
+	mb := p.Mb - 1
+	if !p.Taken {
+		x.s.Used[mb]--
+		return
+	}
+	r := x.c.Reqs[mb]
+	var m out
+	switch {
+	case p.MbCode != 0: // held verdict
+		switch {
+		case o.code == cOK && !p.Proof:
+			m = out{code: p.MbCode, seq: p.MbSeq, img: p.Hold, hasImg: true}
+		case o.code == cUnknown:
+			m = out{code: cUnknown}
+		default:
+			m = out{code: cUnavailable}
+		}
+	case o.code == cOK && p.Proof && x.v != BatchLeaderReceipt: // own receipt in the current image
+		img := p.Cur.Img
+		switch i := receipt(&img, x.c.Reqs, r.ID); {
+		case i >= 0 && img.Ops[i] == mb+1:
+			m = out{code: cOK, seq: i + 1}
+		case i >= 0:
+			m = out{code: cIDConflict, img: img, hasImg: true, def: true}
+		case r.TS <= img.Floor:
+			m = out{code: cUnknown}
+		default:
+			m = out{code: cRouteChanged, def: true}
+		}
+	case o.code == cOK:
+		m = out{code: cOK, seq: p.Seq + 1}
+	case o.code == cIDConflict:
+		m = out{code: cUnavailable, def: true}
+	default:
+		m = out{code: o.code, def: o.def}
+	}
+	if m.code == cOK && !p.Proof && !p.Applied && !p.Acked {
+		x.fail("D18: batch member r%d acknowledged although its publication #%d never committed", mb, p.CID)
+	}
+	q, lr := p.Req, x.r
+	p.Req, x.r = mb, r
+	x.report(m)
+	p.Req, x.r = q, lr
 }
 
 // ack records a successful mutation result (G1, G5).

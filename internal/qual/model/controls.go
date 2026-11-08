@@ -12,6 +12,8 @@ func controlCase(v Variant) *Case {
 		return caseC0()
 	case TailWithoutObject:
 		return caseCD()
+	case BatchLeaderReceipt:
+		return caseB()
 	}
 	return caseP()
 }

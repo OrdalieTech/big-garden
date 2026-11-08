@@ -263,7 +263,7 @@ func (x *px) run(ev, res uint8) {
 	case pcPubCas, pcResCas:
 		c := &x.m.C
 		if ev == evReply && res == rOK {
-			x.commit(c.Next, c.Next.Img.Seq)
+			x.commit(c.Next, opSeq(c))
 			return
 		}
 		if p.PC == pcPubCas && ev == evReply && res == rPreFailed && x.v == HedgeNoResolve {
@@ -285,7 +285,8 @@ func (x *px) run(ev, res uint8) {
 		x.m.HasH, x.m.H, x.m.HasImg, x.m.Img = true, cur, true, cur.Img
 		i := receipt(&cur.Img, x.c.Reqs, x.c.Reqs[c.Req-1].ID)
 		switch {
-		case i >= 0 && cur.Img.Ops[i] == c.Req:
+		case i >= 0 && cur.Img.Ops[i] == c.Req: // a D18 member is then checked by its own receipt
+			x.p.Proof = true
 			x.commit(cur, i+1)
 		case i >= 0:
 			x.resolved()
@@ -711,7 +712,7 @@ func (x *px) settled() bool {
 	switch x.p.Res {
 	case sUnknown:
 		code := cUnavailable
-		if x.m.C.Req == x.p.Req+1 {
+		if x.m.C.Req == x.p.Req+1 || x.m.C.More == x.p.Req+1 { // D18: any member's ID
 			code = cUnknown
 		}
 		x.finish(out{code: code})
@@ -774,7 +775,7 @@ func (x *px) publish(c Cand, ret uint8) {
 	if c.Kind == x.p.Kind {
 		x.p.CID, x.p.Applied = c.Next.Cand, false
 	}
-	x.p.Hedged, x.p.Ret, x.p.Cur = false, ret, Head{}
+	x.p.Hedged, x.p.Ret, x.p.Cur, x.p.Proof = false, ret, Head{}, false
 	if c.Kind != kCompact { // the uploaded object is referenced from the candidate now
 		x.p.O = Obj{}
 	}
@@ -799,7 +800,7 @@ func (x *px) resolveGot(res uint8) {
 	cur := x.p.Cur
 	for i := int8(0); i < c.NN; i++ {
 		if c.Nonces[i] == cur.Nonce {
-			x.commit(cur, c.Next.Img.Seq)
+			x.commit(cur, opSeq(c))
 			return
 		}
 	}
@@ -809,7 +810,7 @@ func (x *px) resolveGot(res uint8) {
 	}
 	switch { // every proposal is dead
 	case c.Att != 0 && refs(&cur, c.Att):
-		x.commit(cur, c.Next.Img.Seq)
+		x.commit(cur, opSeq(c))
 	case c.Req != 0:
 		x.wait(pcResHyd, Msg{Kind: mGetObjs, Head: cur})
 	case c.Kind == kTakeover && x.mine(cur):
@@ -820,6 +821,18 @@ func (x *px) resolveGot(res uint8) {
 		x.dead(cur)
 	}
 }
+
+// opSeq is the sequence of the candidate's own operation (the leader's in a
+// D18 batch, whose member follows it).
+func opSeq(c *Cand) int8 {
+	if c.More != 0 {
+		return c.Next.Img.Seq - 1
+	}
+	return c.Next.Img.Seq
+}
+
+// maxBatch is the model's BatchMax: a publication carries at most two operations.
+const maxBatch = 2
 
 // maxNonces bounds the proposals of one candidate in the model: the three of
 // its publication and two from each of up to two later resolve calls.
@@ -878,34 +891,26 @@ func (x *px) release(base Head) {
 	x.publish(Cand{Kind: kRelease, Base: base, Next: next}, pcRelDone)
 }
 
-// admit is PROTOCOL §6 steps 3-9 on the owned, activated image.
-func (x *px) admit() {
-	p, r := x.p, x.r
-	img := x.m.Img
-	var code uint8
-	var seq int8
+// verdict is PROTOCOL §6 step 3 (state part) and the callback's rejection on img.
+func (x *px) verdict(img *Image, r Req, req int8) (code uint8, seq int8) {
 	if r.TS <= img.Floor {
-		code = cIDExpired
-	} else if i := receipt(&img, x.c.Reqs, r.ID); i >= 0 {
-		code, seq = cIDConflict, 0
-		if img.Ops[i] == p.Req+1 {
-			code, seq = cReplayed, i+1
+		return cIDExpired, 0
+	} else if i := receipt(img, x.c.Reqs, r.ID); i >= 0 {
+		if img.Ops[i] == req+1 {
+			return cReplayed, i + 1
 		}
+		return cIDConflict, 0
 	} else if img.Schema != r.Schema {
-		code = cSchemaMismatch
-	} else if fails(&img, r) {
-		code = cCallback
+		return cSchemaMismatch, 0
+	} else if fails(img, r) {
+		return cCallback, 0
 	}
-	if code != 0 { // state-dependent answer: barrier first
-		p.Pend, p.PendSeq = code, seq
-		x.getHead(pcUpdBarrier)
-		return
-	}
-	if img.Seq == maxOps {
-		x.bound(boundOps)
-		return
-	}
-	ni := img
+	return 0, 0
+}
+
+// local is §6 step 5: raise the floor, prune at most one receipt, insert the
+// receipt and advance the sequence.
+func (x *px) local(ni *Image, r Req, req int8) {
 	bound := x.clock() - x.c.Retention
 	if x.v != FloorlessPrune {
 		if bound > ni.Floor {
@@ -919,15 +924,45 @@ func (x *px) admit() {
 			break
 		}
 	}
-	ni.Ops[ni.Seq] = p.Req + 1
+	ni.Ops[ni.Seq] = req + 1
 	ni.Kept |= 1 << ni.Seq
 	ni.Seq++
 	if r.Kind == kMigrate {
 		ni.Schema = r.To
 	}
+}
+
+// admit is PROTOCOL §6 steps 3-9 on the owned, activated image, with the D18
+// member (if one is queued) admitted against the leader's unpublished commit.
+func (x *px) admit() {
+	p, r := x.p, x.r
+	img := x.m.Img
+	if code, seq := x.verdict(&img, r, p.Req); code != 0 { // state-dependent answer: barrier first
+		p.Pend, p.PendSeq = code, seq
+		x.getHead(pcUpdBarrier)
+		return
+	}
+	if img.Seq+1+min(p.Mb, 1) > maxOps { // ledger room for the leader and its member
+		x.bound(boundOps)
+		return
+	}
+	ni := img
+	x.local(&ni, r, p.Req)
+	if p.Mb != 0 { // D18: take the queued member
+		mb := p.Mb - 1
+		mr := x.c.Reqs[mb]
+		p.Taken, p.Proof, p.Hold = true, false, ni
+		p.MbCode, p.MbSeq = x.verdict(&ni, mr, mb)
+		if mr.TS <= x.clock()-x.c.Retention {
+			p.MbCode, p.MbSeq = cIDExpired, 0
+		}
+		if p.MbCode == 0 {
+			x.local(&ni, mr, mb)
+		}
+	}
 	x.m.Img = ni
 	if x.v == PrematureAck {
-		x.report(out{code: cOK, seq: ni.Seq})
+		x.report(out{code: cOK, seq: img.Seq + 1})
 		p.Acked = true
 	}
 	h := x.m.H
@@ -948,7 +983,7 @@ func (x *px) admit() {
 
 // tailOf is compact(H.tail, delta) for the mutation producing ni (D16).
 func tailOf(h *Head, ni *Image) Tail {
-	t := Tail{Min: ni.Seq, Max: ni.Seq, Pre: h.Img, Post: *ni}
+	t := Tail{Min: h.Img.Seq + 1, Max: ni.Seq, Pre: h.Img, Post: *ni}
 	if h.Tail.Max != 0 {
 		t.Min, t.Pre = h.Tail.Min, h.Tail.Pre
 	}
@@ -974,6 +1009,9 @@ func (x *px) publishUpdate(inline bool) {
 	next.Nonce = x.fresh()
 	next.Img = x.m.Img
 	c := Cand{Kind: p.Kind, Req: p.Req + 1, Base: h}
+	if p.Taken && p.MbCode == 0 {
+		c.More = p.Mb
+	}
 	switch {
 	case inline:
 		next.Tail = tailOf(&h, &x.m.Img)
