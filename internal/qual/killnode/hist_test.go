@@ -35,6 +35,7 @@ type hop struct {
 	Seq                uint64
 	Replayed           bool
 	Ambiguous          bool // an earlier attempt timed out, died or answered outcome_unknown
+	Late               bool // the reply to a timed-out attempt
 	IDs                []string
 	Start, End         int64 // monotonic ns since the history began; End is math.MaxInt64 when unknown
 }
@@ -50,6 +51,7 @@ type attempt struct {
 // history lives in the parent process, outside every node.
 type history struct {
 	mu       sync.Mutex
+	late     sync.WaitGroup // late replies still awaited
 	t0       time.Time
 	Ops      []hop
 	Attempts []attempt
@@ -115,12 +117,36 @@ func (c *rclient) attempt(name string, r Req) (Resp, bool) {
 	var resp Resp
 	ok := false
 	if m := c.cl.get(name); m != nil {
-		resp, ok = m.do(r, routeTimeout)
+		if ch := m.send(r); ch != nil {
+			select {
+			case resp, ok = <-ch:
+			case <-time.After(routeTimeout):
+				c.late(name, r, start, ch)
+			}
+		}
 	}
 	c.h.mu.Lock()
 	c.h.Attempts = append(c.h.Attempts, attempt{c.id, r.Op, r.Key, r.ID, name, resp.Code, resp.OK, ok, start, c.h.now()})
 	c.h.mu.Unlock()
 	return resp, ok
+}
+
+// late records the reply to a timed-out attempt if one still arrives (a
+// stopped node answers after SIGCONT): an acknowledged add or strong read is
+// an observation over [attempt start, arrival] like any other, and goes into
+// the checked history as its own operation.
+func (c *rclient) late(name string, r Req, start int64, ch chan Resp) {
+	if r.Op != "add" && r.Op != "read" {
+		return
+	}
+	c.h.late.Go(func() {
+		resp, ok := <-ch
+		if !ok || !resp.OK {
+			return
+		}
+		c.record(hop{Client: 100 + c.id, Op: r.Op, Key: r.Key, ID: r.ID, Input: r.Input, Class: "ack", Node: name, Value: resp.Value,
+			Seq: resp.Seq, Replayed: resp.Replayed, Late: true, IDs: resp.IDs, Start: start, End: c.h.now()})
+	})
 }
 
 // pick is the Preferred node among believed-available members.
@@ -337,13 +363,13 @@ func TestRoutedHistories(t *testing.T) {
 			return
 		}
 	}
-	t.Logf("%d runs: %d histories checked linearizable (0 inconclusive), %d-%d ops each (%d total: %d acked adds (%d replayed, %d after an ambiguous attempt), %d unknown adds, %d failed adds, %d reads); %d stale-read mutations rejected (%d histories without a candidate read); %d attempts: %d unanswered, %d not_owner/route_changed followed, %d client takeovers (%d won); faults: %v",
-		runs, st.histories, st.minOps, st.maxOps, st.ops, st.acked, st.replayed, st.ambiguous, st.unknown, st.failed, st.reads, st.controls, st.noControl, st.attempts, st.timeouts, st.redirects, st.takeovers, st.takeoversWon, st.faults)
+	t.Logf("%d runs: %d histories checked linearizable (0 inconclusive), %d-%d ops each (%d total: %d acked adds (%d replayed, %d after an ambiguous attempt), %d unknown adds, %d failed adds, %d reads); %d stale-read mutations rejected (%d histories without a candidate read); %d attempts: %d unanswered, %d not_owner/route_changed followed, %d client takeovers (%d won); %d late replies checked (%d strong reads); faults: %v",
+		runs, st.histories, st.minOps, st.maxOps, st.ops, st.acked, st.replayed, st.ambiguous, st.unknown, st.failed, st.reads, st.controls, st.noControl, st.attempts, st.timeouts, st.redirects, st.takeovers, st.takeoversWon, st.late, st.lateReads, st.faults)
 }
 
 type histStats struct {
 	histories, minOps, maxOps, ops, acked, replayed, ambiguous, unknown, failed, reads, controls, noControl int
-	attempts, timeouts, redirects, takeovers, takeoversWon                                                  int
+	attempts, timeouts, redirects, takeovers, takeoversWon, late, lateReads                                 int
 	faults                                                                                                  map[string]int
 }
 
@@ -391,6 +417,7 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 	cwg.Wait()
 	close(done)
 	wg.Wait()
+	h.late.Wait() // every node runs again (or is dead): pending replies arrive
 
 	// stable connectivity: every unknown add is retried with its ID and must
 	// be acknowledged (an exact replay or its single commit); then one strong
@@ -410,6 +437,15 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 			t.Errorf("final read of %s: %+v", k, r)
 		} else {
 			c.record(r)
+		}
+	}
+	h.late.Wait()
+	for _, o := range h.Ops {
+		if o.Late {
+			st.late++
+			if o.Op == "read" {
+				st.lateReads++
+			}
 		}
 	}
 	dump := func(why string) {
