@@ -63,11 +63,12 @@ func rtreeShadow(name string) bool {
 	return strings.HasSuffix(n, "_node") || strings.HasSuffix(n, "_rowid") || strings.HasSuffix(n, "_parent")
 }
 
-// reserved reports whether name is a library-owned object or a virtual table
-// exposing raw pages.
+// reserved reports whether name is a library-owned object (with the index
+// name REINDEX passes for a library table's key) or a virtual table exposing
+// raw pages.
 func reserved(name string) bool {
 	n := strings.ToLower(name)
-	return strings.HasPrefix(n, "_state_") || n == "sqlite_dbpage" || n == "dbstat"
+	return strings.HasPrefix(n, "_state_") || strings.HasPrefix(n, "sqlite_autoindex__state_") || n == "sqlite_dbpage" || n == "dbstat"
 }
 
 // policy is the authorizer of mode m. Application modes allow an explicit
@@ -89,6 +90,9 @@ func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 		tempSchema := db == "temp" && arg1 == "sqlite_temp_master" && (a == sqlite.AuthRead || a == sqlite.AuthUpdate)
 		if a == sqlite.AuthAlterTable { // arg1 is the database; DROP COLUMN passes the column as db
 			db = arg1
+		}
+		if a == sqlite.AuthReindex && reserved(arg1) { // arg1 is the index: skip it, so a bare REINDEX still runs
+			return sqlite.AuthorizerIgnore
 		}
 		if (db != "" && db != "main" && !tempSchema) || reserved(arg1) {
 			return sqlite.AuthorizerDeny

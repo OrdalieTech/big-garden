@@ -33,7 +33,7 @@ entities/<h[0:2]>/<h>/objects/<inc-32hex>/<base-revision-16hex>/<attempt-32hex>/
 - Checksums: `database_checksum` = `ltx.ChecksumReader` over the whole image (flag bit 63 set). Ordinary mutations update it incrementally: XOR out `ChecksumPage(p, old)` for every changed or truncated page, XOR in `ChecksumPage(p, new)` for every final page.
 - Request binding (PLAN §8.3): `bound = SHA-256("state-request-v1\x00" || kind || u32be(from) || u32be(to) || Request.Hash)`, kind 1 create, 2 update, 3 migrate, 4 import; `from = to = Request.Schema` except migrate.
 
-Reserved SQLite tables (part of format 1; the authorizer denies application access, including triggers or indexes whose table is reserved):
+Reserved SQLite tables (part of format 1; the authorizer denies application access, including triggers or indexes whose table is reserved; `REINDEX` skips their key index `sqlite_autoindex__state_*`):
 
 ```sql
 CREATE TABLE _state_meta(format INTEGER NOT NULL, namespace BLOB NOT NULL, key TEXT NOT NULL,

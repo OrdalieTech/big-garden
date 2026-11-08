@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"modernc.org/sqlite"
 )
 
 // TestAuthorizerBypass tries to reach library state, transaction control,
@@ -82,6 +84,16 @@ func TestAuthorizerBypass(t *testing.T) {
 			ok++
 		}
 	}
+	// REINDEX names a library table's key index sqlite_autoindex__state_*:
+	// skipped (a bare REINDEX stays usable), never rebuilt.
+	for _, idx := range []string{"sqlite_autoindex__state_receipts_1", "SQLITE_AUTOINDEX__STATE_META_1", "_state_i"} {
+		if got := policy(mutation, nil)(sqlite.AuthReindex, idx, "", "main", ""); got != sqlite.AuthorizerIgnore {
+			t.Errorf("REINDEX %s: %d", idx, got)
+		}
+	}
+	f.mutate(t, "REINDEX _state_receipts; REINDEX sqlite_autoindex__state_receipts_1")
+	ok++
+
 	// Triggers and views that reach reserved tables are refused when created
 	// or when they would run. The triggers are dropped again, the views kept.
 	for _, p := range [][2]string{
