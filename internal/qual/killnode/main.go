@@ -81,8 +81,9 @@ func main() {
 	flag.Parse()
 	ep.Region, ep.AccessKey, ep.SecretKey = "us-east-1", os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	ctx := context.Background()
+	batch, _ := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")) // Limits.BatchMax (unset: 1)
 	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(nil), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: node, CacheDir: cache,
-		Limits: garden.Limits{CommitTimeout: *commit, StorageAttemptTimeout: min(*commit, 2*time.Second)}})
+		Limits: garden.Limits{CommitTimeout: *commit, StorageAttemptTimeout: min(*commit, 2*time.Second), BatchMax: batch}})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(2)

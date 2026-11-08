@@ -36,6 +36,10 @@ func stress(args []string) error {
 	workers := fs.Int("workers", 8, "concurrent clients of the concurrent phase (one entity each)")
 	cold := fs.Int("cold", 5, "cold activations per size")
 	out := fs.String("out", "", "directory for stress.json")
+	hot := fs.String("hot", "", "comma-separated client counts of hot-entity phases (all on one entity, 1 KiB inline updates)")
+	hotOnly := fs.Bool("hot-only", false, "run only the create and hot-entity phases")
+	delay := fs.Duration("delay", 0, "hold every S3 reply this long before relaying it (injected latency)")
+	batch := fs.Int("batch", 1, "Limits.BatchMax")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -54,18 +58,19 @@ func stress(args []string) error {
 	}
 	ep = ep.Sub("stress")
 	ctx := context.Background()
-	wire := &wire{base: http.DefaultTransport.(*http.Transport).Clone(), inflight: map[string]int{}}
+	wire := &wire{base: http.DefaultTransport.(*http.Transport).Clone(), inflight: map[string]int{}, delay: *delay}
 	dir, err := os.MkdirTemp("", "stress-cache-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(&http.Client{Transport: wire}), Bucket: ep.Bucket,
-		Prefix: ep.Prefix, NodeID: "stress", CacheDir: dir, Limits: garden.Limits{EntityBytes: 32 << 20, CacheBytes: 2 << 30}})
+		Prefix: ep.Prefix, NodeID: "stress", CacheDir: dir, Limits: garden.Limits{EntityBytes: 32 << 20, CacheBytes: 2 << 30, BatchMax: *batch}})
 	if err != nil {
 		return err
 	}
-	rep := stressReport{Endpoint: ep.URL, Prefix: ep.Prefix, Started: time.Now().UTC(), Ops: *ops, Workers: *workers}
+	rep := stressReport{Endpoint: ep.URL, Prefix: ep.Prefix, Started: time.Now().UTC(), Ops: *ops, Workers: *workers,
+		Delay: delay.String(), BatchMax: *batch}
 	defer func() {
 		cerr := n.Close(ctx)
 		k, err := cleanup(ctx, store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, time.Minute))
@@ -81,7 +86,20 @@ func stress(args []string) error {
 		})
 		return err
 	})
+	if *hot != "" {
+		hotRef := refs[0]
+		for _, f := range strings.Split(*hot, ",") {
+			c, err := strconv.Atoi(f)
+			if err != nil || c < 1 {
+				return fmt.Errorf("bad -hot entry %q", f)
+			}
+			rep.phase(fmt.Sprintf("hot-%d", c), wire, n, *ops, c, func(i int) error { return update(ctx, n, hotRef, i%64, 1<<10) })
+		}
+	}
 	small := func(i int) error { return update(ctx, n, refs[i%len(refs)], i%64, 1<<10) }
+	if *hotOnly {
+		goto done
+	}
 	rep.phase("inline-seq", wire, n, *ops, 1, func(i int) error { return update(ctx, n, refs[0], i%64, 1<<10) })
 	rep.phase("inline-conc", wire, n, *ops, *workers, small)
 	rep.phase("upload-seq", wire, n, *ops/4, 1, func(i int) error { return update(ctx, n, refs[0], 1000+i%8, 48<<10) })
@@ -109,12 +127,13 @@ func stress(args []string) error {
 			return read(ctx, n, ref)
 		})
 	}
+done:
 	rep.Finished = time.Now().UTC()
 	st := n.Stats()
 	rep.Stats = &st
 	for _, p := range rep.Phases {
-		fmt.Printf("%-12s n=%-4d p50=%-8s p95=%-8s p99=%-8s max=%-8s err=%d unknown=%d req=%v up=%dB hedges=%d\n",
-			p.Name, p.N, p.P50, p.P95, p.P99, p.Max, p.Errors, p.Unknown, p.Requests, p.Uploaded, p.Hedges)
+		fmt.Printf("%-12s n=%-4d %7.1f/s p50=%-8s p95=%-8s p99=%-8s max=%-8s err=%d unknown=%d req=%v up=%dB hedges=%d batches=%v\n",
+			p.Name, p.N, p.PerSecond, p.P50, p.P95, p.P99, p.Max, p.Errors, p.Unknown, p.Requests, p.Uploaded, p.Hedges, p.Batches)
 	}
 	if *out != "" {
 		if err := os.MkdirAll(*out, 0o755); err != nil {
@@ -168,6 +187,8 @@ type stressReport struct {
 	Endpoint, Prefix  string
 	Started, Finished time.Time
 	Ops, Workers      int
+	Delay             string
+	BatchMax          int
 	Phases            []phase
 	Stats             *garden.Stats
 }
@@ -183,12 +204,14 @@ type phase struct {
 	Uploaded                 int64          // request body bytes (decoded) during the phase
 	Hedges                   int            // head CAS requests repeating an earlier (key, condition)
 	Commits, Snapshots, Comp uint64
+	PerSecond                float64        // successful operations per second of wall time
+	Batches                  map[int]uint64 // committed mutation publications by member count
 }
 
 // phase runs f(0..n-1) on workers goroutines and records latency, outcomes
 // and the wire and library counter deltas.
 func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers int, f func(int) error) {
-	before, s0 := w.snapshot(), node.Stats()
+	before, s0, start := w.snapshot(), node.Stats(), time.Now()
 	durs := make([]time.Duration, n)
 	errs := make([]error, n)
 	next := make(chan int)
@@ -207,6 +230,7 @@ func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers
 	}
 	close(next)
 	wg.Wait()
+	wall := time.Since(start)
 	after, s1 := w.snapshot(), node.Stats()
 	p := phase{Name: name, N: n, Workers: workers, Requests: map[string]int{}, ErrorCodes: map[string]int{},
 		Uploaded: after.uploaded - before.uploaded, Hedges: after.hedges - before.hedges,
@@ -233,6 +257,13 @@ func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers
 			p.Unknown++
 		}
 	}
+	p.PerSecond = float64(n-p.Errors) / wall.Seconds()
+	p.Batches = map[int]uint64{}
+	for i := range s1.Batches {
+		if d := s1.Batches[i] - s0.Batches[i]; d > 0 {
+			p.Batches[i+1] = d
+		}
+	}
 	slices.Sort(durs)
 	q := func(x float64) string {
 		return durs[min(n-1, int(x*float64(n)))].Round(100 * time.Microsecond).String()
@@ -251,6 +282,7 @@ type wire struct {
 	mu       sync.Mutex
 	c        wireCounts
 	inflight map[string]int // head key + condition of head CAS requests awaiting a reply
+	delay    time.Duration  // held after every reply, like storetest.Fault.Delay
 }
 
 type wireCounts struct {
@@ -303,6 +335,9 @@ func (w *wire) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	w.mu.Unlock()
 	resp, err := w.base.RoundTrip(r)
+	if w.delay > 0 {
+		time.Sleep(w.delay)
+	}
 	if k != "" {
 		w.mu.Lock()
 		w.inflight[k]--

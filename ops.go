@@ -57,7 +57,7 @@ func binding(kind byte, from, to uint32, hash [32]byte) head.Digest {
 // unresolved, the same operation ID (or every caller, for a nil id) gets
 // outcome_unknown and others unavailable; a mutation whose ctx ends while
 // queued gets outcome_unknown, since the candidate may be its own.
-func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, error) {
+func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter) (*entity, error) {
 	e, err := n.entity(key)
 	if err != nil {
 		return nil, err
@@ -67,7 +67,16 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, 
 		n.drop(e)
 		return nil, newError(CodeCapacity, "too many operations queued on the entity", nil)
 	}
-	err = e.mu.lock(ctx)
+	served, err := n.wait(ctx, e, m)
+	if served { // the leader that took m counted it out of waiting
+		n.drop(e)
+		select {
+		case <-m.done:
+			return nil, errServed
+		default: // a batch runs m: it may commit
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: *id, Message: "deadline while in a batch", cause: err}
+		}
+	}
 	e.waiting.Add(-1)
 	if err != nil {
 		n.drop(e)
@@ -89,6 +98,9 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID) (*entity, 
 			n.leave(e)
 			if id == nil || (c.op != nil && *c.op == head.OpID(*id)) {
 				return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "earlier attempt still unresolved"}
+			}
+			if slices.Contains(c.more, head.OpID(*id)) {
+				return nil, &Error{Code: CodeOutcomeUnknown, Operation: *id, Message: "earlier attempt still unresolved"}
 			}
 			return nil, newError(CodeUnavailable, "an earlier publication is unresolved", nil)
 		}
@@ -228,7 +240,7 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ctx, ref.Key, &MutationID{})
+	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil)
 	if err != nil {
 		return Result{}, err
 	}
@@ -253,7 +265,7 @@ func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, 
 	if err := head.ValidKey(ref.Key); err != nil {
 		return Result{}, invalid(err.Error())
 	}
-	e, err := n.enter(ctx, ref.Key, &id)
+	e, err := n.enter(ctx, ref.Key, &id, nil)
 	if err != nil {
 		return Result{}, err
 	}
@@ -323,7 +335,7 @@ type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
 // create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
 func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (ref Ref, res Result, err error) {
 	defer func() { n.observe(key, false, res, err) }()
-	e, err := n.enter(ctx, key, &req.ID)
+	e, err := n.enter(ctx, key, &req.ID, nil)
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -537,7 +549,17 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		return Result{}, err
 	}
 	bound := binding(kind, req.Schema, to, req.Hash)
-	e, err := n.enter(ctx, ref.Key, &req.ID)
+	var m *waiter
+	if kind == 2 && n.cfg.Limits.BatchMax > 1 {
+		m = &waiter{ctx: ctx, req: req, bound: bound, fn: fn, done: make(chan struct{})}
+	}
+	e, err := n.enter(ctx, ref.Key, &req.ID, m)
+	if err == errServed {
+		if m.panic != nil {
+			panic(m.panic)
+		}
+		return m.res, m.err
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -578,7 +600,16 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 			return Result{}, verdict
 		}
 		failpoint("sql.after")
-		return n.publishUpdate(ctx, e, req, bound, to, result, seq)
+		var batch []*waiter
+		if m != nil {
+			if batch, err = n.collect(e); err != nil {
+				e.discard()
+				err = newError(CodeUnavailable, "a batch member failed locally", err)
+				n.deliver(e, batch, nil, err)
+				return Result{}, withOp(err, req.ID)
+			}
+		}
+		return n.publishUpdate(ctx, e, req, bound, to, result, seq, batch)
 	}
 	return Result{}, &Error{Code: CodeRouteChanged, Operation: req.ID, Message: "the head changed twice during the operation"}
 }
@@ -608,9 +639,26 @@ func (n *Node) admit(e *entity, req Request, bound head.Digest) (*Result, error)
 
 // publishUpdate captures and publishes a locally committed mutation
 // (PROTOCOL §6 steps 6–10).
-func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound head.Digest, schema uint32, result []byte, seq uint64) (Result, error) {
-	h, op := e.h, head.OpID(req.ID)
-	fail := func(err error) (Result, error) { e.discard(); return Result{}, withOp(err, req.ID) }
+func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound head.Digest, schema uint32, result []byte, seq uint64,
+	batch []*waiter) (Result, error) {
+	h, op, last := e.h, head.OpID(req.ID), seq
+	c := &candidate{base: h, baseETag: e.etag, op: &op, bound: bound}
+	for _, m := range batch {
+		if m.commit {
+			last, c.more = m.res.Version.Sequence, append(c.more, head.OpID(m.req.ID))
+		}
+	}
+	if len(c.more) > 0 { // the shortest member's deadline must not abort the others (PLAN §6.5)
+		var cancel context.CancelFunc
+		ctx, cancel = n.commitContext()
+		defer cancel()
+	}
+	fail := func(err error) (Result, error) {
+		e.discard()
+		err = withOp(err, req.ID)
+		n.deliver(e, batch, nil, err)
+		return Result{}, err
+	}
 	var buf bytes.Buffer
 	delta, err := e.db.Delta(&buf)
 	if err != nil {
@@ -618,9 +666,8 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 	}
 	failpoint("capture")
 	next := *h
-	next.Revision, next.Nonce, next.Sequence, next.Schema = h.Revision+1, head.NewID(), seq, schema
+	next.Revision, next.Nonce, next.Sequence, next.Schema = h.Revision+1, head.NewID(), last, schema
 	next.PageCount, next.DatabaseChecksum = delta.PageCount, delta.Ref.PostChecksum
-	c := &candidate{base: h, baseETag: e.etag, op: &op, bound: bound}
 	if len(h.Deltas) == head.MaxDeltas || e.replay()+uint64(delta.Pages) > 2*uint64(delta.PageCount)+256 {
 		buf.Reset() // snapshot on cap (§6 step 7)
 		snap, err := e.db.Snapshot(&buf)
@@ -661,6 +708,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 	}
 	c.next = next
 	rec, err := n.publish(e, c)
+	n.deliver(e, batch, rec, err)
 	if err != nil {
 		return Result{}, withOp(err, req.ID)
 	}
@@ -669,4 +717,152 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		return Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
 	}
 	return Result{Value: result, Version: Version{h.Incarnation, seq}}, nil
+}
+
+// waiter is an Update queued on a busy entity that a batch may take
+// (PROTOCOL §6 Batches). The batch leader sets taken under entity.qmu, runs
+// the callback, and closes done once res, err (or panic) are final.
+type waiter struct {
+	ctx    context.Context
+	req    Request
+	bound  head.Digest
+	fn     func(*Tx) ([]byte, error)
+	taken  bool
+	commit bool // its transaction committed locally: it is in the publication
+	done   chan struct{}
+	res    Result
+	err    error
+	panic  any
+}
+
+var (
+	errServed = errors.New("garden: served by a batch")
+	errPanic  = errors.New("garden: callback panicked")
+)
+
+// wait locks e.mu within ctx. With m, a batch leader may take m instead:
+// served then reports that m's outcome is (or will be) set by the leader.
+func (n *Node) wait(ctx context.Context, e *entity, m *waiter) (served bool, err error) {
+	if m == nil {
+		return false, e.mu.lock(ctx)
+	}
+	e.qmu.Lock()
+	e.queue = append(e.queue, m)
+	e.qmu.Unlock()
+	locked := false
+	select {
+	case e.mu <- struct{}{}:
+		locked = true
+	case <-m.done:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	e.qmu.Lock()
+	defer e.qmu.Unlock()
+	if m.taken {
+		if locked { // the leader released mu only after closing done
+			e.mu.Unlock()
+		}
+		return true, err
+	}
+	e.queue = slices.DeleteFunc(e.queue, func(x *waiter) bool { return x == m })
+	return false, err
+}
+
+// collect runs, after the leader's own transaction, the transactions of the
+// Updates queued on e in FIFO order, up to BatchMax members in all and only
+// while no other operation waits (PLAN §6.5: never pass a queued read,
+// migration or release). Each member keeps its outcome until the
+// publication resolves; an error means a library failure: discard all.
+func (n *Node) collect(e *entity) (batch []*waiter, err error) {
+	for len(batch)+1 < n.cfg.Limits.BatchMax {
+		var m *waiter
+		e.qmu.Lock()
+		if len(e.queue) > 0 && e.waiting.Load() <= int64(len(e.queue)) {
+			m, e.queue = e.queue[0], e.queue[1:]
+			m.taken = true
+			e.waiting.Add(-1)
+		}
+		e.qmu.Unlock()
+		if m == nil {
+			return batch, nil
+		}
+		batch = append(batch, m)
+		if m.err = m.ctx.Err(); m.err != nil { // its caller already got outcome_unknown
+			continue
+		}
+		if m.err = n.checkClock(m.req); m.err != nil {
+			continue
+		}
+		if res, verdict := n.admit(e, m.req, m.bound); res != nil || verdict != nil {
+			m.res, m.err = *cmp.Or(res, &Result{}), verdict
+			continue
+		}
+		var cb error
+		floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
+		result, seq, err := e.db.Mutate(engine.Commit{ID: head.OpID(m.req.ID), Bound: m.bound, Schema: m.req.Schema, FloorMs: uint64(floor)},
+			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) (r []byte, err error) {
+				defer func() {
+					if p := recover(); p != nil {
+						m.panic, err = p, errPanic
+					}
+				}()
+				return m.fn(&Tx{t})
+			}, &cb))
+		switch {
+		case err == nil:
+			m.res, m.commit = Result{Value: result, Version: Version{e.h.Incarnation, seq}}, true
+		case cb != nil && err == cb: // rolled back alone; held until the publication resolves
+			m.err = callbackError(err, cb)
+		default:
+			return batch, engineError(err)
+		}
+	}
+	return batch, nil
+}
+
+// deliver gives each batch member its outcome once the publication resolved
+// (PROTOCOL §6 Batches). rec non-nil means resolution proved the leader's
+// receipt, perhaps committed by another publication: each member is then
+// checked by its own receipt. Any outcome that observed unpublished state
+// becomes outcome_unknown or unavailable unless the publication committed.
+func (n *Node) deliver(e *entity, batch []*waiter, rec *engine.Receipt, perr error) {
+	var pe *Error
+	errors.As(perr, &pe)
+	for _, m := range batch {
+		id := m.req.ID
+		switch {
+		case perr == nil && rec != nil && m.err == nil:
+			m.res, m.err = n.verify(e, m)
+		case perr == nil && rec == nil:
+		case pe != nil && pe.Code != CodeOutcomeUnknown && m.err == nil && pe.Code != CodeIDConflict:
+			m.res, m.err = Result{}, &Error{Code: pe.Code, Operation: id, Route: pe.Route, Message: pe.Message, cause: perr}
+		case perr == nil || (pe != nil && pe.Code != CodeOutcomeUnknown):
+			m.res, m.err = Result{}, &Error{Code: CodeUnavailable, Operation: id, Message: "the batch was not published", cause: cmp.Or(perr, m.err)}
+		default:
+			m.res, m.err = Result{}, &Error{Code: CodeOutcomeUnknown, Operation: id, Message: "batch publication outcome unknown", cause: perr}
+		}
+		close(m.done)
+	}
+}
+
+// verify checks a member by its receipt in e's current image (deliver).
+func (n *Node) verify(e *entity, m *waiter) (Result, error) {
+	id := m.req.ID
+	if e.db == nil {
+		return Result{}, &Error{Code: CodeOutcomeUnknown, Operation: id, Message: "batch member not verified"}
+	}
+	r, ok, err := e.db.Receipt(head.OpID(id))
+	meta, merr := e.db.Meta()
+	switch {
+	case errors.Join(err, merr) != nil:
+		return Result{}, &Error{Code: CodeOutcomeUnknown, Operation: id, Message: "batch member not verified", cause: errors.Join(err, merr)}
+	case ok && r.InputHash == m.bound:
+		return Result{Value: r.Result, Version: Version{e.h.Incarnation, r.Sequence}, Replayed: m.res.Replayed}, nil
+	case ok:
+		return Result{}, &Error{Code: CodeIDConflict, Operation: id, Message: "operation ID used with another input"}
+	case tsOf(id) <= int64(meta.FloorMs):
+		return Result{}, &Error{Code: CodeOutcomeUnknown, Operation: id, Message: "receipt floor passed during publication"}
+	}
+	return Result{}, &Error{Code: CodeRouteChanged, Operation: id, Route: routeOf(e.h), Message: "the batch was not published"}
 }

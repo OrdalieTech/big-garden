@@ -33,6 +33,8 @@ type entity struct {
 	db         *engine.DB
 	unresolved *candidate
 	pages      []uint32
+	qmu        sync.Mutex
+	queue      []*waiter    // Updates waiting on mu that a batch may take (PROTOCOL §6 Batches)
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
 	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
@@ -72,6 +74,7 @@ type candidate struct {
 	nonces   []head.ID
 	object   *head.Ref
 	op       *head.OpID
+	more     []head.OpID // the later members of a batch (PROTOCOL §6 Batches)
 	bound    head.Digest
 	pages    []uint32
 	unsure   bool // some proposal got an answer other than a definite failure (§2 step 5)

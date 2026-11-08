@@ -25,6 +25,7 @@ type Stats struct {
 	ResidentEntities, QueuedRequests, InflightStorage          int64
 	CacheBytes, StagingBytes                                   int64
 	OldestUnresolved                                           time.Duration
+	Batches                                                    [maxBatch]uint64 // committed mutation publications by member count - 1
 	Storage                                                    [4]struct {
 		Attempts, Failures             uint64
 		UploadedBytes, DownloadedBytes uint64
@@ -37,6 +38,7 @@ type counters struct {
 	unknown, ownerChanges, activations, activationFailures, corruptions                        atomic.Uint64
 	snapshots, compactions, collections, collected                                             atomic.Uint64
 	snapshotBytes, compactionIn, compactionOut, collectedBytes                                 atomic.Uint64
+	batches                                                                                    [maxBatch]atomic.Uint64
 }
 
 // observe counts the outcome of one public operation on key, and logs one
@@ -84,6 +86,7 @@ func (n *Node) countCommit(c *candidate) {
 	k := &n.counters
 	if c.op != nil {
 		k.commits.Add(1)
+		k.batches[len(c.more)].Add(1)
 	}
 	switch {
 	case c.object != nil && c.base != nil && c.next.Snapshot.Key == c.object.Key:
@@ -113,6 +116,9 @@ func (n *Node) Stats() Stats {
 		Collections: c.collections.Load(), CollectedObjects: c.collected.Load(), SnapshotBytes: c.snapshotBytes.Load(),
 		CompactionInputBytes: c.compactionIn.Load(), CompactionOutputBytes: c.compactionOut.Load(),
 		CollectedBytes: c.collectedBytes.Load(), StagingBytes: n.staging.Load()}
+	for i := range s.Batches {
+		s.Batches[i] = c.batches[i].Load()
+	}
 	n.mu.Lock()
 	s.CacheBytes = n.reserved
 	for _, e := range n.entities {
