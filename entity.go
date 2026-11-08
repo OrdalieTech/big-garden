@@ -291,10 +291,8 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 		}
 		committed, rec = ok, &r
 	case c.object != nil: // maintenance: committed only if its object is referenced
-	case c.next.Owner != nil: // takeover
-		committed = n.mine(cur)
-	default: // release
-		committed = !n.mine(cur)
+	default: // takeover (owner set) or release (owner null)
+		committed = n.mine(cur) == (c.next.Owner != nil)
 	}
 	if committed {
 		n.settle(e, c, cur, etag)
