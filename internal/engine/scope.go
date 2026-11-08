@@ -104,31 +104,19 @@ func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 		case sqlite.AuthSelect, sqlite.AuthRead, sqlite.AuthRecursive:
 			return sqlite.AuthorizerOK
 		case sqlite.AuthFunction:
-			if !strings.EqualFold(arg2, "load_extension") {
-				return sqlite.AuthorizerOK
-			}
+			return allow(!strings.EqualFold(arg2, "load_extension"))
 		case sqlite.AuthPragma:
-			if introspection[strings.ToLower(arg1)] && !reserved(arg2) || moduleReads[strings.ToLower(arg1)] && arg2 == "" {
-				return sqlite.AuthorizerOK
-			}
+			return allow(introspection[strings.ToLower(arg1)] && !reserved(arg2) || moduleReads[strings.ToLower(arg1)] && arg2 == "")
 		case sqlite.AuthInsert, sqlite.AuthUpdate, sqlite.AuthDelete:
-			if m == mutation || rtreeShadow(arg1) { // read mode runs with query_only=ON
-				return sqlite.AuthorizerOK
-			}
+			return allow(m == mutation || rtreeShadow(arg1)) // read mode runs with query_only=ON
 		case sqlite.AuthCreateTable, sqlite.AuthCreateView,
 			sqlite.AuthDropTable, sqlite.AuthDropView, sqlite.AuthReindex: // CREATE INDEX authorizes a REINDEX
-			if m == mutation {
-				return sqlite.AuthorizerOK
-			}
+			return allow(m == mutation)
 		case sqlite.AuthCreateVTable, sqlite.AuthDropVTable: // arg2 is the module
-			if m == mutation && modules[strings.ToLower(arg2)] {
-				return sqlite.AuthorizerOK
-			}
+			return allow(m == mutation && modules[strings.ToLower(arg2)])
 		case sqlite.AuthCreateIndex, sqlite.AuthCreateTrigger, sqlite.AuthDropIndex, sqlite.AuthDropTrigger,
 			sqlite.AuthAlterTable: // arg2 is the table
-			if m == mutation && !reserved(arg2) {
-				return sqlite.AuthorizerOK
-			}
+			return allow(m == mutation && !reserved(arg2))
 		}
 		return sqlite.AuthorizerDeny
 	}
@@ -157,9 +145,9 @@ func (s *scope) enter() error {
 	return nil
 }
 
-// query runs q, passes the rows to fn, then closes them and reports the
+// Query runs q, passes the rows to fn, then closes them and reports the
 // first of fn's error, the iteration error and the close error.
-func (s *scope) query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) (err error) {
+func (s *scope) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) (err error) {
 	if err := s.enter(); err != nil {
 		return err
 	}
@@ -184,12 +172,6 @@ func (s *scope) query(ctx context.Context, q string, args []any, fn func(*sql.Ro
 // Tx is the scoped SQL handle of a mutation callback.
 type Tx struct{ scope }
 
-// Query runs a statement and hands its rows to fn; the rows are closed when
-// Query returns.
-func (t *Tx) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
-	return t.query(ctx, q, args, fn)
-}
-
 // Exec runs one or more statements, each authorized separately.
 func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
 	if err := t.enter(); err != nil {
@@ -202,8 +184,9 @@ func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error
 // View is the scoped read-only SQL handle of a read callback.
 type View struct{ scope }
 
-// Query runs a read-only statement and hands its rows to fn; the rows are
-// closed when Query returns.
-func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
-	return v.query(ctx, q, args, fn)
+func allow(ok bool) sqlite.AuthorizerReturnCode {
+	if ok {
+		return sqlite.AuthorizerOK
+	}
+	return sqlite.AuthorizerDeny
 }
