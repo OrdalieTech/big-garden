@@ -63,6 +63,11 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 				return Route{}, withRoute(err, routeOf(e.h))
 			}
 		}
+		if !n.mine(e.h) { // activation restarted on a newer head owned by another session
+			r := routeOf(e.h)
+			e.discard()
+			return Route{}, &Error{Code: CodeRouteChanged, Route: r, Message: "the head changed during activation"}
+		}
 		return *routeOf(e.h), nil
 	}
 }

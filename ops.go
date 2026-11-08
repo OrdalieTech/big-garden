@@ -2,6 +2,7 @@ package garden
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -22,15 +23,20 @@ var errResultTooLarge = errors.New("result exceeds Limits.ResultBytes")
 
 func tsOf(id MutationID) int64 { return int64(binary.BigEndian.Uint64(id[:8])) }
 
-// checkRequest validates the shape and clock of a request (PROTOCOL §5 step
-// 1, §6 step 3).
-func (n *Node) checkRequest(key string, req Request) error {
+// checkRequest validates the key and the shape of a request.
+func checkRequest(key string, req Request) error {
 	if err := head.ValidKey(key); err != nil {
 		return invalid(err.Error())
 	}
-	switch now := n.now(); {
-	case req.ID == MutationID{} || req.Hash == [32]byte{} || req.Schema == 0:
+	if req.ID == (MutationID{}) || req.Hash == [32]byte{} || req.Schema == 0 {
 		return invalid("request needs a nonzero ID, hash and schema")
+	}
+	return nil
+}
+
+// checkClock is the clock admission of PROTOCOL §5 step 1 and §6 step 3.
+func (n *Node) checkClock(req Request) error {
+	switch now := n.now(); {
 	case tsOf(req.ID) > now.Add(clockSkew).UnixMilli():
 		return invalid("mutation ID time is in the future")
 	case tsOf(req.ID) <= now.Add(-n.cfg.Limits.ReceiptRetention).UnixMilli():
@@ -269,7 +275,7 @@ func (n *Node) lookup(ctx context.Context, e *entity, ref Ref, id MutationID) (R
 
 // Create makes a new entity at key (PROTOCOL §5).
 func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx) ([]byte, error)) (Ref, Result, error) {
-	if err := n.checkRequest(key, req); err != nil {
+	if err := cmp.Or(checkRequest(key, req), n.checkClock(req)); err != nil {
 		return Ref{}, Result{}, err
 	}
 	bound := binding(1, req.Schema, req.Schema, req.Hash)
@@ -490,7 +496,7 @@ func (n *Node) Migrate(ctx context.Context, ref Ref, req Request, to uint32, fn 
 // mutate is Update (kind 2) and Migrate (kind 3, schema req.Schema -> to).
 func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to uint32, fn func(*Tx) ([]byte, error)) (res Result, err error) {
 	defer func() { n.observe(false, res, err) }()
-	if err := n.checkRequest(ref.Key, req); err != nil {
+	if err := checkRequest(ref.Key, req); err != nil {
 		return Result{}, err
 	}
 	bound := binding(kind, req.Schema, to, req.Hash)
@@ -502,6 +508,9 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 	for redo := 0; redo < 2; redo++ {
 		if err := n.owned(ctx, e, ref, redo > 0); err != nil {
 			return Result{}, withOp(err, req.ID)
+		}
+		if err := n.checkClock(req); err != nil { // admission starts with the clock (§6 step 3)
+			return Result{}, err
 		}
 		res, verdict := n.admit(e, req, bound)
 		var cb error

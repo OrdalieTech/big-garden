@@ -74,7 +74,7 @@ A candidate is `{base *Head (nil for genesis), baseETag, next Head, nonces []ID,
    - else takeover: committed iff `cur.owner == self`; release: done iff `cur.owner != self`.
    - Not committed: discard; `unresolved = nil`; return `not_owner` with `cur`'s Route if `cur.owner != self`, else `route_changed`.
 4. `cur` is still the base (same nonce, or still absent): if `len(c.nonces) < 3`, set `next.nonce = NewID()`, append it, `CAS(encode(next), baseETag)`; `OK` → committed. Back off, loop.
-5. Deadline: return `outcome_unknown`; `e.unresolved` stays set. Every later operation on the entity runs `resolve(e.unresolved)` first; while it stays unresolved, the same operation ID gets `outcome_unknown`, others `unavailable`.
+5. Deadline: return `outcome_unknown`; `e.unresolved` stays set. Any other failure while `e.unresolved` stays set (a head that fails strict decode, hydration for the receipt check failing with `unavailable`, `capacity` or `corrupt`) is also returned as `outcome_unknown`, never as a code that means "not committed"; only rule 1's `state_missing` keeps its own code. Every later operation on the entity runs `resolve(e.unresolved)` first; while it stays unresolved, the same operation ID gets `outcome_unknown`, others `unavailable`.
 
 After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(TRUNCATE)` and verify an empty WAL; on any failure discard (the result stays a success). If `cur` is not our candidate head and differs in sequence or checksum from the local image, discard.
 
@@ -120,7 +120,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 
 1. Validate request; `bound` with kind 2. Lock. Settle `unresolved`.
 2. Owned root: cached `H` owned by self is enough (no GET; a takeover makes the CAS fail). Otherwise `GET head`, strict decode; owned by an earlier session of this NodeID → implicit takeover (D4, §7); owned by another node or unowned → `not_owner` with Route. Activate if needed (§4).
-3. Admission, in order: `ts(ID) > now+5 min` → `invalid_argument`; `ts(ID) ≤ now − ReceiptRetention` → `id_expired`; then, each after a barrier: `ts(ID) ≤ meta.expiry_floor_ms` → `id_expired`; receipt with same bound → return it `Replayed`; other bound → `id_conflict`; `meta.schema ≠ req.Schema` → `schema_mismatch`.
+3. Admission, in order (after the settle of step 1, so a same-ID retry of an unresolved candidate is resolved first): `ts(ID) > now+5 min` → `invalid_argument`; `ts(ID) ≤ now − ReceiptRetention` → `id_expired`; then, each after a barrier: `ts(ID) ≤ meta.expiry_floor_ms` → `id_expired`; receipt with same bound → return it `Replayed`; other bound → `id_conflict`; `meta.schema ≠ req.Schema` → `schema_mismatch`.
 4. Library `BEGIN IMMEDIATE`; mutation mode; `result, err = fn(tx)`; every `Query` finalized. Error → library `ROLLBACK`, barrier, return it unchanged. Result over `ResultBytes` → rollback, `capacity`.
 5. Library: `floor' = max(floor, now_ms − retention_ms)`; delete at most 1000 receipts with `operation_id < u64be(floor'+1)`; insert receipt `(ID, bound, result, seq+1)`; update meta `sequence = seq+1`, `expiry_floor_ms = floor'`; `page_count × 4096 > EntityBytes` → rollback, `capacity`; `COMMIT`. From here until resolution, nothing derived from this state leaves the entity.
 6. Capture (D2): page numbers from WAL frame headers; `PRAGMA page_count`; for each named page ≤ page_count, `SELECT data FROM sqlite_dbpage WHERE pgno=?`; update the checksum incrementally from the old pages in the main file (still the published image). Assert that every page in `(H.page_count, page_count]` was captured (compaction exactness, §1); else discard, `corrupt`.
@@ -144,7 +144,7 @@ Batches (B > 1, M7 only): steps 4–5 per request in FIFO order with consecutive
 4. `owner ≠ observed.owner` or `epoch ≠ observed.epoch` → `route_changed` with the current Route.
 5. `next = cur` with owner self, epoch+1 (data refs, tail, sequence, schema preserved); `publish` with `base = cur`.
 6. Not committed and the current head still has the observed owner and epoch (the incumbent committed more data): retry from 2, at most 3 times. Else `route_changed`.
-7. Activate exactly `next` (§4). Failure → return it with the current Route; ownership stays claimed, the entity stays unavailable until a later activation succeeds.
+7. Activate exactly `next` (§4). Failure → return it with the current Route; ownership stays claimed, the entity stays unavailable until a later activation succeeds. If activation restarted on a newer head (collection race) that this session does not own, discard and return `route_changed` with that head's Route.
 
 Implicit takeover (D4) is steps 5–7 from inside Update/Read/Lookup when `owner.node = NodeID` and `owner.session ≠ session`.
 

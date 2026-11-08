@@ -764,6 +764,46 @@ func TestResolveObjectBranch(t *testing.T) {
 	}
 }
 
+func TestResolveHydrationFailureIsUnknown(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 500 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	hold := make(chan struct{})
+	var state atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		switch {
+		case a.Op == "cas" && a.Key == head.HeadKey("k") && state.CompareAndSwap(0, 1):
+			return storetest.MemFault{LoseReply: true}
+		case a.Op == "get" && a.Key == head.HeadKey("k") && state.CompareAndSwap(1, 2):
+			return storetest.MemFault{Hold: hold}
+		case a.Op == "get" && strings.HasSuffix(a.Key, ".ltx") && state.Load() == 2:
+			return storetest.MemFault{Reject: store.Unknown} // the receipt check cannot hydrate
+		}
+		return storetest.MemFault{}
+	})
+	go func() {
+		for state.Load() != 2 {
+			time.Sleep(time.Millisecond)
+		}
+		stealHead(t, mem, "k")
+		close(hold)
+	}()
+	req := newReq(t, "applied", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2")) // inline, applied, then the head moved on
+	if e := wantCode(t, err, CodeOutcomeUnknown); e.Operation != req.ID {
+		t.Fatalf("operation %x", e.Operation)
+	}
+	state.Store(3)
+	if res, err := n.Update(bg, ref, req, put("b", "2")); err == nil || !strings.Contains(err.Error(), "not_owner") {
+		t.Fatalf("retry after resolution: %+v %v", res, err)
+	}
+	if res, err := testNode(t, mem, "thief-reader", nil).Resolve(bg, "k"); err != nil || res.Owner.NodeID != "thief" {
+		t.Fatal(err)
+	}
+}
+
 // stealHead publishes a takeover of key by another node directly.
 func stealHead(t *testing.T, mem *storetest.Mem, key string) {
 	h, etag := headAt(t, mem, key)
@@ -1070,4 +1110,32 @@ func TestImport(t *testing.T) {
 	if _, ok := other.Peek(head.BirthKey("x")); ok {
 		t.Fatal("a rejected import wrote birth.json")
 	}
+}
+
+func TestConcurrentUpdatesAndReads(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	refs := []Ref{mustCreate(t, n, "p", l), mustCreate(t, n, "q", l)}
+	var wg sync.WaitGroup
+	for g := range 6 {
+		wg.Go(func() {
+			for i := range 15 {
+				ref := refs[(g+i)%2]
+				k, v := fmt.Sprint("g", g, "-", i), randText(16+(i%4)*12000)
+				if _, err := n.Update(bg, ref, newReq(t, k+v, 1), put(k, v)); err != nil {
+					t.Error(err)
+					return
+				}
+				l.ack(ref, k, v)
+				if _, err := n.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil }); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	n.wg.Wait()
+	l.verify(t, mem, "a")
 }

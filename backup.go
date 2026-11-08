@@ -3,6 +3,7 @@ package garden
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -86,7 +87,7 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 // image rebased to (namespace, key, new incarnation) at manifest.sequence+1
 // with the receipts and floor preserved.
 func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader) (Ref, Result, error) {
-	if err := n.checkRequest(key, req); err != nil {
+	if err := cmp.Or(checkRequest(key, req), n.checkClock(req)); err != nil {
 		return Ref{}, Result{}, err
 	}
 	m, snap, err := n.readArchive(r)

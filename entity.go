@@ -139,7 +139,13 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 		n.settle(e, c, &c.next, etag)
 		return nil, nil
 	}
-	return n.resolve(ctx, e, c)
+	rec, err = n.resolve(ctx, e, c)
+	var pe *Error
+	if e.unresolved != nil && errors.As(err, &pe) && pe.Code != CodeOutcomeUnknown && pe.Code != CodeStateMissing {
+		// still possibly committed: nothing but outcome_unknown may describe it (§2 rule 5)
+		err = &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown: " + pe.Message, cause: pe}
+	}
+	return rec, err
 }
 
 // settle records a committed candidate (PROTOCOL §2, after committed): the
