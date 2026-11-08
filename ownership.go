@@ -60,7 +60,10 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 		}
 		if e.db == nil {
 			if err := n.activate(ctx, e, e.h, e.etag); err != nil {
-				return Route{}, withRoute(err, routeOf(e.h))
+				if pe, ok := err.(*Error); ok && pe.Route == nil { // fresh Errors only: never shared
+					pe.Route = routeOf(e.h)
+				}
+				return Route{}, err
 			}
 		}
 		if !n.mine(e.h) { // activation restarted on a newer head owned by another session
@@ -70,13 +73,6 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 		}
 		return *routeOf(e.h), nil
 	}
-}
-
-func withRoute(err error, r *Route) error {
-	if e, ok := err.(*Error); ok && e.Route == nil { // fresh Errors only: never shared
-		e.Route = r
-	}
-	return err
 }
 
 // Release gives up ownership: owner null, epoch+1 (PROTOCOL §7).
