@@ -182,6 +182,12 @@ func (n *Node) entity(key string) (*entity, error) {
 	return e, nil
 }
 
+func (n *Node) isClosed() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.closed
+}
+
 // reserve claims cache bytes for one activation (PROTOCOL §4 step 1).
 func (n *Node) reserve(b int64) bool {
 	n.mu.Lock()

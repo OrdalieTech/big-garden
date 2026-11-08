@@ -509,7 +509,59 @@ func TestSnapshotOnCap(t *testing.T) {
 	if snapshots == 0 {
 		t.Fatal("replay pages never triggered a snapshot")
 	}
+	// a large database reaches the 32-delta cap before the replay bound
+	ref2 := mustCreate(t, n, "wide", l)
+	if _, err := n.Update(bg, ref2, newReq(t, "fill", 1), func(tx *Tx) ([]byte, error) {
+		for i := range 1000 {
+			if _, err := tx.Exec(bg, "INSERT INTO kv VALUES (?, ?)", fmt.Sprint("fill", i), randText(4000)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	capped := false
+	for prev := 1; !capped; {
+		mustPut(t, n, ref2, "blob", randText(40<<10), l)
+		h, _ := headAt(t, mem, "wide")
+		switch {
+		case prev == head.MaxDeltas:
+			if len(h.Deltas) != 0 || h.Snapshot.BaseRevision == 0 {
+				t.Fatalf("write after %d deltas did not snapshot: %d deltas", prev, len(h.Deltas))
+			}
+			capped = true
+		case len(h.Deltas) != prev+1:
+			t.Fatalf("snapshot before the cap at %d deltas", prev)
+		}
+		prev = len(h.Deltas)
+	}
 	l.verify(t, mem, "a")
+}
+
+func TestConcurrentSameCreate(t *testing.T) {
+	mem := storetest.NewMem()
+	nodes := []*Node{testNode(t, mem, "a", nil), testNode(t, mem, "b", nil), testNode(t, mem, "c", nil)}
+	req := newReq(t, "same", 1)
+	refs := make([]Ref, len(nodes))
+	errs := make([]error, len(nodes))
+	var wg sync.WaitGroup
+	for i, n := range nodes {
+		wg.Go(func() { refs[i], _, errs[i] = n.Create(bg, "k", req, createKV) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		var e *Error
+		switch {
+		case err == nil:
+			if refs[i] != refs[0] && errs[0] == nil {
+				t.Fatalf("two incarnations acknowledged: %x %x", refs[i].Incarnation, refs[0].Incarnation)
+			}
+		case errors.As(err, &e) && e.Code == CodeNotOwner: // replay found another node's head
+		default:
+			t.Fatalf("node %d: %v", i, err)
+		}
+	}
 }
 
 func TestIDExpiredByFloor(t *testing.T) {
@@ -666,6 +718,41 @@ func TestResolveBranches(t *testing.T) {
 			t.Fatalf("receipt in the new head must prove the commit: %+v %v", res, err)
 		}
 	})
+}
+
+func TestResolveObjectBranch(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	hold := make(chan struct{})
+	var state atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		switch {
+		case a.Op == "cas" && a.Key == head.HeadKey("k") && state.CompareAndSwap(0, 1):
+			return storetest.MemFault{LoseReply: true}
+		case a.Op == "get" && a.Key == head.HeadKey("k") && state.CompareAndSwap(1, 2):
+			return storetest.MemFault{Hold: hold}
+		}
+		return storetest.MemFault{}
+	})
+	go func() {
+		for state.Load() != 2 {
+			time.Sleep(time.Millisecond)
+		}
+		stealHead(t, mem, "k")
+		close(hold)
+	}()
+	big := randText(40 << 10)
+	res, err := n.Update(bg, ref, newReq(t, "upload", 1), put("big", big))
+	if err != nil || res.Version.Sequence != 3 {
+		t.Fatalf("an object referenced by the new head proves the commit: %+v %v", res, err)
+	}
+	h, _ := headAt(t, mem, "k")
+	if h.Owner.Node != "thief" || h.Sequence != 3 || len(h.Deltas) != 2 {
+		t.Fatalf("head %+v", h)
+	}
 }
 
 // stealHead publishes a takeover of key by another node directly.

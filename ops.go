@@ -56,6 +56,10 @@ func (n *Node) enter(key string, id *MutationID) (*entity, error) {
 		return nil, err
 	}
 	e.mu.Lock()
+	if n.isClosed() {
+		e.mu.Unlock()
+		return nil, newError(CodeClosed, "", nil)
+	}
 	if c := e.unresolved; c != nil {
 		ctx, cancel := n.commitContext()
 		n.resolve(ctx, e, c)
