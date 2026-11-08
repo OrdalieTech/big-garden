@@ -35,48 +35,18 @@ type manifest struct {
 // manifest.json and snapshot.ltx (PROTOCOL §11). It requires ownership, like
 // Read. A write error is returned as is: the partial output is not a backup.
 func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error) {
-	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil)
+	h, files, err := n.exportFiles(ctx, ref) // in memory: w never blocks the entity
 	if err != nil {
 		return Version{}, err
 	}
-	locked := true
-	defer func() {
-		if locked {
-			n.leave(e)
-		}
-	}()
-	if err := n.owned(ctx, e, ref, true); err != nil {
-		return Version{}, err
-	}
-	h := e.h
-	var snap bytes.Buffer
-	o, err := e.db.Snapshot(&snap)
-	if err != nil {
-		e.discard()
-		return Version{}, engineError(err)
-	}
-	if o.Ref.PostChecksum != h.DatabaseChecksum || o.Ref.MaxSequence != h.Sequence {
-		e.discard()
-		return Version{}, newError(CodeCorrupt, "snapshot differs from the head", nil)
-	}
-	m, err := json.Marshal(manifest{head.Format, h.Namespace, h.Key, h.Incarnation, h.Sequence, h.Schema, head.Codec,
-		head.PageSize, h.PageCount, h.DatabaseChecksum, o.Ref.SHA256, o.Ref.Bytes})
-	if err != nil || len(m) > maxHeadBytes {
-		return Version{}, newError(CodeCorrupt, "manifest", err)
-	}
-	n.leave(e) // the archive is in memory: w never blocks the entity
-	locked = false
 	tw := tar.NewWriter(w)
-	for _, f := range []struct {
-		name string
-		body []byte
-	}{{"manifest.json", m}, {"snapshot.ltx", snap.Bytes()}} {
-		hdr := &tar.Header{Name: f.name, Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(f.body)),
+	for i, name := range []string{"manifest.json", "snapshot.ltx"} {
+		hdr := &tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(files[i])),
 			ModTime: time.Unix(0, 0), Format: tar.FormatUSTAR}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return Version{}, err
 		}
-		if _, err := tw.Write(f.body); err != nil {
+		if _, err := tw.Write(files[i]); err != nil {
 			return Version{}, err
 		}
 	}
@@ -84,6 +54,36 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 		return Version{}, err
 	}
 	return Version{h.Incarnation, h.Sequence}, nil
+}
+
+// exportFiles returns the validated head of ref and the manifest and
+// snapshot of its image, under the entity mutex.
+func (n *Node) exportFiles(ctx context.Context, ref Ref) (*head.Head, [2][]byte, error) {
+	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil)
+	if err != nil {
+		return nil, [2][]byte{}, err
+	}
+	defer n.leave(e)
+	if err := n.owned(ctx, e, ref, true); err != nil {
+		return nil, [2][]byte{}, err
+	}
+	h := e.h
+	var snap bytes.Buffer
+	o, err := e.db.Snapshot(&snap)
+	if err != nil {
+		e.discard()
+		return nil, [2][]byte{}, engineError(err)
+	}
+	if o.Ref.PostChecksum != h.DatabaseChecksum || o.Ref.MaxSequence != h.Sequence {
+		e.discard()
+		return nil, [2][]byte{}, newError(CodeCorrupt, "snapshot differs from the head", nil)
+	}
+	m, err := json.Marshal(manifest{head.Format, h.Namespace, h.Key, h.Incarnation, h.Sequence, h.Schema, head.Codec,
+		head.PageSize, h.PageCount, h.DatabaseChecksum, o.Ref.SHA256, o.Ref.Bytes})
+	if err != nil || len(m) > maxHeadBytes {
+		return nil, [2][]byte{}, newError(CodeCorrupt, "manifest", err)
+	}
+	return h, [2][]byte{m, snap.Bytes()}, nil
 }
 
 // Import creates key from an Export archive (PROTOCOL §11): the archive is
