@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
-	"io"
 	"log/slog"
 	"time"
 
@@ -85,10 +84,6 @@ func NewMutationID(t time.Time) (MutationID, error) {
 	binary.BigEndian.PutUint64(id[:8], uint64(ms))
 	rand.Read(id[8:]) // never returns an error since Go 1.24
 	return id, nil
-}
-
-func (*Node) Import(context.Context, string, Request, io.Reader) (Ref, Result, error) {
-	return Ref{}, Result{}, unsupported()
 }
 
 func (*Node) Stats() Stats { return Stats{} }

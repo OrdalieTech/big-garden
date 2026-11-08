@@ -271,6 +271,30 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 		return Ref{}, Result{}, err
 	}
 	bound := binding(1, req.Schema, req.Schema, req.Hash)
+	return n.create(ctx, key, req, bound, func(path string, inc head.ID) (*engine.DB, []byte, error) {
+		db, err := engine.Create(ctx, path, n.maxPages(), n.ns, key, inc)
+		if err != nil {
+			return nil, nil, engineError(err)
+		}
+		var cb error
+		result, _, err := db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema},
+			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { return fn(&Tx{t}) }, &cb))
+		if err != nil {
+			db.Discard()
+			return nil, nil, callbackError(err, cb)
+		}
+		return db, result, nil
+	})
+}
+
+func (n *Node) maxPages() uint32 { return uint32(n.cfg.Limits.EntityBytes / head.PageSize) }
+
+// builder builds the local genesis image of incarnation inc at path and
+// returns it with the operation's result (PROTOCOL §5 step 4).
+type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
+
+// create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
+func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (Ref, Result, error) {
 	e, err := n.enter(key, &req.ID)
 	if err != nil {
 		return Ref{}, Result{}, err
@@ -310,7 +334,7 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 			}
 			inc = head.NewID()
 		}
-		ref, res, err := n.genesis(ctx, e, key, req, bound, inc, birth == nil, fn)
+		ref, res, err := n.genesis(ctx, e, key, req, bound, inc, birth == nil, build)
 		if err != errRestart {
 			return ref, res, err
 		}
@@ -378,25 +402,18 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 
 // genesis runs PROTOCOL §5 steps 4–8.
 func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, bound head.Digest, inc head.ID, writeBirth bool,
-	fn func(*Tx) ([]byte, error)) (Ref, Result, error) {
-	path := filepath.Join(n.dir, head.NewID().String()+".db")
-	db, err := engine.Create(ctx, path, uint32(n.cfg.Limits.EntityBytes/head.PageSize), n.ns, key, inc)
+	build builder) (Ref, Result, error) {
+	db, result, err := build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
 	if err != nil {
-		return Ref{}, Result{}, engineError(err)
+		return Ref{}, Result{}, err
 	}
 	e.db = db
-	var cb error
 	op := head.OpID(req.ID)
-	result, _, err := db.Mutate(engine.Commit{ID: op, Bound: bound, Schema: req.Schema},
-		scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { return fn(&Tx{t}) }, &cb))
 	var buf bytes.Buffer
-	var snap engine.Object
-	if err == nil {
-		snap, err = db.Snapshot(&buf)
-	}
+	snap, err := db.Snapshot(&buf)
 	if err != nil {
 		e.discard()
-		return Ref{}, Result{}, callbackError(err, cb)
+		return Ref{}, Result{}, engineError(err)
 	}
 	if writeBirth {
 		attempt := head.NewID()
@@ -434,7 +451,7 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 	}
 	self := n.self
 	next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
-		Owner: &self, Epoch: 1, Sequence: 1, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
+		Owner: &self, Epoch: 1, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
 		PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
 	rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
 	if err != nil {
@@ -443,7 +460,7 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 	if rec != nil {
 		result = rec.Result
 	}
-	return Ref{key, e.h.Incarnation}, Result{Value: result, Version: Version{e.h.Incarnation, 1}}, nil
+	return Ref{key, e.h.Incarnation}, Result{Value: result, Version: Version{e.h.Incarnation, e.h.Sequence}}, nil
 }
 
 func withOp(err error, id MutationID) error {

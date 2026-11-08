@@ -67,6 +67,15 @@ func Restore(ctx context.Context, path string, maxPages uint32, h *head.Head, ob
 	return d, nil
 }
 
+// Rebase rewrites the identity in the metadata row of an imported image
+// (PROTOCOL §11 Import step 3); the caller's next Mutate then commits the
+// import receipt at the following sequence.
+func (d *DB) Rebase(ns head.ID, key string, inc head.ID) error {
+	return d.inTx(func() error {
+		return d.exec("UPDATE _state_meta SET namespace = ?, key = ?, incarnation = ?", ns[:], key, inc[:])
+	})
+}
+
 // check verifies the metadata row against h and runs integrity_check.
 func (d *DB) check(h *head.Head) error {
 	m, err := d.Meta()

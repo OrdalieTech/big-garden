@@ -1017,3 +1017,47 @@ func TestExport(t *testing.T) {
 		t.Fatalf("archive %v manifest %+v", names, m)
 	}
 }
+
+func TestImport(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	src := mustCreate(t, n, "src", l)
+	mustPut(t, n, src, "a", "1", l)
+	mustPut(t, n, src, "b", "2", l)
+	var archive bytes.Buffer
+	if _, err := n.Export(bg, src, &archive); err != nil {
+		t.Fatal(err)
+	}
+	other := storetest.NewMem() // another namespace
+	m := testNode(t, other, "z", nil)
+	req := newReq(t, "import", 1)
+	ref, res, err := m.Import(bg, "dst", req, bytes.NewReader(archive.Bytes()))
+	if err != nil || res.Version.Sequence != 4 || ref.Incarnation == src.Incarnation {
+		t.Fatalf("import %+v %+v %v", ref, res, err)
+	}
+	if got := readAll(t, m, ref); got["a"] != "1" || got["b"] != "2" {
+		t.Fatalf("imported rows %v", got)
+	}
+	// the import itself is replayable
+	again, err := m.Lookup(bg, ref, req.ID)
+	if err != nil || !again.Replayed || again.Version.Sequence != 4 {
+		t.Fatalf("import receipt %+v %v", again, err)
+	}
+	if _, res2, err := m.Import(bg, "dst", req, bytes.NewReader(archive.Bytes())); err != nil || !res2.Replayed {
+		t.Fatalf("import replay %+v %v", res2, err)
+	}
+	mustPut(t, m, ref, "c", "3", l)
+	// strictness: schema, trailing data, tampering
+	_, _, err = m.Import(bg, "x", newReq(t, "s", 2), bytes.NewReader(archive.Bytes()))
+	wantCode(t, err, CodeSchemaMismatch)
+	_, _, err = m.Import(bg, "x", newReq(t, "t", 1), io.MultiReader(bytes.NewReader(archive.Bytes()), strings.NewReader("x")))
+	wantCode(t, err, CodeCorrupt)
+	bad := bytes.Clone(archive.Bytes())
+	bad[1536+100] ^= 1 // inside snapshot.ltx data (after two 512-byte headers and the padded manifest)
+	_, _, err = m.Import(bg, "x", newReq(t, "u", 1), bytes.NewReader(bad))
+	wantCode(t, err, CodeCorrupt)
+	if _, ok := other.Peek(head.BirthKey("x")); ok {
+		t.Fatal("a rejected import wrote birth.json")
+	}
+}

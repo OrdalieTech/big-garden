@@ -321,7 +321,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 			objs = append(objs, bytes.NewReader(h.Tail.Data))
 		}
 		path := filepath.Join(n.dir, head.NewID().String()+".db")
-		db, err := engine.Restore(ctx, path, uint32(n.cfg.Limits.EntityBytes/head.PageSize), h, objs)
+		db, err := engine.Restore(ctx, path, n.maxPages(), h, objs)
 		if err != nil {
 			return engineError(err)
 		}
