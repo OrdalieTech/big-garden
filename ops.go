@@ -836,7 +836,7 @@ func (n *Node) deliver(e *entity, batch []*waiter, rec *engine.Receipt, perr err
 		case perr == nil && rec != nil && m.err == nil:
 			m.res, m.err = n.verify(e, m)
 		case perr == nil && rec == nil:
-		case pe != nil && pe.Code != CodeOutcomeUnknown && m.err == nil && pe.Code != CodeIDConflict:
+		case pe != nil && pe.Code != CodeOutcomeUnknown && m.commit && pe.Code != CodeIDConflict:
 			m.res, m.err = Result{}, &Error{Code: pe.Code, Operation: id, Route: pe.Route, Message: pe.Message, cause: perr}
 		case perr == nil || (pe != nil && pe.Code != CodeOutcomeUnknown):
 			m.res, m.err = Result{}, &Error{Code: CodeUnavailable, Operation: id, Message: "the batch was not published", cause: cmp.Or(perr, m.err)}
