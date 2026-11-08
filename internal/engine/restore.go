@@ -137,9 +137,7 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 			err = fmt.Errorf("%w: page %d after %d (commit %d)", ErrCorrupt, ph.Pgno, prev, hd.Commit)
 		}
 		if err == nil && ph.Pgno <= count {
-			if _, err = f.ReadAt(old, int64(ph.Pgno-1)*pageSize); err == nil {
-				sum ^= ltx.ChecksumPage(ph.Pgno, old)
-			}
+			err = xorPage(&sum, f, ph.Pgno, old)
 		}
 		if err == nil {
 			_, err = f.WriteAt(data, int64(ph.Pgno-1)*pageSize)
@@ -157,10 +155,9 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 		return img, 0, fmt.Errorf("%w: object grows to %d pages but carries %d of %d new pages", ErrCorrupt, hd.Commit, grown, hd.Commit-count)
 	}
 	for p := hd.Commit + 1; p <= count; p++ {
-		if _, err := f.ReadAt(old, int64(p-1)*pageSize); err != nil {
+		if err := xorPage(&sum, f, p, old); err != nil {
 			return img, 0, err
 		}
-		sum ^= ltx.ChecksumPage(p, old)
 	}
 	if err := f.Truncate(int64(hd.Commit) * pageSize); err != nil {
 		return img, 0, err

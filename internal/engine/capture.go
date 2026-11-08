@@ -74,20 +74,18 @@ func (d *DB) Delta(w io.Writer) (Object, error) {
 				return err
 			}
 			if p <= d.pub.PageCount {
-				if err := d.oldPage(p, old); err != nil {
+				if err := xorPage(&e.sum, d.main, p, old); err != nil {
 					return err
 				}
-				e.sum ^= ltx.ChecksumPage(p, old)
 			}
 			if err := e.page(p, data); err != nil {
 				return err
 			}
 		}
 		for p := n + 1; p <= d.pub.PageCount; p++ { // truncated pages
-			if err := d.oldPage(p, old); err != nil {
+			if err := xorPage(&e.sum, d.main, p, old); err != nil {
 				return err
 			}
-			e.sum ^= ltx.ChecksumPage(p, old)
 		}
 		o, err = e.close()
 		return err
@@ -204,10 +202,13 @@ func (d *DB) walPages() ([]uint32, error) {
 	return slices.Compact(pages), nil
 }
 
-// oldPage reads page p of the published image from the main file.
-func (d *DB) oldPage(p uint32, buf []byte) error {
-	_, err := d.main.ReadAt(buf, int64(p-1)*pageSize)
-	return err
+// xorPage reads page p of f into buf and XORs its checksum into sum.
+func xorPage(sum *ltx.Checksum, f io.ReaderAt, p uint32, buf []byte) error {
+	if _, err := f.ReadAt(buf, int64(p-1)*pageSize); err != nil {
+		return err
+	}
+	*sum ^= ltx.ChecksumPage(p, buf)
+	return nil
 }
 
 // encoder writes one LTX object while hashing its bytes and keeping the
