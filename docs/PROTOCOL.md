@@ -11,7 +11,7 @@ The exact steps every operation implements. PLAN.md is the contract and DECISION
 - Head missing: if `birth.json` exists, `state_missing`; else `not_found`.
 - "Discard" (D10) = close the connection, delete the entity's db, `-wal`, `-shm` files, drop the cached head. The next access rehydrates (§4).
 - "Barrier" = §3 steps 2–3 (fresh conditional head GET). Required before returning any state-dependent answer that is not a successful CAS (replays, `id_conflict`, `schema_mismatch`, `id_expired` by floor, callback errors). If the head changed, redo the operation from its activation step once, then return `route_changed`.
-- Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else, except the decoded page frames of each of `H`'s snapshot, deltas and tail, derived from `H` and reset with it (the replay pages of §6.7 and §9; set by activation and by each committed candidate).
+- Entity memory (D8): cached head `H`, its ETag `E`, the connection, `unresolved *candidate`. Nothing else, except the decoded page frames of each of `H`'s snapshot, deltas and tail, derived from `H` and reset with it (the replay pages of §6.7 and §9; set by activation and by each committed candidate), and the time of the last admission (cache policy only).
 
 ## 1. Objects and formats
 
@@ -150,7 +150,9 @@ Implicit takeover (D4) is steps 5–7 from inside Update/Read/Lookup when `owner
 
 `Release(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); use `H` if owned, else `GET head`; `owner ≠ self` → return nil. `next = H` with owner null, epoch+1 (tail preserved); `publish`; then discard. Dead with `cur.owner ≠ self` → nil.
 
-`Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10); forget the entity. Ownership is unchanged: this session may activate it again.
+`Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10); forget the entity (its struct stays registered, so its mutex keeps serializing the key). Ownership is unchanged: this session may activate it again.
+
+Cache policy: before an activation or a genesis build, if `ResidentEntities` other entities are resident, discard the least recently admitted one that is idle and settled (never a busy one; wait up to 1 s, then `capacity`). A sweeper discards settled caches idle for `IdleTimeout`. Both are D10 discards: ownership is unchanged.
 
 `Close(ctx)`: stop admissions (`closed`); per resident entity, settle `unresolved` within ctx (and at most `CommitTimeout` in total) and discard; delete the session cache dir; return `outcome_unknown` if any candidate stayed unresolved. Never closes the caller's S3 client.
 
