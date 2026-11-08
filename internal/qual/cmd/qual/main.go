@@ -11,7 +11,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: qual model|doctor|stall|faults|stress|check|cost|footprint|reproducible|report [flags]")
+		fmt.Fprintln(os.Stderr, "usage: qual model|doctor|stall|faults|stress|soak|check|cost|footprint|reproducible|report [flags]")
 		os.Exit(2)
 	}
 	var run func([]string) error
@@ -26,6 +26,10 @@ func main() {
 		run = stall
 	case "stress":
 		run = stress
+	case "soak":
+		run = soak
+	case "soak-node":
+		run = soakNode
 	case "check":
 		run = check
 	case "cost":
