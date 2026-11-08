@@ -61,7 +61,12 @@ func (n *Node) enter(key string, id *MutationID) (*entity, error) {
 	if err != nil {
 		return nil, err
 	}
+	if e.waiting.Add(1) > int64(n.cfg.Limits.PendingPerEntity) {
+		e.waiting.Add(-1)
+		return nil, newError(CodeCapacity, "too many operations queued on the entity", nil)
+	}
 	e.mu.Lock()
+	e.waiting.Add(-1)
 	e.used = time.Now()
 	if n.isClosed() {
 		e.mu.Unlock()

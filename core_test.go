@@ -1167,3 +1167,28 @@ func TestCachePolicy(t *testing.T) {
 	mustPut(t, n, refs[0], "b", "after idle", l)
 	l.verify(t, mem, "a")
 }
+
+func TestPendingPerEntity(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", func(l *Limits) { l.PendingPerEntity = 1 })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	inside, release := make(chan struct{}), make(chan struct{})
+	go n.Update(bg, ref, newReq(t, "hold", 1), func(tx *Tx) ([]byte, error) {
+		close(inside)
+		<-release
+		return nil, nil
+	})
+	<-inside
+	queued := make(chan error, 1)
+	go func() { _, err := n.Update(bg, ref, newReq(t, "queued", 1), put("q", "1")); queued <- err }()
+	for n.Stats().QueuedRequests != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	_, err := n.Update(bg, ref, newReq(t, "over", 1), put("o", "1"))
+	wantCode(t, err, CodeCapacity)
+	close(release)
+	if err := <-queued; err != nil {
+		t.Fatal(err)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/engine"
@@ -32,7 +33,8 @@ type entity struct {
 	db         *engine.DB
 	unresolved *candidate
 	pages      []uint32
-	used       time.Time // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.

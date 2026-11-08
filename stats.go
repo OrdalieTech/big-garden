@@ -90,6 +90,7 @@ func (n *Node) Stats() Stats {
 	n.mu.Lock()
 	s.CacheBytes = n.reserved
 	for _, e := range n.entities {
+		s.QueuedRequests += e.waiting.Load()
 		if e.mu.TryLock() { // a busy entity is resident by definition
 			if e.db != nil {
 				s.ResidentEntities++
