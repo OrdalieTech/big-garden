@@ -106,10 +106,6 @@ type Driver struct {
 	modules map[string]bool
 }
 
-// builtinModules are the compiled-in virtual table modules application SQL
-// may create: their state lives in ordinary shadow tables (DECISIONS D19).
-var builtinModules = []string{"fts5", "fts5vocab", "rtree", "rtree_i32", "geopoly"}
-
 // NewDriver returns a Driver on which extend (if not nil) has registered
 // functions and virtual table modules. The modules it added are allowed to
 // application SQL besides the built-in ones. It must not replace a function,
@@ -118,10 +114,9 @@ var builtinModules = []string{"fts5", "fts5vocab", "rtree", "rtree_i32", "geopol
 // use it whatever trusted_schema says) or a connection hook (caller code on
 // every connection, activation included).
 func NewDriver(extend func(*sqlite.Driver) error) (*Driver, error) {
-	d := &Driver{sqlite: &sqlite.Driver{}, modules: map[string]bool{}}
-	for _, m := range builtinModules {
-		d.modules[m] = true
-	}
+	// The compiled-in modules keep their state in ordinary shadow tables (D19).
+	d := &Driver{sqlite: &sqlite.Driver{}, modules: map[string]bool{"fts5": true, "fts5vocab": true, "rtree": true,
+		"rtree_i32": true, "geopoly": true}}
 	if extend == nil {
 		return d, nil
 	}
@@ -505,10 +500,10 @@ func (d *DB) checkpoint() error {
 	return nil
 }
 
-// Checkpoint installs the published object o into the main file (PROTOCOL
+// Checkpoint installs the published image img into the main file (PROTOCOL
 // §2, after committed): TRUNCATE checkpoint, empty WAL, and a main file whose
-// sequence and size match o. On error the caller discards the cache.
-func (d *DB) Checkpoint(o Object) error {
+// sequence and size match img. On error the caller discards the cache.
+func (d *DB) Checkpoint(img Image) error {
 	if err := d.checkpoint(); err != nil {
 		return err
 	}
@@ -520,11 +515,10 @@ func (d *DB) Checkpoint(o Object) error {
 	if err != nil {
 		return err
 	}
-	if m.Sequence != o.Ref.MaxSequence || st.Size() != int64(o.PageCount)*pageSize {
-		return fmt.Errorf("engine: checkpointed image (sequence %d, %d bytes) is not object %d..%d with %d pages",
-			m.Sequence, st.Size(), o.Ref.MinSequence, o.Ref.MaxSequence, o.PageCount)
+	if m.Sequence != img.Sequence || st.Size() != int64(img.PageCount)*pageSize {
+		return fmt.Errorf("engine: checkpointed image (sequence %d, %d bytes) is not %+v", m.Sequence, st.Size(), img)
 	}
-	d.pub = Image{o.Ref.MaxSequence, o.PageCount, o.Ref.PostChecksum}
+	d.pub = img
 	return nil
 }
 

@@ -199,8 +199,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 	n.countCommit(c)
 	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
 		e.pages = c.pages
-		o := engine.Object{Ref: head.Ref{MaxSequence: cur.Sequence, PostChecksum: cur.DatabaseChecksum}, PageCount: cur.PageCount}
-		if e.db.Published() != imageOf(cur) && e.db.Checkpoint(o) != nil {
+		if e.db.Published() != imageOf(cur) && e.db.Checkpoint(imageOf(cur)) != nil {
 			e.discard()
 		}
 	}

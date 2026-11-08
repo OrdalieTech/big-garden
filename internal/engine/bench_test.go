@@ -35,7 +35,7 @@ func benchDelta(b *testing.B, size int64) {
 			b.Fatalf("one-row update captured %d pages", o.Pages)
 		}
 		captured += int(o.Pages)
-		if err := fx.d.Checkpoint(o); err != nil {
+		if err := fx.d.Checkpoint(Image{o.Ref.MaxSequence, o.PageCount, o.Ref.PostChecksum}); err != nil {
 			b.Fatal(err)
 		}
 		b.StartTimer()

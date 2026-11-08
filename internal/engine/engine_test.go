@@ -103,7 +103,7 @@ func (f *fixture) publish(t testing.TB, snapshot bool) Object {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.d.Checkpoint(o); err != nil {
+	if err := f.d.Checkpoint(Image{o.Ref.MaxSequence, o.PageCount, o.Ref.PostChecksum}); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.objs) == 0 {
