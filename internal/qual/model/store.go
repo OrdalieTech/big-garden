@@ -249,9 +249,9 @@ func (w *world) checkWrite(e int, nh Head, node int8, sess ID) {
 		w.fail("G7: data changed without a sequence advance (%s -> %s)", imgString(oi), imgString(img))
 	case img.Seq == oi.Seq && nh.Tail != old.Tail:
 		w.fail("G7: inline tail changed without a sequence advance")
-	case img.Seq != oi.Seq && img.Seq != oi.Seq+1:
+	case img.Seq < oi.Seq || img.Seq > oi.Seq+maxBatch:
 		w.fail("G1: sequence %d replaced by %d", oi.Seq, img.Seq)
-	case img.Seq == oi.Seq+1 && (!extends(img, oi) || img.Floor < oi.Floor):
+	case img.Seq > oi.Seq && (!extends(img, oi) || img.Floor < oi.Floor):
 		w.fail("G1: head %s does not extend its predecessor %s", imgString(img), imgString(oi))
 	case ownerChanged && nh.Epoch != old.Epoch+1, !ownerChanged && nh.Epoch != old.Epoch:
 		w.fail("G7: owner change with epoch %d -> %d", old.Epoch, nh.Epoch)

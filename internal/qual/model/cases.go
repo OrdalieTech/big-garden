@@ -38,9 +38,10 @@ const all = 0xff
 // Cases returns the M1 bounded cases P, O, G, I (PLAN §14) and three creation
 // cases: C (Create, the D5 resume and an administrative head deletion at any
 // time: finding F1, accepted by D14), C0 (no deletion) and CD (deletion only
-// while no create of the key is in flight, D14's scope).
+// while no create of the key is in flight, D14's scope), and the group-commit
+// case B (D18).
 func Cases() []*Case {
-	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD()}
+	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -164,6 +165,25 @@ func caseCD() *Case {
 	return c
 }
 
+// B: group commit (D18). Two nodes, one entity; r1 may run alone or as the
+// leader of a batch whose member r2 is queued behind it; both may be retried
+// alone on either node; one takeover by n1, one crash, one hedge; replies may
+// be delayed or lost (abandoned writes still apply). A batch retried after
+// its member committed holds the member's replay.
+func caseB() *Case {
+	c := &Case{Name: "B", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 40,
+		Restarts: 1, Hedges: 1, Retention: 8, Age: 1}
+	c.Reqs = []Req{
+		genesisReq(1),
+		{Kind: kUpdate, Nodes: 3, Tries: 2, ID: 2, Hash: 1, TS: 1, Schema: 1, More: 3},
+		{Kind: kUpdate, Nodes: 3, Tries: 2, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kTakeover, Nodes: 2, Tries: 1},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, nil, 0, true)
+	return c
+}
+
 // CaseR is the random-trace configuration: entity 0 exists with a two-delta
 // root, entity 1 does not; every operation kind is in the pool.
 func CaseR(nodes, ents, active int) *Case {
@@ -174,7 +194,7 @@ func CaseR(nodes, ents, active int) *Case {
 		genesisReq(3),
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 3, Schema: 1},
 		{Kind: kUpdate, ID: 3, Hash: 1, TS: 3, Schema: 1},
-		{Kind: kUpdate, Nodes: all, Tries: 2, ID: 4, Hash: 1, TS: 2, Schema: 1},
+		{Kind: kUpdate, Nodes: all, Tries: 2, ID: 4, Hash: 1, TS: 2, Schema: 1, More: 5}, // D18 leader, r4 queued behind it
 		{Kind: kUpdate, Nodes: all, Tries: 2, ID: 5, Hash: 1, TS: 2, Schema: 1, Input: 2},
 		{Kind: kUpdate, Nodes: all, Tries: 1, ID: 5, Hash: 2, TS: 2, Schema: 1},
 		{Kind: kMigrate, Nodes: all, Tries: 1, ID: 6, Hash: 1, TS: 3, Schema: 1, To: 2},

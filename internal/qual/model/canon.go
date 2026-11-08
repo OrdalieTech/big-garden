@@ -107,6 +107,7 @@ func (k *canon) cand(c *Cand) {
 	k.i8(c.Req)
 	k.i8(c.NN)
 	k.i8(c.Lim)
+	k.i8(c.More)
 	k.id(c.Att)
 	for _, n := range c.Nonces {
 		k.id(n)
@@ -138,6 +139,14 @@ func (k *canon) proc(p *Proc) {
 	k.id(p.Inc)
 	k.id(p.ObsSess)
 	k.i16(p.ObsEpoch)
+	if p.Mb != 0 {
+		k.b = append(k.b, uint8(p.Mb), p.MbCode, uint8(p.MbSeq))
+		k.bit(p.Taken)
+		k.bit(p.Proof)
+		k.img(&p.Hold)
+	} else {
+		k.u8(0)
+	}
 	if p.Cur != (Head{}) {
 		k.u8(1)
 		k.head(&p.Cur)
