@@ -51,7 +51,10 @@ var introspection = map[string]bool{"table_info": true, "table_xinfo": true, "in
 
 // moduleReads lists the pragmas the built-in modules query, without an
 // argument: rtree reads page_size when it creates a table, fts5 reads
-// data_version to validate its cached structure.
+// data_version to validate its cached structure. modernc passes a missing
+// argument as "", so PRAGMA page_size='' and data_version='' pass too:
+// harmless, page_size ignores a size that is not a power of two (and is
+// fixed in WAL mode), data_version is read-only.
 var moduleReads = map[string]bool{"page_size": true, "data_version": true}
 
 // rtreeShadow reports whether name may be a shadow table of rtree or

@@ -93,6 +93,12 @@ func TestAuthorizerBypass(t *testing.T) {
 	}
 	f.mutate(t, "REINDEX _state_receipts; REINDEX sqlite_autoindex__state_receipts_1")
 	ok++
+	// An empty argument reads as none to the authorizer (moduleReads): harmless.
+	f.mutate(t, "PRAGMA page_size=''; PRAGMA data_version=''")
+	ok++
+	if got := scalar(t, f.d.conn, "PRAGMA page_size"); got != "4096" {
+		t.Fatalf("page_size %s", got)
+	}
 
 	// Triggers and views that reach reserved tables are refused when created
 	// or when they would run. The triggers are dropped again, the views kept.
