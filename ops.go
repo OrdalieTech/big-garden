@@ -217,24 +217,30 @@ func callbackError(err, cb error) error {
 // Resolve returns the current Route of key from a fresh head GET (PROTOCOL
 // §3). Each call costs that GET: cache Route.Ref per key.
 func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
+	h, err := n.current(ctx, key, head.ID{})
+	if err != nil {
+		return Route{}, err
+	}
+	return *routeOf(h), nil
+}
+
+// current decodes key's head (of incarnation inc unless zero) from a plain
+// GET, with no entity or cache: Resolve and Collect.
+func (n *Node) current(ctx context.Context, key string, inc head.ID) (*head.Head, error) {
 	if err := head.ValidKey(key); err != nil {
-		return Route{}, invalid(err.Error())
+		return nil, invalid(err.Error())
 	}
 	if n.isClosed() {
-		return Route{}, newError(CodeClosed, "", nil)
+		return nil, newError(CodeClosed, "", nil)
 	}
 	obj, err := n.st.Get(ctx, head.HeadKey(key), "", maxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
-		h, err := n.decodeHead(obj.Body, key, head.ID{})
-		if err != nil {
-			return Route{}, err
-		}
-		return *routeOf(h), nil
+		return n.decodeHead(obj.Body, key, inc)
 	case store.NotFound:
-		return Route{}, n.missing(ctx, key)
+		return nil, n.missing(ctx, key)
 	}
-	return Route{}, storeError(err)
+	return nil, storeError(err)
 }
 
 // Read runs fn on the state validated by a head GET issued after the call

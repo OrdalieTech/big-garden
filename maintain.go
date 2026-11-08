@@ -101,21 +101,7 @@ func (n *Node) maintain(e *entity) {
 // the current head's revision and that the head does not reference. It runs
 // on any node and opens no SQLite.
 func (n *Node) Collect(ctx context.Context, ref Ref) error {
-	if err := head.ValidKey(ref.Key); err != nil {
-		return invalid(err.Error())
-	}
-	if n.isClosed() {
-		return newError(CodeClosed, "", nil)
-	}
-	obj, err := n.st.Get(ctx, head.HeadKey(ref.Key), "", maxHeadBytes)
-	switch store.OutcomeOf(err) {
-	case store.OK:
-	case store.NotFound:
-		return n.missing(ctx, ref.Key)
-	default:
-		return storeError(err)
-	}
-	h, err := n.decodeHead(obj.Body, ref.Key, ref.Incarnation)
+	h, err := n.current(ctx, ref.Key, ref.Incarnation)
 	if err != nil {
 		return err
 	}
