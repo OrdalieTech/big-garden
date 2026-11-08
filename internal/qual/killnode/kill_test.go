@@ -56,8 +56,8 @@ type proc struct {
 	lines chan []byte
 }
 
-func start(t *testing.T, ep storetest.Endpoint, failpoint string) *proc {
-	cmd := exec.Command(nodeBinary(t), "-url", ep.URL, "-bucket", ep.Bucket, "-prefix", ep.Prefix, "-cache", t.TempDir())
+func start(t *testing.T, ep storetest.Endpoint, cache, failpoint string) *proc {
+	cmd := exec.Command(nodeBinary(t), "-url", ep.URL, "-bucket", ep.Bucket, "-prefix", ep.Prefix, "-cache", cache)
 	cmd.Env = append(os.Environ(), "AWS_ACCESS_KEY_ID="+ep.AccessKey, "AWS_SECRET_ACCESS_KEY="+ep.SecretKey,
 		"GARDEN_FAILPOINT="+failpoint)
 	cmd.Stderr = os.Stderr
@@ -131,8 +131,9 @@ func newID() string {
 // TestProcessKill runs the M4 kill matrix against MinIO: for each failpoint,
 // GARDEN_KILL_RUNS times (default 20) one node process works on a fresh
 // entity and is SIGKILLed at the failpoint's nth pass (n random in 1..4),
-// then a new process with an empty cache retries the unknown operation with
-// the same ID and the parent's acknowledgment ledger is checked.
+// then a new process (on an empty cache directory in even runs, on the
+// killed one's directory in odd runs) retries the unknown operation with the
+// same ID and the parent's acknowledgment ledger is checked.
 func TestProcessKill(t *testing.T) {
 	base := storetest.MinIO(t)
 	runs := 20
@@ -144,7 +145,7 @@ func TestProcessKill(t *testing.T) {
 			var tot tally
 			for i := range runs {
 				ep := base.Sub(fmt.Sprintf("%s-%d", fp, i))
-				r := killRun(t, ep, fmt.Sprintf("%s:%d", fp, 1+rand.N(4)))
+				r := killRun(t, ep, fmt.Sprintf("%s:%d", fp, 1+rand.N(4)), i%2 == 1)
 				tot.killed, tot.acked, tot.unknown, tot.replayed = tot.killed+r.killed, tot.acked+r.acked, tot.unknown+r.unknown, tot.replayed+r.replayed
 				clean(t, ep)
 				if t.Failed() {
@@ -168,9 +169,12 @@ type op struct {
 
 type tally struct{ killed, acked, unknown, replayed int }
 
-func killRun(t *testing.T, ep storetest.Endpoint, failpoint string) (tl tally) {
+// killRun restarts with an empty cache directory, or with the killed
+// process's own one when reuse is set (its residue must be ignored).
+func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) (tl tally) {
 	t.Helper()
-	p := start(t, ep, failpoint)
+	cache := t.TempDir()
+	p := start(t, ep, cache, failpoint)
 	var ops []*op
 	inc := ""
 	do := func(r Req) bool {
@@ -205,7 +209,10 @@ func killRun(t *testing.T, ep storetest.Endpoint, failpoint string) (tl tally) {
 	}
 
 	// restart with an empty cache; retry every unknown with the same ID and input
-	p = start(t, ep, "")
+	if !reuse {
+		cache = t.TempDir()
+	}
+	p = start(t, ep, cache, "")
 	defer p.stop()
 	call := func(r Req) Resp {
 		resp, alive := p.call(t, r)
