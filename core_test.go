@@ -1006,6 +1006,34 @@ func TestDeadlineEndsWaiting(t *testing.T) {
 	l.verify(t, mem, "a")
 }
 
+// TestCreateCallbackPanic: a panicking Create callback releases its cache
+// reservation and file and is not counted as a success.
+func TestCreateCallbackPanic(t *testing.T) {
+	n := testNode(t, newStore(t), "a", nil)
+	for range 5 {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("no panic")
+				}
+			}()
+			n.Create(bg, "k", newReq(t, "create", 1), func(*Tx) ([]byte, error) { panic("boom") })
+		}()
+	}
+	n.mu.Lock()
+	reserved := n.reserved
+	n.mu.Unlock()
+	if entries, _ := os.ReadDir(n.dir); reserved != 0 || len(entries) != 1 {
+		t.Fatalf("reserved %d, cache dir %v", reserved, entries)
+	}
+	if st := n.Stats(); st.Mutations != 0 || st.CacheBytes != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+	mustCreate(t, n, "k", nil)
+	_, _, err := n.Create(bg, "k2", newReq(t, "nil", 1), nil)
+	wantCode(t, err, CodeInvalidArgument)
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer

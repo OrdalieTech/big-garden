@@ -293,6 +293,9 @@ func (n *Node) lookup(ctx context.Context, e *entity, ref Ref, id MutationID) (R
 
 // Create makes a new entity at key (PROTOCOL §5).
 func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx) ([]byte, error)) (Ref, Result, error) {
+	if ctx == nil || fn == nil {
+		return Ref{}, Result{}, invalid("nil context or callback")
+	}
 	if err := cmp.Or(checkRequest(key, req), n.checkClock(req)); err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -303,14 +306,20 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 			return nil, nil, engineError(err)
 		}
 		var cb error
+		built := false
+		defer func() { // also on a callback panic
+			if !built {
+				db.Discard()
+			}
+		}()
 		failpoint("sql.before")
 		result, _, err := db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema},
 			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
 		if err != nil {
-			db.Discard()
 			return nil, nil, callbackError(err, cb)
 		}
 		failpoint("sql.after")
+		built = true
 		return db, result, nil
 	})
 }
@@ -435,8 +444,10 @@ func (n *Node) genesis(ctx context.Context, e *entity, key string, req Request, 
 	if err := n.cache(ctx, e); err != nil {
 		return Ref{}, Result{}, err
 	}
-	db, result, err := build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
-	n.unreserve()
+	db, result, err := func() (*engine.DB, []byte, error) {
+		defer n.unreserve() // also on a callback panic
+		return build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
+	}()
 	if err != nil {
 		return Ref{}, Result{}, err
 	}

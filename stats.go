@@ -45,6 +45,7 @@ func (n *Node) observe(key string, read bool, res Result, err error) {
 	c := &n.counters
 	var e *Error
 	switch {
+	case err == nil && res.Version.Sequence == 0: // a callback panic is unwinding: count nothing
 	case err == nil && read:
 		c.reads.Add(1)
 	case err == nil && res.Replayed:
