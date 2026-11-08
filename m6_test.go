@@ -938,7 +938,7 @@ func TestImportRejectsMalformedArchives(t *testing.T) {
 		"empty":               {},
 		"no snapshot":         tarOf(member{name: "manifest.json", body: mj}),
 		"wrong order":         tarOf(member{name: "snapshot.ltx", body: snap}, member{name: "manifest.json", body: mj}),
-		"extra member":        append(tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}, member{name: "x", body: []byte("y")})),
+		"extra member":        tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}, member{name: "x", body: []byte("y")}),
 		"duplicate":           tarOf(member{name: "manifest.json", body: mj}, member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}),
 		"renamed":             tarOf(member{name: "./manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}),
 		"symlink":             tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", typ: tar.TypeSymlink}),
