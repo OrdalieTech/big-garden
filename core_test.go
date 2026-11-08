@@ -320,6 +320,10 @@ func TestCreateUpdateReadLookup(t *testing.T) {
 	_, err = n.Read(bg, ref, 1, func(*View) ([]byte, error) { return make([]byte, 17<<10), nil })
 	wantCode(t, err, CodeCapacity)
 
+	st := n.Stats()
+	if st.Commits < 6 || st.Replays != 1 || st.Conflicts != 1 || st.Reads < 1 || st.ResidentEntities != 1 || st.Mutations < 6 {
+		t.Fatalf("stats %+v", st)
+	}
 	route, err := n.Resolve(bg, "doc")
 	if err != nil || route.Ref != ref || route.Owner != n.Owner() || route.Epoch != 1 {
 		t.Fatalf("resolve %+v %v", route, err)
@@ -966,6 +970,12 @@ func TestCollect(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Fatalf("objects that must survive were deleted: %v", want)
+	}
+	if st := other.Stats(); st.Collections != 1 || st.CollectedObjects == 0 {
+		t.Fatalf("collect stats %+v", st)
+	}
+	if st := n.Stats(); st.Compactions == 0 || st.Commits != 41 {
+		t.Fatalf("maintenance stats %+v", st)
 	}
 	err := other.Collect(bg, Ref{"k", [16]byte{9}})
 	wantCode(t, err, CodeIncarnationMismatch)

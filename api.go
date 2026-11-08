@@ -86,8 +86,6 @@ func NewMutationID(t time.Time) (MutationID, error) {
 	return id, nil
 }
 
-func (*Node) Stats() Stats { return Stats{} }
-
 func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
 	return v.v.Query(ctx, q, args, fn)
 }

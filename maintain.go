@@ -128,12 +128,16 @@ func (n *Node) Collect(ctx context.Context, ref Ref) error {
 		for _, o := range page {
 			after = o.Key
 			if base, _, _, err := head.ParseObjectKey(prefix, o.Key); err == nil && base < h.Revision && !live[o.Key] {
-				if err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) == store.Failed {
+				switch err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) {
+				case store.OK:
+					n.counters.collected.Add(1)
+				case store.Failed:
 					return storeError(err)
 				} // Unknown: left for a later pass
 			}
 		}
 		if !more || len(page) == 0 {
+			n.counters.collections.Add(1)
 			return nil
 		}
 	}

@@ -30,6 +30,7 @@ type Node struct {
 	reserved int64 // cache bytes reserved by activations in progress
 	closed   bool
 
+	counters        counters
 	wg              sync.WaitGroup // maintenance steps in flight
 	skipMaintenance bool           // tests of the §6.7 cap only
 }

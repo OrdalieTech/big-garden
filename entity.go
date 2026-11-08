@@ -147,6 +147,7 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 // is not cur's.
 func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 	e.unresolved = nil
+	n.countCommit(c)
 	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
 		e.pages = c.pages
 		o := engine.Object{Ref: head.Ref{MaxSequence: cur.Sequence, PostChecksum: cur.DatabaseChecksum}, PageCount: cur.PageCount}
@@ -320,8 +321,10 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 		path := filepath.Join(n.dir, head.NewID().String()+".db")
 		db, err := engine.Restore(ctx, path, n.maxPages(), h, objs)
 		if err != nil {
+			n.counters.activationFailures.Add(1)
 			return engineError(err)
 		}
+		n.counters.activations.Add(1)
 		e.db, e.h, e.etag = db, h, etag
 		e.pages = db.Pages
 		return nil
