@@ -268,11 +268,19 @@ func (d *DB) setup(maxPages uint32) error {
 	}
 	for _, s := range settings {
 		var got string
-		if err := d.exec(s.set); err != nil {
+		get := func() error { return d.conn.QueryRowContext(context.Background(), s.get).Scan(&got) }
+		if err := get(); err != nil {
 			return err
 		}
-		if err := d.conn.QueryRowContext(context.Background(), s.get).Scan(&got); err != nil {
-			return err
+		// set only what differs: even a no-op auto_vacuum=FULL commits a
+		// write to page 1, and an opened image must stay its head's (M9)
+		if got != s.want {
+			if err := d.exec(s.set); err != nil {
+				return err
+			}
+			if err := get(); err != nil {
+				return err
+			}
 		}
 		if got != s.want {
 			return fmt.Errorf("engine: %s = %q, want %q", s.get, got, s.want)

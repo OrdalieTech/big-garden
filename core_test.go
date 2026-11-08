@@ -1765,3 +1765,55 @@ func TestCacheBytes(t *testing.T) {
 	}
 	l.verify(t, mem, "a")
 }
+
+// TestExportAfterActivation: Export of an entity the Node activated from the
+// store (evicted, read, taken over, or after a restart) matches its head,
+// with and without an inline tail, and the archive imports.
+func TestExportAfterActivation(t *testing.T) {
+	for _, writes := range []int{0, 2} { // 0: snapshot only; 2: deltas or an inline tail
+		mem := newStore(t)
+		a := testNode(t, mem, "a", nil)
+		l := newLedger()
+		ref := mustCreate(t, a, "k", l)
+		for i := range writes {
+			mustPut(t, a, ref, strconv.Itoa(i), "v", l)
+		}
+		export := func(step string, n *Node) {
+			t.Helper()
+			var out bytes.Buffer
+			v, err := n.Export(bg, ref, &out)
+			if err != nil || v.Sequence != uint64(1+writes) {
+				t.Fatalf("writes=%d %s: export %+v %v", writes, step, v, err)
+			}
+			imp := testNode(t, newStore(t), "z", nil)
+			dst, _, err := imp.Import(bg, "dst", newReq(t, "import", 1), &out)
+			if err != nil {
+				t.Fatalf("writes=%d %s: import %v", writes, step, err)
+			}
+			if got := readAll(t, imp, dst); len(got) != writes {
+				t.Fatalf("writes=%d %s: imported rows %v", writes, step, got)
+			}
+		}
+		if err := a.Evict(bg, ref); err != nil {
+			t.Fatal(err)
+		}
+		export("evict", a)
+		if err := a.Evict(bg, ref); err != nil {
+			t.Fatal(err)
+		}
+		readAll(t, a, ref)
+		export("evict-read", a)
+		a.Close(bg)
+		b := testNode(t, mem, "b", nil)
+		route, err := b.Resolve(bg, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Takeover(bg, route); err != nil {
+			t.Fatal(err)
+		}
+		export("takeover", b)
+		b.Close(bg)
+		export("restart", testNode(t, mem, "b", nil)) // same NodeID: implicit takeover (D4)
+	}
+}

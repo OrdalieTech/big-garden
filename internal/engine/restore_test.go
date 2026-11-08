@@ -108,3 +108,22 @@ func TestRestoreRejects(t *testing.T) {
 	}
 	d.Discard()
 }
+
+// TestRestoreOpensWithoutWriting: opening a restored image commits nothing,
+// so its WAL stays empty and a Snapshot reproduces the head's checksum (an
+// Export after activation, M9).
+func TestRestoreOpensWithoutWriting(t *testing.T) {
+	f := newFixture(t, 1000)
+	f.mutate(t, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+	f.publish(t, true)
+	f.mutate(t, "INSERT INTO t(v) VALUES ('a')")
+	f.publish(t, false)
+	d := f.restore(t)
+	if st, err := os.Stat(d.path + "-wal"); err != nil || st.Size() != 0 {
+		t.Fatalf("WAL after restore: %v %v", st.Size(), err)
+	}
+	o, err := d.Snapshot(io.Discard)
+	if err != nil || o.Ref.PostChecksum != f.head.DatabaseChecksum || o.Ref.MaxSequence != f.head.Sequence || o.PageCount != f.head.PageCount {
+		t.Fatalf("snapshot after restore %+v %v, head %+v", o, err, f.head)
+	}
+}
