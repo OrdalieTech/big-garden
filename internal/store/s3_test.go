@@ -27,11 +27,11 @@ type rig struct {
 }
 
 func upstreams(t *testing.T, f func(t *testing.T, newRig func(opts ...func(*s3.Options)) *rig)) {
-	for _, kind := range []string{"mem", "minio"} {
+	for _, kind := range []string{"mem", "local"} {
 		t.Run(kind, func(t *testing.T) {
 			var ep storetest.Endpoint
-			if kind == "minio" {
-				ep = storetest.MinIO(t)
+			if kind == "local" {
+				ep = storetest.Local(t)
 			} else {
 				srv := httptest.NewServer(storetest.Handler(storetest.NewMem()))
 				t.Cleanup(srv.Close)

@@ -714,8 +714,8 @@ func dirBytes(dir string) int64 {
 // and every read returns the acknowledged rows.
 func TestDatasetLargerThanCache(t *testing.T) {
 	var st store.Store = storetest.NewMem()
-	if os.Getenv(storetest.MinIOEnv) != "" { // the S3 adapter without the journaling fault proxy
-		ep := storetest.MinIO(t)
+	if storetest.LocalOn() { // the S3 adapter without the journaling fault proxy
+		ep := storetest.Local(t)
 		st = store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, 2*time.Second)
 		t.Cleanup(func() {
 			for range 100 {

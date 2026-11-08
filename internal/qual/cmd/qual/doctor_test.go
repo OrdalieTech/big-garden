@@ -79,8 +79,8 @@ func TestDoctorRejectsStoreIgnoringConditions(t *testing.T) {
 	}
 }
 
-func TestDoctorMinIO(t *testing.T) {
-	ep := storetest.MinIO(t)
+func TestDoctorLocal(t *testing.T) {
+	ep := storetest.Local(t)
 	quiet(t)
 	rep, err := runDoctor(context.Background(), ep, quick)
 	if err != nil || !rep.Pass {

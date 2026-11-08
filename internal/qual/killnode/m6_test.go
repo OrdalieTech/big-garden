@@ -22,7 +22,7 @@ import (
 // object is never referenced by a later head, a cannot write any more, and
 // the ledger is intact through a third node c.
 func TestStaleMaintenance(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	runs := 20
 	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
 		runs, _ = strconv.Atoi(s)

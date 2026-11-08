@@ -5,25 +5,32 @@ commands to reproduce. Remote = Scaleway Object Storage fr-par, bucket in
 production use, client on one workstation in France over the public
 internet, prefix `qual-state/<random>/`, deleted afterwards.
 
-## Stalled PUT versus GET (2026-11-08, `qual stall --remote --stall 40s`)
+## Stalled PUT versus GET (2026-11-08, `qual stall --remote|--local --stall 40s`)
 
 A raw signed PUT declares Content-Length, sends half its 2 KiB body, stalls
 40 s, then completes. GETs of the key from fresh connection pools start 1 s
 into the stall. "Racer" is a competing CAS with the same condition sent
 during the stall.
 
-| Condition | Scaleway fr-par: GET during stall | Scaleway: stalled PUT | Pinned MinIO: GET during stall | MinIO: stalled PUT |
-|---|---|---|---|---|
-| If-Match current ETag | 22-34 ms, old value | 200 at 40 s | **29.3 s**, then old value | 503 |
-| unconditional | 21-32 ms, old value | 200 at 40 s | 1-5 ms | 503 |
-| If-None-Match: * (absent key) | 25-32 ms, not found | 200 at 40 s | **29.3 s**, then not found | 503 |
-| If-Match + racer | 19-33 ms; racer CAS OK in 23 ms | **412** at 40 s; racer's value stored | 29.3 s; racer OK | 503; racer's value |
-| If-None-Match + racer | 25-27 ms; racer create OK in 31 ms | **412** at 40 s; racer's value stored | 29.3 s; racer OK | 503; racer's value |
+| Condition | Scaleway fr-par: GET during stall | Scaleway: stalled PUT | Pinned MinIO: GET during stall | MinIO: stalled PUT | Pinned RustFS: GET during stall | RustFS: stalled PUT |
+|---|---|---|---|---|---|---|
+| If-Match current ETag | 22-34 ms, old value | 200 at 40 s | **29.3 s**, then old value | 503 | 1-2 ms, old value | 200 at 40 s |
+| unconditional | 21-32 ms, old value | 200 at 40 s | 1-5 ms | 503 | 1 ms, old value | 200 at 40 s |
+| If-None-Match: * (absent key) | 25-32 ms, not found | 200 at 40 s | **29.3 s**, then not found | 503 | 1 ms, not found | 200 at 40 s |
+| If-Match + racer | 19-33 ms; racer CAS OK in 23 ms | **412** at 40 s; racer's value stored | 29.3 s; racer OK | 503; racer's value | 1 ms; racer CAS OK in 4 ms | **412** at 40 s; racer's value stored |
+| If-None-Match + racer | 25-27 ms; racer create OK in 31 ms | **412** at 40 s; racer's value stored | 29.3 s; racer OK | 503; racer's value | 1 ms; racer create OK in 3 ms | **412** at 40 s; racer's value stored |
 
 On Scaleway a stalled conditional write blocks neither readers nor
 competing writers, and its condition is evaluated when the body completes
 (so a stalled owner's late CAS loses to a takeover). The ~30 s read
-unavailability after an owner stalls mid-CAS is MinIO-only.
+unavailability after an owner stalls mid-CAS is MinIO-only. The pinned RustFS
+(the default local fixture) behaves like Scaleway on every row.
+
+Contended conditional writes (`qual doctor --local`, 1000 rounds x 32
+contenders per race): both fixtures give exactly one winner every round.
+RustFS resets the connection of some losers instead of sending their 412
+(0 to 4115 Unknown replies per 31,000 losers depending on the run, never a
+winner); MinIO answers every loser 412.
 
 ## Library latency on Scaleway (2026-11-08, `qual stress --remote --ops 400 --workers 8 --cold 10`)
 
@@ -64,8 +71,8 @@ whole inline tail (up to 31 KiB, D16) until it is flushed to an object.
 
 ## Suites run against Scaleway (2026-11-08)
 
-`GARDEN_TEST_MINIO=1 GARDEN_TEST_REMOTE=1` points every `storetest.MinIO`
-caller at `QUAL_S3_*`. Root core suite (create/update inline and upload,
+`GARDEN_TEST_S3=1 GARDEN_TEST_REMOTE=1` (then named `GARDEN_TEST_MINIO`)
+points every `storetest.Local` caller at `QUAL_S3_*`. Root core suite (create/update inline and upload,
 read, lookup, takeover/release, migrate, export/import, collect, restart
 with an empty cache, fault-scripted resolve branches through the proxy):
 all pass in 88 s. `internal/store`: all pass. Kill harness

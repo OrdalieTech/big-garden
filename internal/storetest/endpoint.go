@@ -1,7 +1,7 @@
 // Package storetest holds the storage test fixtures (PLAN §15.1): an
 // in-memory linearizable store with scheduled faults (Mem), a fault proxy
 // that preserves signed requests to real S3 endpoints (Proxy), and helpers
-// that locate a pinned local MinIO or a remote test endpoint. It is imported
+// that locate a pinned local S3 server or a remote test endpoint. It is imported
 // only by tests and qualification code, never by the library.
 package storetest
 
@@ -84,32 +84,55 @@ func RemoteFromEnv() (Endpoint, error) {
 	return e, nil
 }
 
-// MinIO fixture: container name, address and test-only credentials.
+// Local S3 fixtures: pinned servers under rootless podman (PLAN §15.1),
+// each with its image digest in research.lock.json. RustFS is the default;
+// MinIO stays selectable because it alone reproduces a GET that blocks ~30 s
+// behind a stalled conditional PUT (docs/PERFORMANCE.md).
 const (
-	MinIOEnv       = "GARDEN_TEST_MINIO" // set (to anything) to run MinIO tests
-	minioName      = "state-minio"
-	minioAddr      = "127.0.0.1:9000"
-	minioUser      = "stateminio"
-	minioPassword  = "stateminio-secret"
-	minioBucket    = "state-test"
-	minioTmpfsSize = "1g"
+	LocalEnv       = "GARDEN_TEST_S3"        // set (to anything) to run the local S3 tests
+	legacyLocalEnv = "GARDEN_TEST_MINIO"     // older name of LocalEnv, still honored
+	ServerEnv      = "GARDEN_TEST_S3_SERVER" // "rustfs" (default) or "minio"
+	localBucket    = "state-test"
+	localTmpfs     = "/data:rw,size=1g,mode=1777"
 )
 
-// RemoteEnv, set (to anything) together with GARDEN_TEST_MINIO, runs the
-// MinIO tests against the remote endpoint of RemoteFromEnv instead.
+type fixture struct {
+	name, addr, lockKey, user, password string
+	run                                 func(image string) []string // podman run arguments after the image's ports
+}
+
+var fixtures = map[string]fixture{
+	"rustfs": {"state-rustfs", "127.0.0.1:9100", "rustfs_fixture", "staterustfs", "staterustfs-secret",
+		func(image string) []string {
+			return []string{"-p", "127.0.0.1:9100:9000", "-e", "RUSTFS_ACCESS_KEY=staterustfs", "-e", "RUSTFS_SECRET_KEY=staterustfs-secret",
+				"-e", "RUSTFS_CONSOLE_ENABLE=false", "--tmpfs", localTmpfs, image, "/data"}
+		}},
+	"minio": {"state-minio", "127.0.0.1:9000", "minio_fixture", "stateminio", "stateminio-secret",
+		func(image string) []string {
+			return []string{"-p", "127.0.0.1:9000:9000", "-p", "127.0.0.1:9001:9001",
+				"-e", "MINIO_ROOT_USER=stateminio", "-e", "MINIO_ROOT_PASSWORD=stateminio-secret",
+				"--tmpfs", localTmpfs, image, "server", "/data", "--console-address", ":9001"}
+		}},
+}
+
+// RemoteEnv, set (to anything) together with GARDEN_TEST_S3, runs the local
+// S3 tests against the remote endpoint of RemoteFromEnv instead.
 const RemoteEnv = "GARDEN_TEST_REMOTE"
 
-// MinIO returns a fresh prefix on the local MinIO fixture, starting the
-// container if needed, or with GARDEN_TEST_REMOTE on the remote endpoint,
+// LocalOn reports whether GARDEN_TEST_S3 (or GARDEN_TEST_MINIO) is set.
+func LocalOn() bool { return os.Getenv(LocalEnv) != "" || os.Getenv(legacyLocalEnv) != "" }
+
+// Local returns a fresh prefix on the selected local S3 fixture, starting
+// the container if needed, or with GARDEN_TEST_REMOTE on the remote endpoint,
 // where missing configuration fails the test with
-// blocked_missing_remote_configuration. It skips t only when
-// GARDEN_TEST_MINIO is unset; a fixture that cannot start fails the test.
-func MinIO(t testing.TB) Endpoint {
+// blocked_missing_remote_configuration. It skips t only when GARDEN_TEST_S3
+// is unset; a fixture that cannot start fails the test.
+func Local(t testing.TB) Endpoint {
 	t.Helper()
-	if os.Getenv(MinIOEnv) == "" {
-		t.Skip(MinIOEnv + " is not set")
+	if !LocalOn() {
+		t.Skip(LocalEnv + " is not set")
 	}
-	start := StartMinIO
+	start := StartLocal
 	if os.Getenv(RemoteEnv) != "" {
 		start = func(context.Context) (Endpoint, error) { return RemoteFromEnv() }
 	}
@@ -120,28 +143,34 @@ func MinIO(t testing.TB) Endpoint {
 	return e.Sub(strings.ReplaceAll(t.Name(), "/", "_"))
 }
 
-// StartMinIO makes sure the pinned MinIO container (image digest from
-// research.lock.json) serves on 127.0.0.1:9000 and has the test bucket. It
-// reuses a running state-minio container and refuses one with another image.
-func StartMinIO(ctx context.Context) (Endpoint, error) {
-	e := Endpoint{URL: "http://" + minioAddr, Region: "us-east-1", Bucket: minioBucket, Prefix: "t",
-		AccessKey: minioUser, SecretKey: minioPassword}
-	image, err := lockedMinIOImage()
+// StartLocal makes sure the fixture named by GARDEN_TEST_S3_SERVER (image
+// digest from research.lock.json) serves on its 127.0.0.1 port and has the
+// test bucket. It reuses a running container of that name and refuses one
+// with another image.
+func StartLocal(ctx context.Context) (Endpoint, error) {
+	server := os.Getenv(ServerEnv)
+	if server == "" {
+		server = "rustfs"
+	}
+	f, ok := fixtures[server]
+	if !ok {
+		return Endpoint{}, fmt.Errorf("%s=%q: want rustfs or minio", ServerEnv, server)
+	}
+	e := Endpoint{URL: "http://" + f.addr, Region: "us-east-1", Bucket: localBucket, Prefix: "t",
+		AccessKey: f.user, SecretKey: f.password}
+	image, err := lockedImage(f.lockKey)
 	if err != nil {
 		return e, err
 	}
-	out, err := exec.CommandContext(ctx, "podman", "inspect", "--format", "{{.State.Running}} {{.ImageName}}", minioName).Output()
+	out, err := exec.CommandContext(ctx, "podman", "inspect", "--format", "{{.State.Running}} {{.ImageName}}", f.name).Output()
 	switch {
 	case err != nil: // absent: start it, detached from this process group
-		cmd := exec.CommandContext(ctx, "setsid", "podman", "run", "-d", "--name", minioName,
-			"-p", minioAddr+":9000", "-p", "127.0.0.1:9001:9001",
-			"-e", "MINIO_ROOT_USER="+minioUser, "-e", "MINIO_ROOT_PASSWORD="+minioPassword,
-			"--tmpfs", "/data:rw,size="+minioTmpfsSize+",mode=1777", image, "server", "/data", "--console-address", ":9001")
+		cmd := exec.CommandContext(ctx, "setsid", append([]string{"podman", "run", "-d", "--name", f.name}, f.run(image)...)...)
 		if b, err := cmd.CombinedOutput(); err != nil {
-			return e, fmt.Errorf("podman run %s: %v: %s", minioName, err, b)
+			return e, fmt.Errorf("podman run %s: %v: %s", f.name, err, b)
 		}
 	case strings.TrimSpace(string(out)) != "true "+image:
-		return e, fmt.Errorf("container %s is %q, want running %s", minioName, strings.TrimSpace(string(out)), image)
+		return e, fmt.Errorf("container %s is %q, want running %s", f.name, strings.TrimSpace(string(out)), image)
 	}
 	c := e.Client(nil)
 	for i := 0; ; i++ {
@@ -150,14 +179,14 @@ func StartMinIO(ctx context.Context) (Endpoint, error) {
 			return e, nil
 		}
 		if i == 50 {
-			return e, fmt.Errorf("minio not ready: %w", err)
+			return e, fmt.Errorf("%s not ready: %w", server, err)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
-// lockedMinIOImage reads image@digest from research.lock.json at the module root.
-func lockedMinIOImage() (string, error) {
+// lockedImage reads image@digest of research.lock.json's key at the module root.
+func lockedImage(key string) (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return "", err
@@ -165,13 +194,12 @@ func lockedMinIOImage() (string, error) {
 	for ; ; dir = filepath.Dir(dir) {
 		b, err := os.ReadFile(filepath.Join(dir, "research.lock.json"))
 		if err == nil {
-			var lock struct {
-				Minio struct{ Image, Digest string } `json:"minio_fixture"`
+			var lock map[string]struct{ Image, Digest string }
+			_ = json.Unmarshal(b, &lock) // other entries have other shapes
+			if f := lock[key]; f.Image != "" && strings.HasPrefix(f.Digest, "sha256:") {
+				return f.Image + "@" + f.Digest, nil
 			}
-			if err := json.Unmarshal(b, &lock); err != nil || lock.Minio.Image == "" || !strings.HasPrefix(lock.Minio.Digest, "sha256:") {
-				return "", fmt.Errorf("research.lock.json: no minio_fixture image digest (%v)", err)
-			}
-			return lock.Minio.Image + "@" + lock.Minio.Digest, nil
+			return "", fmt.Errorf("research.lock.json: no %s image digest", key)
 		}
 		if filepath.Dir(dir) == dir {
 			return "", errors.New("research.lock.json not found above the working directory")

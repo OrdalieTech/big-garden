@@ -26,7 +26,7 @@ import (
 // sizes committed before the kill and requires multi-member batches in most
 // runs of each failpoint.
 func TestBatchKill(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	t.Setenv("GARDEN_TEST_BATCH", "16")
 	runs := 20
 	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {

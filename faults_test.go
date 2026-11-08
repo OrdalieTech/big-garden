@@ -2,7 +2,6 @@ package garden
 
 import (
 	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +11,7 @@ import (
 )
 
 // faultStore is the store of a fault-scripted core test: a Mem, or with
-// GARDEN_TEST_MINIO set the S3 adapter on MinIO through a storetest.Proxy
+// GARDEN_TEST_S3 set the S3 adapter on the local S3 fixture through a storetest.Proxy
 // that translates the same plans into HTTP faults on signed requests.
 type faultStore interface {
 	store.Store
@@ -32,10 +31,10 @@ type proxied struct {
 
 // newStore is the store of a core test (see faultStore).
 func newStore(t *testing.T) faultStore {
-	if os.Getenv(storetest.MinIOEnv) == "" {
+	if !storetest.LocalOn() {
 		return storetest.NewMem()
 	}
-	ep := storetest.MinIO(t)
+	ep := storetest.Local(t)
 	p, err := storetest.NewProxy(ep.URL)
 	if err != nil {
 		t.Fatal(err)

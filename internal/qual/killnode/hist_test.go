@@ -420,7 +420,7 @@ func TestLinearizabilityChecker(t *testing.T) {
 // history must be rejected, and the ledger is checked from S3 after every
 // node process and cache is gone.
 func TestRoutedHistories(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	runs := killRuns()
 	var st histStats
 	for i := range runs {

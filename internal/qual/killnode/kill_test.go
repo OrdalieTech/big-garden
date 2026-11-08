@@ -143,7 +143,7 @@ func newID() string {
 // killed one's directory in odd runs) retries the unknown operation with the
 // same ID and the parent's acknowledgment ledger is checked.
 func TestProcessKill(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	runs := 20
 	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
 		runs, _ = strconv.Atoi(s)
@@ -414,7 +414,7 @@ func (p *proc) stopped() bool {
 // b's lineage holds it; a strong read from a never shows a state without b's
 // acknowledged writes; the ledger is checked through a third node c.
 func TestStaleOwner(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	runs := 20
 	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
 		runs, _ = strconv.Atoi(s)

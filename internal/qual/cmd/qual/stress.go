@@ -30,7 +30,7 @@ import (
 // a fresh random prefix and deleted afterwards.
 func stress(args []string) error {
 	fs := flag.NewFlagSet("stress", flag.ContinueOnError)
-	local := fs.Bool("local", false, "use the pinned local MinIO fixture")
+	local := fs.Bool("local", false, "use the pinned local S3 fixture (GARDEN_TEST_S3_SERVER: rustfs or minio)")
 	remote := fs.Bool("remote", false, "use QUAL_S3_* and AWS_* (missing: blocked_missing_remote_configuration)")
 	ops := fs.Int("ops", 200, "operations per latency phase")
 	workers := fs.Int("workers", 8, "concurrent clients of the concurrent phase (one entity each)")
@@ -49,7 +49,7 @@ func stress(args []string) error {
 	case *remote:
 		ep, err = storetest.RemoteFromEnv()
 	case *local:
-		ep, err = storetest.StartMinIO(context.Background())
+		ep, err = storetest.StartLocal(context.Background())
 	default:
 		return errors.New("choose --local or --remote")
 	}

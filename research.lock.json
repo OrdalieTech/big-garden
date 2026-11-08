@@ -117,6 +117,25 @@
     {"module": "github.com/superfly/ltx@v0.5.3", "path": "go.mod", "git_blob": "f78d963480bd526d319492d3b9956933af32a0f8"},
     {"module": "github.com/anishathalye/porcupine@v1.3.1", "path": "model.go, porcupine.go", "note": "Model/Operation API"}
   ],
+  "rustfs_fixture": {
+    "image": "docker.io/rustfs/rustfs",
+    "digest": "sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2",
+    "digest_kind": "OCI image index (amd64 + arm64, plus attestation manifests)",
+    "platform_manifests": {
+      "linux/amd64": "sha256:e287e99762a4a3e7b706526e01f2ff755f67db165e9be9f6b907adc6fb6d6ee1",
+      "linux/arm64": "sha256:6be0def183a9ec8c05147594ac71c030648fcb0a4b79f29f74cebd1d128ba17a"
+    },
+    "tag": "1.0.4 (latest stable release on Docker Hub; 'latest' resolved to the same index on 2026-11-08)",
+    "rustfs_version": "rustfs 1.0.4, revision 46337942d55f3a8e6a97b147ca98d9ea8115555d, release build 2026-10-25, x86_64-unknown-linux-musl",
+    "image_created": "2026-10-25T16:28:08Z",
+    "license": "Apache-2.0",
+    "pull": "podman pull docker.io/rustfs/rustfs:1.0.4 (rootless podman 5.8.9, 2026-11-08), resolved to the digest above; run by digest only",
+    "container": "state-rustfs on 127.0.0.1:9100 (S3 port only, console disabled), tmpfs /data, started by storetest.StartLocal",
+    "qualification": "QUALIFIED 2026-11-08 at this digest, default local fixture since then. qual doctor --local (GARDEN_TEST_S3_SERVER=rustfs), two runs, every check pass: create-race 1000/1000 rounds x 32 contenders with exactly one winner (unknown replies 0, then 2431); cas-race 1000/1000 with one winner, stale token 412, winner visible on the other connection pool, conditional GET 304 (unknown replies 4115, then 1071); immutable-create 412; cas-create-update-stale 412; cas-missing-key 404 NoSuchKey; conditional-get 304; get-absent 404; truncated and corrupted GET bodies rejected after 4 requests; put-corrupted-request 400 BadDigest and nothing stored; cas-5xx-one-attempt 1 request; get-5xx-bounded-retry 4 requests; cas-lost-reply and cas-late-apply-after-cancel applied; cas-hedge stalled request answered 412 after release; physical-attempt-count adapter 19 = proxy 19. The same doctor on the pinned MinIO: all pass, 0 unknown replies in both races.",
+    "stall_probe": "qual stall --local --stall 40s: like Scaleway, unlike MinIO. GETs during a stalled If-Match, unconditional or If-None-Match: * PUT answer in 1-2 ms with the old state (MinIO: 29.3 s for both conditional cases); the stalled PUT completes 200 at 40 s; with a competing write during the stall the racer wins in 3-4 ms and the stalled PUT gets 412 at 40 s (condition evaluated at body completion), racer's value stored.",
+    "suites": "GARDEN_TEST_S3=1: root, internal/store, internal/storetest, internal/qual/cmd/qual pass; GARDEN_KILL_RUNS=5 internal/qual/killnode pass with batching off (10 histories, 6343 ops, all linearizable, 0 inconclusive) and with GARDEN_TEST_BATCH=16 (10 histories, 8830 ops, 0 inconclusive). TestConcurrentTakeover waited 0 times for a stalled CAS (MinIO-only behavior).",
+    "finding": "Under 32-way contention on one key RustFS resets the TCP connection of some losing conditional PUTs (client: read: connection reset by peer, 7-115 ms) instead of delivering their 412: 3-13% of losers in some doctor races, 0 of 31000 losers in another 1000-round run, never a round's winner. Safe (the adapter classifies them Unknown and the library resolves them by reading), but a definite answer is lost; MinIO delivers every 412. The server waits for the full body before answering 412 and keeps connections usable after a 412 (raw-socket checks), so the cause is inside RustFS under load, not isolated further."
+  },
   "minio_fixture": {
     "image": "cgr.dev/chainguard/minio",
     "digest": "sha256:869ca3178831d9f521ea02258a0f0d4fbc1e9f84302e707514e1f861b860865d",

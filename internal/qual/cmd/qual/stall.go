@@ -27,7 +27,7 @@ import (
 // a fresh random prefix and deleted afterwards.
 func stall(args []string) error {
 	fs := flag.NewFlagSet("stall", flag.ContinueOnError)
-	local := fs.Bool("local", false, "use the pinned local MinIO fixture")
+	local := fs.Bool("local", false, "use the pinned local S3 fixture (GARDEN_TEST_S3_SERVER: rustfs or minio)")
 	remote := fs.Bool("remote", false, "use QUAL_S3_* and AWS_* (missing: blocked_missing_remote_configuration)")
 	hold := fs.Duration("stall", 40*time.Second, "how long the PUT body stalls")
 	if err := fs.Parse(args); err != nil {
@@ -39,7 +39,7 @@ func stall(args []string) error {
 	case *remote:
 		ep, err = storetest.RemoteFromEnv()
 	case *local:
-		ep, err = storetest.StartMinIO(context.Background())
+		ep, err = storetest.StartLocal(context.Background())
 	default:
 		return errors.New("choose --local or --remote")
 	}

@@ -18,7 +18,10 @@ Generic Go library: durable SQLite entities over S3. `docs/PLAN.md` is the contr
 
 ## S3
 
-- Local: MinIO under rootless podman with a pinned image digest (recorded in `research.lock.json`). Start it with `setsid nohup` and a fixed name `state-minio`, on port 9000/9001 bound to 127.0.0.1.
+- Local: a pinned real server under rootless podman, image digest recorded in `research.lock.json`. `GARDEN_TEST_S3=1` (the older `GARDEN_TEST_MINIO=1` still works) runs the local S3 tests; `storetest.StartLocal` starts the fixture selected by `GARDEN_TEST_S3_SERVER`, detached with `setsid`:
+  - `rustfs` (default): container `state-rustfs`, RustFS (`rustfs_fixture`), 127.0.0.1:9100, tmpfs data.
+  - `minio`: container `state-minio`, MinIO (`minio_fixture`), 127.0.0.1:9000/9001. Keep it for the one behavior no other fixture reproduces: a GET blocks ~30 s behind a stalled conditional PUT (docs/PERFORMANCE.md).
+  - `qual doctor --local` and `qual stall --local` probe the selected fixture; rerun both after any digest change.
 - Remote (Scaleway fr-par): load `~/code/monogram/.env.deploy`, then map `AWS_ACCESS_KEY_ID=$SCW_ACCESS_KEY`, `AWS_SECRET_ACCESS_KEY=$SCW_SECRET_KEY`, region `fr-par`, endpoint `https://s3.fr-par.scw.cloud`, bucket `monogram`. **Only ever write, list or delete under the `qual-state/` prefix.** Never read or touch `prod/` or `backup/`: they hold live production data. Clean up your random sub-prefix when done. Never print or commit credentials.
 
 ## Git

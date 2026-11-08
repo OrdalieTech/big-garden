@@ -26,7 +26,7 @@ import (
 // random prefix and deletes it afterwards.
 func doctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	local := fs.Bool("local", false, "use the pinned local MinIO fixture (started if needed)")
+	local := fs.Bool("local", false, "use the pinned local S3 fixture (GARDEN_TEST_S3_SERVER: rustfs or minio) (started if needed)")
 	remote := fs.Bool("remote", false, "use QUAL_S3_ENDPOINT/REGION/BUCKET/PREFIX and AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY")
 	requireRemote := fs.Bool("require-remote", false, "missing remote configuration is blocked_missing_remote_configuration")
 	var cfg doctorConfig
@@ -44,7 +44,7 @@ func doctor(args []string) error {
 	case *remote || *requireRemote:
 		ep, err = storetest.RemoteFromEnv()
 	case *local:
-		ep, err = storetest.StartMinIO(context.Background())
+		ep, err = storetest.StartLocal(context.Background())
 	default:
 		return errors.New("choose --local or --remote")
 	}

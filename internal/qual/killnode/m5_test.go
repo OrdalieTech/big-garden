@@ -131,7 +131,8 @@ func (m *mnode) kill() {
 // between the headers and the body of its head CAS (If-Match PUT), the pinned
 // MinIO holds the object's lock and every GET of that head blocks until the
 // server drops the stalled request after about 30 s (measured: an
-// unconditional PUT does not block readers). The library then correctly
+// unconditional PUT does not block readers; the pinned RustFS and Scaleway
+// never block). The library then correctly
 // answers unavailable; this waits up to 60 s for the store to recover and
 // reports whether it had to. Any other failure is fatal.
 func resolveAfterStall(t *testing.T, e endpoint, key string) (*Rt, bool) {
@@ -236,7 +237,7 @@ func (l *ledger) check(t *testing.T, ep storetest.Endpoint, key, inc string, iss
 // winner's Route, the previous owner and the losers cannot commit, the
 // resumed a publishes nothing new, and the ledger survives.
 func TestConcurrentTakeover(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	runs := killRuns()
 	var procWins, inWins, staleAcks, stalls int
 	for i := range runs {
@@ -427,7 +428,7 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 // acknowledgment replays the same value and sequence, and the same ID with
 // another hash is id_conflict on any node.
 func TestSameIDSeveralNodes(t *testing.T) {
-	base := storetest.MinIO(t)
+	base := storetest.Local(t)
 	runs := killRuns()
 	var tl [4]int // both nodes acked across a takeover, conflict refusals, replays after takeover, stopped-owner acks
 	for i := range runs {
