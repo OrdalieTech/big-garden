@@ -56,7 +56,7 @@ func (l Limits) resolve() (Limits, error) {
 	orDefault(&l.InflightStorage, 64)
 	orDefault(&l.PendingPerEntity, 64)
 	orDefault(&l.Recoveries, 8)
-	orDefault(&l.BatchMax, 1)
+	orDefault(&l.BatchMax, maxBatch) // group commit on (DECISIONS D18)
 	orDefault(&l.StorageAttemptTimeout, 2*time.Second)
 	orDefault(&l.CommitTimeout, 10*time.Second)
 	orDefault(&l.IdleTimeout, 60*time.Second)

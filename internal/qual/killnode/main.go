@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -33,6 +34,7 @@ import (
 type Req struct {
 	Op, Key, Inc, ID, Input string
 	Big                     bool // add a 40 KiB pad so the delta is an object, not inline
+	Fail                    bool // add: the callback inserts its row, then returns errRefused
 	Tag                     string
 	Route                   *Rt
 }
@@ -82,7 +84,7 @@ func main() {
 	flag.Parse()
 	ep.Region, ep.AccessKey, ep.SecretKey = "us-east-1", os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	ctx := context.Background()
-	batch, _ := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")) // Limits.BatchMax (unset: 1)
+	batch, _ := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")) // Limits.BatchMax (unset: the default)
 	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(nil), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: node, CacheDir: cache,
 		Limits: garden.Limits{CommitTimeout: *commit, StorageAttemptTimeout: min(*commit, 2*time.Second), BatchMax: batch}})
 	if err != nil {
@@ -128,6 +130,10 @@ func main() {
 	n.Close(ctx)
 }
 
+// errRefused is the callback error of a Fail add: it must reach the caller
+// unchanged (code "other") and roll its row back.
+var errRefused = errors.New("refused by callback")
+
 func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 	var id garden.MutationID
 	hex.Decode(id[:], []byte(r.ID))
@@ -152,8 +158,8 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 			rand.Read(pad)
 		}
 		res, err = n.Update(ctx, ref, req, func(tx *garden.Tx) ([]byte, error) {
-			if _, err := tx.Exec(ctx, "INSERT INTO log VALUES (?, ?)", r.ID, pad); err != nil {
-				return nil, err
+			if _, err := tx.Exec(ctx, "INSERT INTO log VALUES (?, ?)", r.ID, pad); err != nil || r.Fail {
+				return nil, cmp.Or(err, errRefused)
 			}
 			var c int
 			err := tx.Query(ctx, "SELECT count(*) FROM log", nil, func(rows *sql.Rows) error {

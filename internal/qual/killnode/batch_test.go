@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,15 +17,29 @@ import (
 // TestBatchKill is TestProcessKill with group commit (PROTOCOL §6 Batches):
 // one entity, 8 concurrent clients (8 adds each, every other one 40 KiB so
 // most publications upload) against one node process with BatchMax 16,
-// SIGKILLed at each failpoint's nth pass (n random in 4..6; reply: the
-// 10th..39th reply; net.*: the proxy fault armed after 10..39 replies).
+// SIGKILLed at each failpoint's nth pass (n random in 4..6; sql.member:
+// 4..40; reply: the 10th..39th reply; net.*: the proxy fault armed after
+// 10..39 replies).
 // The restart alternates an empty cache and the killed one's, every unknown
 // is retried with its ID, and the ledger is checked as in killRun. The
 // "unpublished invisible" check of killRun does not apply: with concurrent
 // clients a committed member may die before its reply is written. Every
 // add reply carries the node's Stats.Batches, so the test reports the batch
 // sizes committed before the kill and requires multi-member batches in most
-// runs of each failpoint.
+// runs of each failpoint; for sql.member, a failpoint inside a member's
+// transaction (reached only while a batch of at least two is being
+// assembled), the killed batch counts too.
+//
+// Partial batches: some adds are held-outcome members (PROTOCOL §6
+// Batches): clients 0-2 send a callback that inserts its row and then fails
+// at their 3rd and 6th add, client 3 reuses its last acknowledged ID with
+// another input (id_conflict) and client 4 replays it, at their 3rd and 6th
+// add. A first answer must be the final outcome (the callback's error
+// unchanged, id_conflict, or the acknowledged result replayed), or
+// unavailable / outcome_unknown / no reply when the publication did not
+// commit; after the restart every one that was not final is retried and
+// must reach its final outcome, and the ledger checks hold (a failed
+// callback's row never appears).
 func TestBatchKill(t *testing.T) {
 	base := storetest.Local(t)
 	t.Setenv("GARDEN_TEST_BATCH", "16")
@@ -32,18 +47,22 @@ func TestBatchKill(t *testing.T) {
 	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
 		runs, _ = strconv.Atoi(s)
 	}
-	for _, fp := range failpoints {
+	for _, fp := range append(slices.Clone(failpoints), "sql.member") {
 		t.Run(fp, func(t *testing.T) {
 			var tot tally
 			var sizes [16]uint64
 			multi := 0
+			partial := map[string]int{}
 			for i := range runs {
 				ep := base.Sub(fmt.Sprintf("batch-%s-%d", fp, i))
 				n := 4 + rand.N(3)
-				if fp == "reply" || strings.HasPrefix(fp, "net.") {
+				switch {
+				case fp == "reply" || strings.HasPrefix(fp, "net."):
 					n = 10 + rand.N(30)
+				case fp == "sql.member": // ~7 member passes per batch: also land in batches with held-outcome members
+					n = 4 + rand.N(37)
 				}
-				r, b := batchKillRun(t, ep, fp, n, i%2 == 1)
+				r, b := batchKillRun(t, ep, fp, n, i%2 == 1, partial)
 				tot.killed, tot.acked, tot.unknown, tot.replayed = tot.killed+r.killed, tot.acked+r.acked, tot.unknown+r.unknown, tot.replayed+r.replayed
 				m := uint64(0)
 				for k := range b {
@@ -52,7 +71,7 @@ func TestBatchKill(t *testing.T) {
 						m += b[k]
 					}
 				}
-				if m > 0 {
+				if m > 0 || (fp == "sql.member" && r.killed > 0) {
 					multi++
 				}
 				clean(t, ep)
@@ -61,8 +80,9 @@ func TestBatchKill(t *testing.T) {
 				}
 			}
 			t.Logf("%s: %d runs, %d killed at the failpoint, %d with a multi-member batch committed before the kill; "+
-				"batch sizes before the kill (members:publications) %s; %d acknowledged ops, %d unknown retried (%d replayed a commit)",
-				fp, runs, tot.killed, multi, batchSizes(sizes), tot.acked, tot.unknown, tot.replayed)
+				"batch sizes before the kill (members:publications) %s; %d acknowledged ops, %d unknown retried (%d replayed a commit); "+
+				"held-outcome members (kind:first answer, all final after the restart) %v",
+				fp, runs, tot.killed, multi, batchSizes(sizes), tot.acked, tot.unknown, tot.replayed, partial)
 			if tot.killed == 0 {
 				t.Fatalf("failpoint %s never fired", fp)
 			}
@@ -75,7 +95,7 @@ func TestBatchKill(t *testing.T) {
 
 // batchKillRun returns the largest Stats.Batches seen in a reply of the
 // killed process.
-func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, reuse bool) (tl tally, batches []uint64) {
+func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, reuse bool, partial map[string]int) (tl tally, batches []uint64) {
 	t.Helper()
 	cache := t.TempDir()
 	failpoint := fmt.Sprintf("%s:%d", mode, armAt)
@@ -109,6 +129,7 @@ func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, r
 		create.outcome, create.resp = "failed", resp
 	}
 	ops := []*op{create}
+	var held []*special
 	inc := create.resp.Inc
 	done := make(chan struct{})
 	if create.outcome != "ack" {
@@ -161,24 +182,65 @@ func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, r
 		var omu sync.Mutex
 		for c := range 8 {
 			wg.Go(func() {
+				var last *op // this client's last acknowledged add
 				for i := range 8 {
 					o := &op{req: Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: fmt.Sprintf("%d-%d", c, i), Big: i%2 == 1,
 						Tag: fmt.Sprintf("%d-%d", c, i)}}
+					var s *special
+					switch {
+					case c < 3 && i%3 == 2:
+						o.req.Fail = true
+						s = &special{kind: "fail", req: o.req}
+					case (c == 3 || c == 4) && i%3 == 2:
+						s = &special{kind: "replay", req: last.req, ack: last.resp}
+						s.req.Tag = o.req.Tag
+						if c == 3 {
+							s.kind, s.req.Input = "conflict", s.req.Input+"-reuse"
+						}
+					}
 					omu.Lock()
-					ops = append(ops, o)
+					if s != nil {
+						held = append(held, s)
+					} else {
+						ops = append(ops, o)
+					}
 					omu.Unlock()
 					ch := make(chan *Resp, 1)
 					mu.Lock()
 					if dead {
 						mu.Unlock()
 						o.outcome = "unknown"
+						if s != nil {
+							s.first = "unsent"
+						}
 						return
 					}
 					pending[o.req.Tag] = ch
 					b, _ := json.Marshal(o.req)
+					if s != nil {
+						b, _ = json.Marshal(s.req)
+					}
 					p.in.Write(append(b, '\n'))
 					mu.Unlock()
 					r := <-ch
+					if s != nil {
+						switch {
+						case r == nil:
+							s.first = "none"
+						case s.final(*r):
+							s.first = "final"
+							continue
+						case r.Code == "outcome_unknown" || r.Code == "unavailable":
+							s.first = r.Code
+							if px != nil && r.Code == "outcome_unknown" {
+								p.cmd.Process.Kill()
+							}
+						default:
+							s.first = "bad"
+							t.Errorf("%s: held-outcome %s member %s answered %+v", failpoint, s.kind, s.req.ID, r)
+						}
+						return
+					}
 					switch {
 					case r == nil:
 						o.outcome = "unknown"
@@ -196,6 +258,7 @@ func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, r
 					if o.outcome != "ack" {
 						return
 					}
+					last = o
 				}
 			})
 		}
@@ -243,6 +306,17 @@ func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, r
 			inc = resp.Inc
 		} else {
 			committed[r.ID] = true
+		}
+	}
+	for _, s := range held {
+		partial[s.kind+":"+s.first]++
+		if s.first == "final" {
+			continue
+		}
+		r := s.req
+		r.Inc = inc
+		if resp := call(r); !s.final(resp) {
+			t.Fatalf("%s: retry of held-outcome %s member %s (first answer %s): %+v", failpoint, s.kind, r.ID, s.first, resp)
 		}
 	}
 	if mode == "net.late" && !reuse && inc != "" {
@@ -313,4 +387,26 @@ func sum(b []uint64) (s uint64) {
 		s += v
 	}
 	return s
+}
+
+// special is a held-outcome member of TestBatchKill: a failing callback
+// ("fail"), or an acknowledged add's ID reused with another input
+// ("conflict") or replayed ("replay"). first is how its first attempt ended:
+// "final", "unavailable", "outcome_unknown", "none" (no reply) or "unsent".
+type special struct {
+	kind, first string
+	req         Req
+	ack         Resp // the acknowledged add whose ID it reuses
+}
+
+// final reports whether r is s's outcome once the publication that
+// answers it committed (PROTOCOL §6 Batches).
+func (s *special) final(r Resp) bool {
+	switch s.kind {
+	case "fail":
+		return r.Code == "other" && strings.Contains(r.Err, "refused by callback")
+	case "conflict":
+		return r.Code == "id_conflict"
+	}
+	return r.OK && r.Replayed && r.Value == s.ack.Value && r.Seq == s.ack.Seq
 }

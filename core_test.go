@@ -72,7 +72,7 @@ func testNode(t *testing.T, mem store.Store, nodeID string, mod func(*Limits)) *
 	t.Helper()
 	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: nodeID, CacheDir: t.TempDir(),
 		Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}
-	if b, err := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")); err == nil { // every core test again with batching on
+	if b, err := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")); err == nil { // =1: every core test again on the unbatched path
 		cfg.Limits.BatchMax = b
 	}
 	if mod != nil {
