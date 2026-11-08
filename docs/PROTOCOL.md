@@ -96,7 +96,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 
 ## 4. Activation (cold restore of exactly head `H`, PLAN §9.3)
 
-1. Reserve cache bytes (`4×EntityBytes + 1 MiB`) under the cache policy (§7); else `capacity`.
+1. Take one of `Limits.Recoveries` activation slots, waiting within the caller's ctx (else `capacity`). Reserve cache bytes (`4×EntityBytes + 1 MiB`) under the cache policy (§7); else `capacity`.
 2. GET snapshot and deltas (≤ 4 concurrent), `max = ref.bytes`. The tail needs no GET: its bytes are in `H`. Check length and SHA-256. `NotFound` or mismatch: GET head again; if it changed, restart with the new head (collection race); else `state_missing` (missing) or `corrupt` (mismatch).
 3. Into a new private file (`O_EXCL`, 0600) in the session cache dir: apply the snapshot, then each delta in order, then the tail as `Tail.Ref()` over `tail.data`. Per object: `MinTXID/MaxTXID` = ref range, `PreApplyChecksum` = running checksum, decoder close succeeds, truncate to `Commit` pages, recomputed checksum = trailer post-checksum = `ref.post_checksum`.
 4. Check `page_count = H.page_count` and checksum = `H.database_checksum`.

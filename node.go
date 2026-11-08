@@ -26,12 +26,13 @@ type Node struct {
 	lock *os.File // holds the flock on dir
 	now  func() time.Time
 
-	mu       sync.Mutex
-	entities map[string]*entity
-	reserved int64        // cache bytes reserved by activations in progress
-	staging  atomic.Int64 // bytes of objects being uploaded (Stats)
-	logged   atomic.Int64 // unix nanos of the last log line (rate limit)
-	closed   bool
+	mu         sync.Mutex
+	entities   map[string]*entity
+	reserved   int64         // cache bytes reserved by activations in progress
+	recoveries chan struct{} // one token per activation in progress (Limits.Recoveries)
+	staging    atomic.Int64  // bytes of objects being uploaded (Stats)
+	logged     atomic.Int64  // unix nanos of the last log line (rate limit)
+	closed     bool
 
 	done            chan struct{} // closed by Close: stops the sweeper
 	counters        counters
@@ -50,7 +51,8 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now}
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now,
+		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	if err := n.namespace(ctx); err != nil {
 		return nil, err
 	}

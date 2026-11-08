@@ -1331,6 +1331,35 @@ func TestCloseHonorsContext(t *testing.T) {
 	armed.Store(false)
 }
 
+// TestRecoveriesBound: at most Limits.Recoveries activations run at once.
+func TestRecoveriesBound(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	var refs []Ref
+	for i := range 6 {
+		refs = append(refs, mustCreate(t, n, fmt.Sprint("k", i), nil))
+	}
+	var inflight, peak atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if a.Op != "get" || !strings.HasSuffix(a.Key, ".ltx") {
+			return storetest.MemFault{}
+		}
+		peak.Store(max(peak.Load(), inflight.Add(1)))
+		hold := make(chan struct{})
+		time.AfterFunc(50*time.Millisecond, func() { inflight.Add(-1); close(hold) })
+		return storetest.MemFault{Hold: hold}
+	})
+	cold := testNode(t, mem, "a", func(l *Limits) { l.Recoveries = 2 })
+	var wg sync.WaitGroup
+	for _, ref := range refs {
+		wg.Go(func() { readAll(t, cold, ref) })
+	}
+	wg.Wait()
+	if p := peak.Load(); p < 1 || p > 2 {
+		t.Fatalf("peak concurrent activations %d, want at most 2", p)
+	}
+}
+
 func TestMaintenance(t *testing.T) {
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)

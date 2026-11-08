@@ -330,6 +330,12 @@ func sleep(ctx context.Context, i int) error {
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting
 // with the current head if an object vanished or changed under it.
 func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag string) error {
+	select {
+	case n.recoveries <- struct{}{}:
+		defer func() { <-n.recoveries }()
+	case <-ctx.Done():
+		return newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
+	}
 	if err := n.cache(ctx, e); err != nil {
 		return err
 	}
