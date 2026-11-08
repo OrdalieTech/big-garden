@@ -85,23 +85,20 @@ func (n *Node) sweeper() {
 		case <-n.done:
 			return
 		case now := <-t.C:
-			n.evict(now.Add(-n.cfg.Limits.IdleTimeout), 0, nil)
+			n.mu.Lock()
+			n.scan(now.Add(-n.cfg.Limits.IdleTimeout), nil)
+			n.mu.Unlock()
 		}
 	}
 }
 
-// room makes room for self to become resident under ResidentEntities,
-// waiting briefly while every resident entity is busy.
-func (n *Node) room(ctx context.Context, self *entity) bool {
-	for i := 0; i < 100; i++ {
-		if n.evict(time.Time{}, n.cfg.Limits.ResidentEntities, self) {
-			return true
-		}
-		if pause(ctx) != nil {
-			return false
-		}
-	}
-	return false
+// room reports whether self can become resident under ResidentEntities,
+// discarding the least recently admitted idle, settled entity if needed.
+func (n *Node) room(self *entity) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	resident, _, lru := n.scan(time.Time{}, self)
+	return resident < n.cfg.Limits.ResidentEntities || shed(lru)
 }
 
 // pause waits 10 ms or until ctx ends.
@@ -114,17 +111,6 @@ func pause(ctx context.Context) error {
 	case <-t.C:
 		return nil
 	}
-}
-
-// evict discards resident, idle, settled entities last used before cutoff.
-// With keep > 0 it also discards the least recently used one if at least
-// keep entities other than self are resident, and reports whether there is
-// room for self.
-func (n *Node) evict(cutoff time.Time, keep int, self *entity) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	resident, _, lru := n.scan(cutoff, self)
-	return keep == 0 || resident < keep || shed(lru)
 }
 
 // scan walks the entities other than self under n.mu, never blocking on an
@@ -350,8 +336,10 @@ func (n *Node) buildBytes() int64 { return 4*n.cfg.Limits.EntityBytes + 1<<20 }
 // building its file (PROTOCOL §4 step 1, §7 cache policy); the caller
 // releases the reserve with unreserve once the file is built.
 func (n *Node) cache(ctx context.Context, e *entity) error {
-	if !n.room(ctx, e) {
-		return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
+	for i := 0; !n.room(e); i++ { // wait briefly while every resident entity is busy
+		if i == 100 || pause(ctx) != nil {
+			return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
+		}
 	}
 	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
 		if i == 100 || pause(ctx) != nil {
