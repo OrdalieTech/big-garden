@@ -41,6 +41,7 @@ type Request struct {
 	Seq                    int
 	Method, Path, RawQuery string
 	IfMatch, IfNoneMatch   string
+	Body                   []byte // request body as received (before CorruptRequest)
 	Fault                  Fault
 	Upstream               int // upstream status; 0 if never forwarded or no reply
 	Relayed                bool
@@ -141,7 +142,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	p.mu.Lock()
 	req := Request{Seq: len(p.journal), Method: r.Method, Path: r.URL.Path, RawQuery: r.URL.RawQuery,
-		IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match")}
+		IfMatch: r.Header.Get("If-Match"), IfNoneMatch: r.Header.Get("If-None-Match"), Body: bytes.Clone(body)}
 	if p.plan != nil {
 		req.Fault = p.plan(req)
 	}

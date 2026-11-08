@@ -52,11 +52,10 @@ func (l *ledger) ack(ref Ref, k, v string) {
 // verify reads every acknowledged row through a new Node with an empty cache.
 func (l *ledger) verify(t *testing.T, st store.Store, nodeID string) {
 	t.Helper()
-	if mem, ok := st.(*storetest.Mem); ok {
-		mem.SetPlan(nil)
+	if fs, ok := st.(faultStore); ok {
+		fs.SetPlan(nil)
 	}
-	mem := st
-	n := testNode(t, mem, nodeID, nil)
+	n := testNode(t, st, nodeID, nil)
 	defer n.Close(bg)
 	for key, rows := range l.rows {
 		got := readAll(t, n, Ref{key, l.incs[key]})
@@ -66,28 +65,6 @@ func (l *ledger) verify(t *testing.T, st store.Store, nodeID string) {
 			}
 		}
 	}
-}
-
-// newStore is the store of a core test: a fresh Mem, or with GARDEN_TEST_MINIO
-// set the S3 adapter on a fresh prefix of the MinIO fixture.
-func newStore(t *testing.T) store.Store {
-	if os.Getenv(storetest.MinIOEnv) == "" {
-		return storetest.NewMem()
-	}
-	ep := storetest.MinIO(t)
-	st := store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, 2*time.Second)
-	t.Cleanup(func() { // after the test's Nodes closed (cleanups run last-in first-out)
-		for range 100 {
-			page, _, err := st.List(bg, "", "", 1000)
-			if err != nil || len(page) == 0 {
-				return
-			}
-			for _, o := range page {
-				st.Delete(bg, o.Key)
-			}
-		}
-	})
-	return st
 }
 
 func testNode(t *testing.T, mem store.Store, nodeID string, mod func(*Limits)) *Node {
@@ -221,13 +198,13 @@ func TestOpenNamespace(t *testing.T) {
 		t.Fatal("nodes disagree on the namespace or share a session")
 	}
 	// entities without namespace.json: fail closed
-	mem2 := storetest.NewMem()
+	mem2 := newStore(t)
 	mem2.PutImmutable(bg, head.EntityDir("k")+"/birth.json", []byte("{}"))
 	cfg, _ := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: t.TempDir()}.validate()
 	_, err := open(bg, cfg, mem2)
 	wantCode(t, err, CodeStateMissing)
 	// a store that ignores If-None-Match is unsupported
-	mem3 := storetest.NewMem()
+	mem3 := newStore(t)
 	mem3.SetPlan(func(a storetest.Attempt) storetest.MemFault {
 		if strings.HasPrefix(a.Key, "probe/") && a.Op == "cas" && a.Cond != "" && bytes.Equal(a.Body, []byte("3")) {
 			return storetest.MemFault{Reject: store.Failed}
@@ -446,7 +423,7 @@ func TestConcurrentCreates(t *testing.T) {
 }
 
 // failHeadCAS rejects every head CAS with a definite failure until disarmed.
-func failHeadCAS(mem *storetest.Mem, key string, armed *atomic.Bool) {
+func failHeadCAS(mem faultStore, key string, armed *atomic.Bool) {
 	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
 		if armed.Load() && a.Op == "cas" && a.Key == head.HeadKey(key) {
 			return storetest.MemFault{Reject: store.Unknown}
@@ -456,7 +433,7 @@ func failHeadCAS(mem *storetest.Mem, key string, armed *atomic.Bool) {
 }
 
 func TestCreateResumeD5(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
 	var armed atomic.Bool
 	armed.Store(true)
@@ -589,7 +566,7 @@ func TestSnapshotOnCap(t *testing.T) {
 }
 
 func TestConcurrentSameCreate(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	nodes := []*Node{testNode(t, mem, "a", nil), testNode(t, mem, "b", nil), testNode(t, mem, "c", nil)}
 	req := newReq(t, "same", 1)
 	refs := make([]Ref, len(nodes))
@@ -614,7 +591,7 @@ func TestConcurrentSameCreate(t *testing.T) {
 }
 
 func TestIDExpiredByFloor(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	ahead := testNode(t, mem, "a", nil)
 	ahead.now = func() time.Time { return time.Now().Add(2 * time.Hour) } // a skewed clock moves the floor
 	l := newLedger()
@@ -642,7 +619,7 @@ func TestIDExpiredByFloor(t *testing.T) {
 // TestResolveBranches drives each resolve() branch with scheduled faults.
 func TestResolveBranches(t *testing.T) {
 	t.Run("lost reply after apply", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", nil)
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
@@ -662,7 +639,7 @@ func TestResolveBranches(t *testing.T) {
 		l.verify(t, mem, "a")
 	})
 	t.Run("apply after client cancel, retry same ID", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
@@ -695,7 +672,7 @@ func TestResolveBranches(t *testing.T) {
 		l.verify(t, mem, "a")
 	})
 	t.Run("hedged duplicate", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", nil)
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
@@ -725,7 +702,7 @@ func TestResolveBranches(t *testing.T) {
 		l.verify(t, mem, "a")
 	})
 	t.Run("412 receipt absent", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", nil)
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
@@ -738,7 +715,7 @@ func TestResolveBranches(t *testing.T) {
 		}
 	})
 	t.Run("412 receipt present", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", nil)
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
@@ -768,7 +745,7 @@ func TestResolveBranches(t *testing.T) {
 		}
 	})
 	t.Run("every proposal definitely failed", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", nil)
 		l := newLedger()
 		ref := mustCreate(t, n, "k", l)
@@ -798,7 +775,7 @@ func TestResolveBranches(t *testing.T) {
 		l.verify(t, mem, "a")
 	})
 	t.Run("ambiguous then definite stays unknown", func(t *testing.T) {
-		mem := storetest.NewMem()
+		mem := newStore(t)
 		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
 		var logBuf syncBuffer
 		n.cfg.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
@@ -872,7 +849,7 @@ func (s *syncBuffer) String() string {
 }
 
 func TestResolveObjectBranch(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -907,7 +884,7 @@ func TestResolveObjectBranch(t *testing.T) {
 }
 
 func TestResolveHydrationFailureIsUnknown(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 500 * time.Millisecond })
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
@@ -1049,7 +1026,7 @@ func TestOwnershipAndMigrate(t *testing.T) {
 }
 
 func TestCloseReportsUnresolved(t *testing.T) {
-	mem := storetest.NewMem()
+	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
