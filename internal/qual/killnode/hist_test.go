@@ -260,26 +260,34 @@ type pin struct {
 }
 
 type pout struct {
-	Known bool
-	Value string
-	IDs   []string
+	Known  bool
+	Value  string
+	IDs    []string
+	joined string // IDs concatenated: the state a read must equal
 }
 
+func readOut(ids []string) pout { return pout{Known: true, IDs: ids, joined: strings.Join(ids, "")} }
+
+// The state is the concatenation of the committed IDs (32 hex digits each),
+// so a step costs one substring search and no allocation for reads.
 var ledgerModel = porcupine.Model{
 	Init: func() any { return "" },
 	Step: func(st, in, out any) (bool, any) {
 		s, i, o := st.(string), in.(pin), out.(pout)
 		if !i.Add {
-			return strings.Join(o.IDs, ",") == s, s
+			return o.joined == s, s
 		}
-		var log []string
-		if s != "" {
-			log = strings.Split(s, ",")
+		for off := 0; ; {
+			p := strings.Index(s[off:], i.ID)
+			if p < 0 {
+				break
+			}
+			if p += off; p%len(i.ID) == 0 {
+				return !o.Known || o.Value == strconv.Itoa(p/len(i.ID)+1), s
+			}
+			off = p + 1
 		}
-		if p := slices.Index(log, i.ID); p >= 0 {
-			return !o.Known || o.Value == strconv.Itoa(p+1), s
-		}
-		return !o.Known || o.Value == strconv.Itoa(len(log)+1), strings.Trim(s+","+i.ID, ",")
+		return !o.Known || o.Value == strconv.Itoa(len(s)/len(i.ID)+1), s + i.ID
 	},
 	DescribeOperation: func(in, out any) string {
 		i, o := in.(pin), out.(pout)
@@ -302,13 +310,33 @@ func operations(ops []hop, key string) []porcupine.Operation {
 		if o.Key != key || o.Class == "failed" || (o.Op == "read" && o.Class != "ack") {
 			continue
 		}
+		po := pout{Known: o.Class == "ack", Value: o.Value}
+		if o.Op == "read" {
+			po = readOut(o.IDs)
+		}
 		out = append(out, porcupine.Operation{ClientId: o.Client, Input: pin{o.Op == "add", o.ID},
-			Output: pout{o.Class == "ack", o.Value, o.IDs}, Call: o.Start, Return: o.End})
+			Output: po, Call: o.Start, Return: o.End})
 	}
 	return out
 }
 
 const checkTimeout = 60 * time.Second
+
+// linearizable checks one entity's operations. It first checks the strict
+// history without the unknown adds: a linearization of it extends to the
+// whole history (each unknown add goes right after its ID's commit as a
+// replay without known output, or at the very end as an append if its ID
+// never committed), so Ok there is Ok for the whole history and only fewer
+// explanations were allowed. Otherwise it checks the whole history (full is
+// true), where unknown adds may take effect; porcupine's search over several
+// long-open unknown adds can be exponential, and Unknown fails the test.
+func linearizable(ops []porcupine.Operation) (res porcupine.CheckResult, full bool) {
+	strict := slices.DeleteFunc(slices.Clone(ops), func(o porcupine.Operation) bool { return o.Return == math.MaxInt64 })
+	if porcupine.CheckOperationsTimeout(ledgerModel, strict, checkTimeout) == porcupine.Ok {
+		return porcupine.Ok, false
+	}
+	return porcupine.CheckOperationsTimeout(ledgerModel, ops, checkTimeout), true
+}
 
 // TestLinearizabilityChecker is the negative control of the checker itself
 // over hand-made histories: it must reject stale reads, lost
@@ -319,7 +347,7 @@ func TestLinearizabilityChecker(t *testing.T) {
 		return porcupine.Operation{Input: pin{true, id}, Output: pout{Known: value != "", Value: value}, Call: call, Return: ret}
 	}
 	read := func(call, ret int64, ids ...string) porcupine.Operation {
-		return porcupine.Operation{ClientId: 1, Input: pin{}, Output: pout{Known: true, IDs: ids}, Call: call, Return: ret}
+		return porcupine.Operation{ClientId: 1, Input: pin{}, Output: readOut(ids), Call: call, Return: ret}
 	}
 	unknown := func(id string, call int64) porcupine.Operation { return add(id, call, math.MaxInt64, "") }
 	for _, c := range []struct {
@@ -338,7 +366,7 @@ func TestLinearizabilityChecker(t *testing.T) {
 		{"double commit", false, []porcupine.Operation{add("a", 0, 10, "1"), read(20, 30, "a", "a")}},
 		{"read goes back", false, []porcupine.Operation{add("a", 0, 1, "1"), add("b", 0, 1, "2"), read(20, 30, "a", "b"), read(40, 50, "a")}},
 	} {
-		res := porcupine.CheckOperationsTimeout(ledgerModel, c.ops, checkTimeout)
+		res, _ := linearizable(c.ops)
 		if want := map[bool]porcupine.CheckResult{true: porcupine.Ok, false: porcupine.Illegal}[c.ok]; res != want {
 			t.Errorf("%s: %s, want %s", c.name, res, want)
 		}
@@ -363,13 +391,13 @@ func TestRoutedHistories(t *testing.T) {
 			return
 		}
 	}
-	t.Logf("%d runs: %d histories checked linearizable (0 inconclusive), %d-%d ops each (%d total: %d acked adds (%d replayed, %d after an ambiguous attempt), %d unknown adds, %d failed adds, %d reads); %d stale-read mutations rejected (%d histories without a candidate read); %d attempts: %d unanswered, %d not_owner/route_changed followed, %d client takeovers (%d won); %d late replies checked (%d strong reads); faults: %v",
-		runs, st.histories, st.minOps, st.maxOps, st.ops, st.acked, st.replayed, st.ambiguous, st.unknown, st.failed, st.reads, st.controls, st.noControl, st.attempts, st.timeouts, st.redirects, st.takeovers, st.takeoversWon, st.late, st.lateReads, st.faults)
+	t.Logf("%d runs: %d histories checked linearizable (%d needed unknown adds to take effect; 0 inconclusive), %d-%d ops each (%d total: %d acked adds (%d replayed, %d after an ambiguous attempt), %d unknown adds, %d failed adds, %d reads); %d stale-read mutations rejected (%d histories without a candidate read); %d attempts: %d unanswered, %d not_owner/route_changed followed, %d client takeovers (%d won); %d late replies checked (%d strong reads); faults: %v",
+		runs, st.histories, st.fullChecks, st.minOps, st.maxOps, st.ops, st.acked, st.replayed, st.ambiguous, st.unknown, st.failed, st.reads, st.controls, st.noControl, st.attempts, st.timeouts, st.redirects, st.takeovers, st.takeoversWon, st.late, st.lateReads, st.faults)
 }
 
 type histStats struct {
 	histories, minOps, maxOps, ops, acked, replayed, ambiguous, unknown, failed, reads, controls, noControl int
-	attempts, timeouts, redirects, takeovers, takeoversWon, late, lateReads                                 int
+	attempts, timeouts, redirects, takeovers, takeoversWon, late, lateReads, fullChecks                     int
 	faults                                                                                                  map[string]int
 }
 
@@ -384,6 +412,19 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 		}
 	}()
 	h := &history{t0: time.Now()}
+	dump := func(why string) {
+		h.mu.Lock()
+		b, _ := json.MarshalIndent(h, "", " ")
+		h.mu.Unlock()
+		p := filepath.Join(os.TempDir(), fmt.Sprintf("killnode-history-%d-%s.json", run, storetest.RandomHex(3)))
+		os.WriteFile(p, b, 0o644)
+		t.Errorf("run %d: %s; history in %s", run, why, p)
+	}
+	defer func() { // also after a t.Fatal
+		if t.Failed() {
+			dump("failed")
+		}
+	}()
 	keys := []string{"k0", "k1"}
 	inc := map[string]string{}
 	for _, k := range keys {
@@ -448,24 +489,22 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 			}
 		}
 	}
-	dump := func(why string) {
-		b, _ := json.MarshalIndent(h, "", " ")
-		p := filepath.Join(os.TempDir(), fmt.Sprintf("killnode-history-%d-%s.json", run, storetest.RandomHex(3)))
-		os.WriteFile(p, b, 0o644)
-		t.Errorf("run %d: %s; history in %s", run, why, p)
-	}
 	for _, k := range keys {
 		ops := operations(h.Ops, k)
-		res, info := porcupine.CheckOperationsVerbose(ledgerModel, ops, checkTimeout)
+		res, full := linearizable(ops)
 		switch res {
 		case porcupine.Unknown:
-			dump(fmt.Sprintf("%s: porcupine inconclusive after %v (%d ops) — not a pass", k, checkTimeout, len(ops)))
+			t.Errorf("run %d %s: porcupine inconclusive after %v (%d ops): not a pass", run, k, checkTimeout, len(ops))
 			return
 		case porcupine.Illegal:
+			_, info := porcupine.CheckOperationsVerbose(ledgerModel, ops, checkTimeout)
 			p := filepath.Join(os.TempDir(), fmt.Sprintf("killnode-porcupine-%d-%s.html", run, k))
 			porcupine.VisualizePath(ledgerModel, info, p)
-			dump(fmt.Sprintf("%s: history not linearizable (%d ops, visualization %s)", k, len(ops), p))
+			t.Errorf("run %d %s: history not linearizable (%d ops, visualization %s)", run, k, len(ops), p)
 			return
+		}
+		if full {
+			st.fullChecks++
 		}
 		st.histories++
 		if st.minOps == 0 || len(ops) < st.minOps {
@@ -493,8 +532,8 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 				continue
 			}
 			bad := slices.Clone(ops)
-			bad[i].Output = pout{Known: true, IDs: out.IDs[:len(out.IDs)-1]}
-			if res := porcupine.CheckOperationsTimeout(ledgerModel, bad, checkTimeout); res != porcupine.Illegal {
+			bad[i].Output = readOut(out.IDs[:len(out.IDs)-1])
+			if res, _ := linearizable(bad); res != porcupine.Illegal {
 				t.Errorf("run %d %s: a stale read of the real history checked %s, want Illegal", run, k, res)
 			}
 			control = true
@@ -558,9 +597,6 @@ func histRun(t *testing.T, ep storetest.Endpoint, run int, st *histStats) {
 			}
 		}
 		led.check(t, ep, k, inc[k], issued)
-	}
-	if t.Failed() {
-		dump("ledger check failed")
 	}
 }
 

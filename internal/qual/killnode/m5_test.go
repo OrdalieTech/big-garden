@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -39,17 +40,22 @@ type endpoint interface {
 // request that times out stays pending in the process (a stopped process
 // runs it after SIGCONT); its late reply is dropped.
 type mnode struct {
-	name string
-	p    *proc
-	mu   sync.Mutex
-	wait map[string]chan Resp
-	dead bool
-	tags int
+	name  string
+	cache string // removed by kill: a run's caches must not pile up in /tmp
+	p     *proc
+	mu    sync.Mutex
+	wait  map[string]chan Resp
+	dead  bool
+	tags  int
 }
 
 func startNode(t *testing.T, ep storetest.Endpoint, name string) *mnode {
-	p := start(t, ep, t.TempDir(), "", "-node", name)
-	m := &mnode{name: name, p: p, wait: map[string]chan Resp{}}
+	cache, err := os.MkdirTemp("", "killnode-cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := start(t, ep, cache, "", "-node", name)
+	m := &mnode{name: name, cache: cache, p: p, wait: map[string]chan Resp{}}
 	go func() {
 		for line := range p.lines {
 			var r Resp
@@ -109,11 +115,12 @@ func (m *mnode) send(r Req) chan Resp {
 
 func (m *mnode) signal(s syscall.Signal) { m.p.cmd.Process.Signal(s) }
 
-// kill SIGKILLs the process and reaps it.
+// kill SIGKILLs the process, reaps it and deletes its cache directory.
 func (m *mnode) kill() {
 	m.p.cmd.Process.Signal(syscall.SIGCONT)
 	m.p.cmd.Process.Kill()
 	m.p.stop()
+	os.RemoveAll(m.cache)
 }
 
 type inproc struct{ n *garden.Node }
@@ -122,14 +129,20 @@ func (x inproc) do(r Req, _ time.Duration) (Resp, bool) {
 	return serve(context.Background(), x.n, r), true
 }
 
-func openInproc(t *testing.T, ep storetest.Endpoint, name string) inproc {
-	n, err := garden.Open(context.Background(), garden.Config{S3: ep.Client(nil), Bucket: ep.Bucket, Prefix: ep.Prefix,
-		NodeID: name, CacheDir: t.TempDir()})
+// openInproc opens an in-process Node; the returned func closes it and
+// deletes its cache directory.
+func openInproc(t *testing.T, ep storetest.Endpoint, name string) (inproc, func()) {
+	cache, err := os.MkdirTemp("", "killnode-inproc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close(context.Background()) })
-	return inproc{n}
+	hc := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+	n, err := garden.Open(context.Background(), garden.Config{S3: ep.Client(hc), Bucket: ep.Bucket, Prefix: ep.Prefix,
+		NodeID: name, CacheDir: cache})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inproc{n}, func() { n.Close(context.Background()); hc.CloseIdleConnections(); os.RemoveAll(cache) }
 }
 
 // ledger is the parent-side acknowledgment record of one entity.
@@ -225,7 +238,9 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 	}
 	for i := range 32 {
 		name := fmt.Sprintf("m%02d", i)
-		cands[name] = openInproc(t, ep, name)
+		x, closer := openInproc(t, ep, name)
+		defer closer()
+		cands[name] = x
 	}
 	led := newLedger()
 	issued := map[string]bool{}
@@ -447,7 +462,8 @@ func sameIDRun(t *testing.T, ep storetest.Endpoint) (tl [4]int) {
 			tl[1]++
 		}
 	}
-	retryOnOwner := func(r Req) Resp {
+	retryOnOwner := func(r Req) Resp { // to the owner the head names now
+		cur = call(cur, Req{Op: "resolve", Key: "k"}).Route.Node
 		resp := call(cur, r)
 		if !resp.OK {
 			t.Fatalf("retry of %s on owner %s: %+v", r.ID, cur, resp)
@@ -520,8 +536,9 @@ func sameIDRun(t *testing.T, ep storetest.Endpoint) (tl [4]int) {
 			led.ack(t, z.ID, r)
 		}
 	}
-	if rt.OK {
-		cur = taker
+	cur = call(cur, Req{Op: "resolve", Key: "k"}).Route.Node
+	if rt.OK && cur != taker {
+		t.Fatalf("takeover by %s acknowledged but the head names %s", taker, cur)
 	}
 	led.ack(t, z.ID, retryOnOwner(z))
 	conflict(cur, z)
@@ -545,8 +562,9 @@ func sameIDRun(t *testing.T, ep storetest.Endpoint) (tl [4]int) {
 	}
 	allowed("hash p", rp, "outcome_unknown", "not_owner", "route_changed", "id_conflict")
 	allowed("hash q", rq, "outcome_unknown", "not_owner", "route_changed", "id_conflict")
-	if rt.OK {
-		cur = taker
+	cur = call(cur, Req{Op: "resolve", Key: "k"}).Route.Node
+	if rt.OK && cur != taker {
+		t.Fatalf("takeover by %s acknowledged but the head names %s", taker, cur)
 	}
 	for _, r := range []Resp{rp, rq} {
 		if r.OK {

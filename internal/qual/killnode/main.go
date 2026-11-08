@@ -188,7 +188,11 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 				rt = toRt(*ge.Route)
 			}
 		}
-		return Resp{Code: code, Err: err.Error(), Route: rt}
+		msg := err.Error()
+		if c := errors.Unwrap(err); c != nil { // the test reports the redacted cause too
+			msg += " (cause: " + c.Error() + ")"
+		}
+		return Resp{Code: code, Err: msg, Route: rt}
 	}
 	var rt *Rt
 	if r.Op == "resolve" || r.Op == "takeover" {
