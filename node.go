@@ -452,6 +452,8 @@ func engineError(err error) *Error {
 		return newError(CodeCorrupt, "local image failed validation", err)
 	case engine.Full(err):
 		return newError(CodeCapacity, "entity size limit reached", err)
+	case errors.Is(err, engine.ErrReserved):
+		return newError(CodeInvalidArgument, "reserved table name", err)
 	}
 	return newError(CodeUnavailable, "local database", err)
 }

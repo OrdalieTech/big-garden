@@ -55,7 +55,8 @@ func TestBuiltinVirtualTables(t *testing.T) {
 	f.mutate(t, `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 300)
 		INSERT INTO docs(body) SELECT 'row ' || n FROM c;
 		INSERT INTO docs(docs, rank) VALUES ('merge', 16); INSERT INTO docs(docs) VALUES ('optimize');
-		INSERT INTO docs(docs) VALUES ('integrity-check'); DELETE FROM box WHERE id = 2; DROP TABLE ibox`)
+		INSERT INTO docs(docs) VALUES ('integrity-check'); DELETE FROM box WHERE id = 2; DROP TABLE ibox;
+		CREATE VIRTUAL TABLE tmp USING fts5(a); INSERT INTO tmp VALUES ('x'); DROP TABLE tmp`)
 	check := func(d *DB) {
 		t.Helper()
 		for q, want := range map[string]string{
@@ -64,7 +65,7 @@ func TestBuiltinVirtualTables(t *testing.T) {
 			"SELECT doc FROM docs_terms WHERE term = 'quick'":                                              "2",
 			"SELECT group_concat(id) FROM box WHERE x1 >= 0.8 AND x0 <= 1.5 ORDER BY id":                   "1,3",
 			"SELECT name FROM shapes WHERE geopoly_contains_point(_shape, 0.5, 0.5)":                       "square",
-			"SELECT count(*) FROM sqlite_schema WHERE name = 'ibox'":                                       "0",
+			"SELECT count(*) FROM sqlite_schema WHERE name LIKE 'ibox%' OR name LIKE 'tmp%'":               "0",
 			"SELECT json_extract('{\"a\":[1,2]}', '$.a[1]') || sqrt(16) || (box.id) FROM box WHERE id = 3": "24.03",
 		} {
 			if got := readString(t, d, q); got != want {
@@ -351,5 +352,33 @@ func TestFTS5OutOfSync(t *testing.T) {
 	r := f.restore(t)
 	if got := scalar(t, r.conn, "PRAGMA integrity_check"); got != "ok" {
 		t.Fatalf("integrity_check: %s", got)
+	}
+}
+
+// TestRenameIntoReserved: ALTER TABLE ... RENAME TO passes the old name to
+// the authorizer only, so Mutate checks the schema after the callback and
+// rolls back a mutation that moved a table (and a module's shadow tables)
+// into a reserved name.
+func TestRenameIntoReserved(t *testing.T) {
+	f := newFixture(t, 4000)
+	f.mutate(t, "CREATE TABLE app(a); CREATE VIRTUAL TABLE docs USING fts5(b); CREATE VIRTUAL TABLE box USING rtree(id, a, b)")
+	schema := scalar(t, f.d.conn, "SELECT group_concat(name) FROM sqlite_schema")
+	for _, q := range []string{"ALTER TABLE app RENAME TO _state_new", "ALTER TABLE app RENAME TO _STATE_x",
+		"ALTER TABLE docs RENAME TO _state_y", "ALTER TABLE box RENAME TO _state_z", "ALTER TABLE app RENAME TO dbstat",
+		"ALTER TABLE app RENAME TO DBSTAT"} {
+		f.n++
+		if _, _, err := f.d.Mutate(commit(f.n), func(tx *Tx) ([]byte, error) {
+			_, err := tx.Exec(bg, q)
+			return nil, err
+		}); !errors.Is(err, ErrReserved) {
+			t.Errorf("%s: %v", q, err)
+		}
+	}
+	if got := scalar(t, f.d.conn, "SELECT group_concat(name) FROM sqlite_schema"); got != schema {
+		t.Fatalf("schema %s, want %s", got, schema)
+	}
+	f.mutate(t, "ALTER TABLE docs RENAME TO docs2; ALTER TABLE box RENAME TO box2; ALTER TABLE app RENAME TO state_app")
+	if got := readString(t, f.d, "SELECT count(*) FROM sqlite_schema WHERE name IN ('docs2_data', 'box2_node', 'state_app')"); got != "3" {
+		t.Fatalf("renamed shadow tables: %s", got)
 	}
 }

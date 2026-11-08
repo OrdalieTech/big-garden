@@ -30,6 +30,10 @@ import (
 // ErrCorrupt marks an image, object or file that fails validation.
 var ErrCorrupt = errors.New("engine: corrupt")
 
+// ErrReserved is returned by Mutate when application SQL gave a table a
+// reserved name by renaming it; the transaction is rolled back.
+var ErrReserved = errors.New("engine: application SQL used a reserved table name")
+
 const (
 	pageSize   = head.PageSize
 	valueBytes = 1 << 20 // SQL value, row and statement text limit (PLAN §11.2)
@@ -395,6 +399,14 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 	}
 	if err := d.setMode(library); err != nil {
 		return nil, 0, err
+	}
+	var renamed int // ALTER TABLE ... RENAME TO: the authorizer never sees the new name
+	if err := d.conn.QueryRowContext(context.Background(), `SELECT count(*) FROM sqlite_schema
+		WHERE name LIKE '\_state\_%' ESCAPE '\' AND name NOT IN ('_state_meta', '_state_receipts') OR name LIKE 'dbstat'`).Scan(&renamed); err != nil {
+		return nil, 0, err
+	}
+	if renamed != 0 {
+		return nil, 0, ErrReserved
 	}
 	res, err := d.conn.ExecContext(context.Background(), "UPDATE _state_receipts SET result = ? WHERE operation_id = ?",
 		append([]byte{}, result...), c.ID[:])

@@ -290,6 +290,12 @@ func TestExtendBoundary(t *testing.T) {
 			t.Errorf("%q: unclear error %v", q, err)
 		}
 	}
+	// A rename into the reserved namespace is rolled back: invalid_argument.
+	_, err = n.Update(bg, ref, newReq(t, "rename", 1), func(tx *Tx) ([]byte, error) {
+		_, err := tx.Exec(bg, "ALTER TABLE items RENAME TO _state_items")
+		return nil, err
+	})
+	wantCode(t, err, CodeInvalidArgument)
 	if _, err := n.Read(bg, ref, 1, func(v *View) ([]byte, error) {
 		got, err := ints(v, "SELECT vec_length(emb) FROM items")
 		if err != nil || !slices.Equal(got, []int64{2}) {
