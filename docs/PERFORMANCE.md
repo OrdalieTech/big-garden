@@ -89,7 +89,10 @@ Scaleway = fr-par from the workstation, 200 updates per phase, prefix
 `qual-state/m7-<random>/`, deleted afterwards. B=1 on MinIO is the binary
 before the change (48ca9b4 plus the hot-phase flags); B=1 on Scaleway is
 the new binary with `BatchMax` 1. Same seeds/payload shape and phase order
-in both columns. No errors and no unknown outcomes in any phase.
+in both columns. No errors and no unknown outcomes in any phase. Noise check: the new binary with `BatchMax` 1 on MinIO gave
+368/366/374 updates/s (0 ms) and 29.6/29.0/28.9 (+25 ms) for 1/8/32
+clients, with the same request counts as the old binary: run-to-run noise
+is up to ~10% at 0 ms.
 
 | Store | Clients | B=1 updates/s | B=1 p50 / p95 / p99 | B=16 updates/s | B=16 p50 / p95 / p99 | B=16 batch sizes (publications) |
 |---|---:|---:|---|---:|---|---|
