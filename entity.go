@@ -47,6 +47,7 @@ type candidate struct {
 	op       *head.OpID
 	bound    head.Digest
 	pages    []uint32
+	unsure   bool // some proposal got an answer other than a definite failure (§2 step 5)
 }
 
 // discard closes and deletes the cache file and drops the cached head (D10).
@@ -109,15 +110,17 @@ func (n *Node) commitContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), n.cfg.Limits.CommitTimeout)
 }
 
-// cas sends one hedged head CAS (D3).
-func (n *Node) cas(ctx context.Context, e *entity, next *head.Head, etag string) (string, error) {
-	body, err := next.Encode()
+// cas sends c's proposal as one hedged head CAS (D3). c.unsure is set unless
+// every request of it definitely did not apply.
+func (n *Node) cas(ctx context.Context, e *entity, c *candidate) (string, error) {
+	body, err := c.next.Encode()
 	if err != nil {
 		return "", newError(CodeCorrupt, "candidate head: "+err.Error(), nil)
 	}
-	tag, _, err := store.Hedge(ctx, n.cfg.Limits.StorageAttemptTimeout/2, func(ctx context.Context) (string, error) {
-		return n.st.PutCAS(ctx, head.HeadKey(e.key), body, etag)
+	tag, errs, err := store.Hedge(ctx, n.cfg.Limits.StorageAttemptTimeout/2, func(ctx context.Context) (string, error) {
+		return n.st.PutCAS(ctx, head.HeadKey(e.key), body, c.baseETag)
 	})
+	c.unsure = c.unsure || slices.ContainsFunc(errs, func(err error) bool { return store.OutcomeOf(err) != store.Failed })
 	return tag, err
 }
 
@@ -137,10 +140,15 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	ctx, cancel := n.commitContext()
 	defer cancel()
 	e.unresolved, c.nonces = c, []head.ID{c.next.Nonce}
-	etag, err := n.cas(ctx, e, &c.next, c.baseETag)
+	etag, err := n.cas(ctx, e, c)
 	if err == nil {
 		n.settle(e, c, &c.next, etag)
 		return nil, nil
+	}
+	if !c.unsure { // definitely not committed (§2 step 5)
+		e.discard()
+		e.unresolved = nil
+		return nil, storeError(err)
 	}
 	rec, err = n.resolve(ctx, e, c)
 	var pe *Error
@@ -203,7 +211,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		if len(c.nonces) < 3 { // D12: re-propose with a fresh nonce under the same condition
 			c.next.Nonce = head.NewID()
 			c.nonces = append(c.nonces, c.next.Nonce)
-			if etag, err := n.cas(ctx, e, &c.next, c.baseETag); err == nil {
+			if etag, err := n.cas(ctx, e, c); err == nil {
 				n.settle(e, c, &c.next, etag)
 				return nil, nil
 			}

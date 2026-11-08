@@ -63,7 +63,8 @@ A candidate is `{base *Head (nil for genesis), baseETag, next Head, nonces []ID,
 2. `e.unresolved = c`; `c.nonces = [next.Nonce]`.
 3. `CAS(head key, encode(next), baseETag)` (`""` = `If-None-Match: *` for genesis), under a node-owned context bounded by `CommitTimeout`; the caller's cancellation does not cancel it.
 4. `OK`: `e.H, e.E = next, etag`; `e.unresolved = nil`; committed.
-5. Otherwise: `resolve(c)`.
+5. A definite failure (the store adapter's `Failed`: the request was answered and never applied, e.g. 403 or 400) of every request of the proposal, hedge included: no proposal of `c` can ever apply, so `c` is definitely not committed: discard (D10); `unresolved = nil`; return `unavailable`. A candidate is definitely not committed only if every proposal it ever sent got such an answer; `PreconditionFailed` (412) is not one (it does not prove an earlier proposal did not apply), nor is a timeout, 5xx, cancellation after sending or a lost reply.
+6. Otherwise: `resolve(c)`. A candidate in `resolve` thus has at least one proposal that may still apply late, and a later definite failure of a re-proposal does not change that: it stays unresolved under rule 5 below until a read decides it.
 
 `resolve(c)`, looped until `CommitTimeout`:
 1. `GET head` (no `If-None-Match`). `Unknown`: back off, loop. `NotFound` with `base != nil`: `state_missing`, keep `unresolved`. `NotFound` with `base == nil`: go to 4.

@@ -727,6 +727,80 @@ func TestResolveBranches(t *testing.T) {
 			t.Fatalf("receipt in the new head must prove the commit: %+v %v", res, err)
 		}
 	})
+	t.Run("every proposal definitely failed", func(t *testing.T) {
+		mem := storetest.NewMem()
+		n := testNode(t, mem, "a", nil)
+		l := newLedger()
+		ref := mustCreate(t, n, "k", l)
+		mustPut(t, n, ref, "a", "1", l)
+		var once atomic.Bool
+		mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+			if a.Op == "cas" && a.Key == head.HeadKey("k") && once.CompareAndSwap(false, true) {
+				return storetest.MemFault{Reject: store.Failed}
+			}
+			return storetest.MemFault{}
+		})
+		start := time.Now()
+		_, err := n.Update(bg, ref, newReq(t, "refused", 1), put("b", "2"))
+		wantCode(t, err, CodeUnavailable)
+		if time.Since(start) >= n.cfg.Limits.CommitTimeout {
+			t.Fatal("a definitely refused candidate waited for the commit deadline")
+		}
+		e, _ := n.entity("k")
+		e.mu.Lock()
+		if e.unresolved != nil {
+			t.Fatal("candidate still unresolved")
+		}
+		e.mu.Unlock()
+		if res := mustPut(t, n, ref, "c", "3", l); res.Version.Sequence != 3 {
+			t.Fatalf("version %+v", res.Version)
+		}
+		l.verify(t, mem, "a")
+	})
+	t.Run("ambiguous then definite stays unknown", func(t *testing.T) {
+		mem := storetest.NewMem()
+		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
+		l := newLedger()
+		ref := mustCreate(t, n, "k", l)
+		mustPut(t, n, ref, "a", "1", l)
+		var cas atomic.Int32
+		mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+			if a.Op != "cas" || a.Key != head.HeadKey("k") {
+				return storetest.MemFault{}
+			}
+			if cas.Add(1) == 1 {
+				return storetest.MemFault{Reject: store.Unknown} // may still apply late
+			}
+			return storetest.MemFault{Reject: store.Failed}
+		})
+		before := len(mem.Journal())
+		req := newReq(t, "late", 1)
+		_, err := n.Update(bg, ref, req, put("b", "2"))
+		wantCode(t, err, CodeOutcomeUnknown)
+		if cas.Load() != 3 {
+			t.Fatalf("want 3 proposals, got %d", cas.Load())
+		}
+		_, err = n.Update(bg, ref, newReq(t, "other", 1), put("c", "3"))
+		wantCode(t, err, CodeUnavailable)
+		mem.SetPlan(nil)
+		var first storetest.Attempt
+		for _, a := range mem.Journal()[before:] {
+			if a.Op == "cas" && a.Key == head.HeadKey("k") {
+				first = a
+				break
+			}
+		}
+		if _, err := mem.PutCAS(bg, head.HeadKey("k"), first.Body, first.Cond); err != nil { // the late apply
+			t.Fatal(err)
+		}
+		res, err := n.Update(bg, ref, req, put("b", "2"))
+		if err != nil || !res.Replayed || res.Version.Sequence != 3 {
+			t.Fatalf("retry %+v %v", res, err)
+		}
+		l.ack(ref, "b", "2")
+		mustPut(t, n, ref, "c", "3", l)
+		l.verify(t, mem, "a")
+	})
 }
 
 func TestResolveObjectBranch(t *testing.T) {
