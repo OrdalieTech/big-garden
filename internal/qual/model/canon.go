@@ -106,6 +106,7 @@ func (k *canon) cand(c *Cand) {
 	k.bit(c.Genesis)
 	k.i8(c.Req)
 	k.i8(c.NN)
+	k.i8(c.Lim)
 	k.id(c.Att)
 	for _, n := range c.Nonces {
 		k.id(n)

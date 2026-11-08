@@ -927,6 +927,33 @@ func TestResolvePrunedReceipt(t *testing.T) {
 	wantCode(t, err, CodeIDExpired)
 }
 
+// TestReproposeAfterRecovery: the D12 proposal cap is per resolve call, so a
+// candidate whose first proposals all got 503s commits once S3 recovers.
+func TestReproposeAfterRecovery(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	mustPut(t, n, ref, "a", "1", l)
+	var cas atomic.Int32
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if a.Op == "cas" && a.Key == head.HeadKey("k") && cas.Add(1) <= 4 {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "ambiguous", 1)
+	_, err := n.Update(bg, ref, req, put("b", "2"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	mustPut(t, n, ref, "c", "3", l) // settles the candidate first: it commits
+	res, err := n.Lookup(bg, ref, req.ID)
+	if err != nil || !res.Replayed || res.Version.Sequence != 3 {
+		t.Fatalf("lookup %+v %v", res, err)
+	}
+	l.ack(ref, "b", "2")
+	l.verify(t, mem, "a")
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer

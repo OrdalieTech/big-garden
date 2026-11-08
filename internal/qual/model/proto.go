@@ -700,6 +700,7 @@ func (x *px) start() {
 func (x *px) settle(next uint8) {
 	x.p.Res = 0
 	if x.m.Unres {
+		x.m.C.Lim = min(x.m.C.NN+2, maxNonces) // two re-proposals per later resolve call (model bound: maxNonces)
 		x.p.Ret = next
 		x.getHead(pcResGet)
 		return
@@ -770,7 +771,7 @@ func (x *px) cas(c *Cand) Msg {
 // publish is PROTOCOL §2: mark the candidate unresolved, then one CAS.
 func (x *px) publish(c Cand, ret uint8) {
 	c.Next.Cand = x.fresh()
-	c.Nonces, c.NN = [3]ID{c.Next.Nonce}, 1
+	c.Nonces, c.NN, c.Lim = [maxNonces]ID{c.Next.Nonce}, 1, 3
 	x.m.Unres, x.m.C = true, c
 	if c.Kind == x.p.Kind {
 		x.p.CID, x.p.Applied = c.Next.Cand, false
@@ -822,10 +823,14 @@ func (x *px) resolveGot(res uint8) {
 	}
 }
 
+// maxNonces bounds the proposals of one candidate in the model: the three of
+// its publication and two from each of up to two later resolve calls.
+const maxNonces = 7
+
 // repropose is the D12 fence: same head, fresh nonce, same condition.
 func (x *px) repropose() {
 	c := &x.m.C
-	if c.NN < 3 {
+	if c.NN < c.Lim {
 		c.Next.Nonce = x.fresh()
 		c.Nonces[c.NN] = c.Next.Nonce
 		c.NN++

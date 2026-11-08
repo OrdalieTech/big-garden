@@ -66,7 +66,7 @@ PLAN §6.3 writes `birth.json` first and runs the callback after. A callback tha
 
 ## D12. The D3 fence re-proposes the candidate with a fresh nonce
 
-When `resolve` finds the head still at the candidate's base, it sends the same proposed head again with a new nonce and the same `If-Match` (or `If-None-Match: *` for genesis). All proposals of one candidate share one condition, so at most one applies; resolution accepts any of their nonces. A winning re-proposal both fences the earlier ambiguous request and commits the intended effect, so an ambiguous mutation ends committed instead of rolled back. Proposals are capped at three per candidate.
+When `resolve` finds the head still at the candidate's base, it sends the same proposed head again with a new nonce and the same `If-Match` (or `If-None-Match: *` for genesis). All proposals of one candidate share one condition, so at most one applies; resolution accepts any of their nonces. A winning re-proposal both fences the earlier ambiguous request and commits the intended effect, so an ambiguous mutation ends committed instead of rolled back. Proposals are capped per resolve call, not per candidate: a publication sends at most three (its CAS and two re-proposals), and each later resolve of the same candidate (the settle that starts every later operation, or Close) at most two more. A per-candidate cap would leave a candidate whose first three proposals met an outage unresolvable until restart, since resolve could then only read a head that stays at the base. Sending more proposals is safe for the same reason as sending three: they all carry the one `If-Match` (or `If-None-Match: *`), so at most one applies, and resolution accepts any nonce the candidate ever sent.
 
 ## D13. LTX is pinned at v0.5.3
 

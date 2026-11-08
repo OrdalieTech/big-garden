@@ -193,6 +193,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 
 // resolve runs PROTOCOL §2 resolve(c) until ctx ends.
 func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Receipt, error) {
+	limit := len(c.nonces) + 2 // D12: two re-proposals per call
 	for i := 0; ; i++ {
 		if i > 0 && sleep(ctx, i) != nil {
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown", cause: ctx.Err()}
@@ -221,7 +222,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		if cur != nil && cur.Nonce != c.base.Nonce {
 			return nil, newError(CodeCorrupt, "head revision went backwards", nil)
 		}
-		if len(c.nonces) < 3 { // D12: re-propose with a fresh nonce under the same condition
+		if len(c.nonces) < limit { // D12: re-propose with a fresh nonce under the same condition
 			c.next.Nonce = head.NewID()
 			c.nonces = append(c.nonces, c.next.Nonce)
 			if etag, err := n.cas(ctx, e, c); err == nil {
