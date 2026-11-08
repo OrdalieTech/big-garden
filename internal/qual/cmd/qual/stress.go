@@ -132,8 +132,8 @@ done:
 	st := n.Stats()
 	rep.Stats = &st
 	for _, p := range rep.Phases {
-		fmt.Printf("%-12s n=%-4d %7.1f/s p50=%-8s p95=%-8s p99=%-8s max=%-8s err=%d unknown=%d req=%v up=%dB hedges=%d batches=%v\n",
-			p.Name, p.N, p.PerSecond, p.P50, p.P95, p.P99, p.Max, p.Errors, p.Unknown, p.Requests, p.Uploaded, p.Hedges, p.Batches)
+		fmt.Printf("%-12s n=%-4d %7.1f/s p50=%-8s p95=%-8s p99=%-8s max=%-8s err=%d unknown=%d req=%v up=%dB down=%dB hedges=%d batches=%v\n",
+			p.Name, p.N, p.PerSecond, p.P50, p.P95, p.P99, p.Max, p.Errors, p.Unknown, p.Requests, p.Uploaded, p.Downloaded, p.Hedges, p.Batches)
 	}
 	if *out != "" {
 		if err := os.MkdirAll(*out, 0o755); err != nil {
@@ -202,6 +202,8 @@ type phase struct {
 	P50, P95, P99, Max       string
 	Requests                 map[string]int // physical requests by class during the phase
 	Uploaded                 int64          // request body bytes (decoded) during the phase
+	ObjectUploaded           int64          // the part of Uploaded sent by immutable object PUTs
+	Downloaded               int64          // response body bytes (Content-Length) during the phase
 	Hedges                   int            // head CAS requests repeating an earlier (key, condition)
 	Commits, Snapshots, Comp uint64
 	PerSecond                float64        // successful operations per second of wall time
@@ -233,7 +235,8 @@ func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers
 	wall := time.Since(start)
 	after, s1 := w.snapshot(), node.Stats()
 	p := phase{Name: name, N: n, Workers: workers, Requests: map[string]int{}, ErrorCodes: map[string]int{},
-		Uploaded: after.uploaded - before.uploaded, Hedges: after.hedges - before.hedges,
+		Uploaded: after.uploaded - before.uploaded, Downloaded: after.downloaded - before.downloaded,
+		ObjectUploaded: after.objUploaded - before.objUploaded, Hedges: after.hedges - before.hedges,
 		Commits: s1.Commits - s0.Commits, Snapshots: s1.Snapshots - s0.Snapshots, Comp: s1.Compactions - s0.Compactions}
 	for k, v := range after.requests {
 		if d := v - before.requests[k]; d > 0 {
@@ -273,7 +276,8 @@ func (r *stressReport) phase(name string, w *wire, node *garden.Node, n, workers
 }
 
 // wire counts physical requests by class (head CAS, head GET, object PUT,
-// object GET, list, delete), request body bytes, and hedges: head CAS
+// object GET, list, delete; a head GET answered 304 Not Modified is
+// "get-head-304"), request and response body bytes, and hedges: head CAS
 // requests sent while one with the same key and condition awaits its reply
 // (a D12 re-proposal is sent only after the previous reply, so it is not
 // counted).
@@ -286,9 +290,11 @@ type wire struct {
 }
 
 type wireCounts struct {
-	requests map[string]int
-	uploaded int64
-	hedges   int
+	requests    map[string]int
+	uploaded    int64
+	objUploaded int64
+	downloaded  int64
+	hedges      int
 }
 
 func (w *wire) snapshot() wireCounts {
@@ -324,6 +330,9 @@ func (w *wire) RoundTrip(r *http.Request) (*http.Response, error) {
 	w.c.requests[class]++
 	if r.Method == "PUT" {
 		w.c.uploaded += max(n, 0)
+		if !head {
+			w.c.objUploaded += max(n, 0)
+		}
 	}
 	k := ""
 	if r.Method == "PUT" && head {
@@ -335,6 +344,15 @@ func (w *wire) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	w.mu.Unlock()
 	resp, err := w.base.RoundTrip(r)
+	if err == nil {
+		w.mu.Lock()
+		if resp.StatusCode == http.StatusNotModified && class == "get-head" {
+			w.c.requests[class]--
+			w.c.requests["get-head-304"]++
+		}
+		w.c.downloaded += max(resp.ContentLength, 0)
+		w.mu.Unlock()
+	}
 	if w.delay > 0 {
 		time.Sleep(w.delay)
 	}
