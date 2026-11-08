@@ -529,7 +529,7 @@ func withOp(err error, id MutationID) error {
 	return err
 }
 
-// Update runs fn as one mutation of ref (PROTOCOL §6, B = 1).
+// Update runs fn as one mutation of ref (PROTOCOL §6), perhaps in a batch.
 func (n *Node) Update(ctx context.Context, ref Ref, req Request, fn func(*Tx) ([]byte, error)) (Result, error) {
 	return n.mutate(ctx, ref, req, 2, req.Schema, fn)
 }
