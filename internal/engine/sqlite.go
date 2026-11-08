@@ -31,7 +31,8 @@ import (
 var ErrCorrupt = errors.New("engine: corrupt")
 
 // ErrReserved is returned by Mutate when application SQL gave a table a
-// reserved name by renaming it; the transaction is rolled back.
+// reserved name by renaming it or declared a foreign key to a reserved
+// table; the transaction is rolled back.
 var ErrReserved = errors.New("engine: application SQL used a reserved table name")
 
 const (
@@ -400,13 +401,8 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 	if err := d.setMode(library); err != nil {
 		return nil, 0, err
 	}
-	var renamed int // ALTER TABLE ... RENAME TO: the authorizer never sees the new name
-	if err := d.conn.QueryRowContext(context.Background(), `SELECT count(*) FROM sqlite_schema
-		WHERE name LIKE '\_state\_%' ESCAPE '\' AND name NOT IN ('_state_meta', '_state_receipts') OR name LIKE 'dbstat'`).Scan(&renamed); err != nil {
+	if err := d.schemaOwned(); err != nil {
 		return nil, 0, err
-	}
-	if renamed != 0 {
-		return nil, 0, ErrReserved
 	}
 	res, err := d.conn.ExecContext(context.Background(), "UPDATE _state_receipts SET result = ? WHERE operation_id = ?",
 		append([]byte{}, result...), c.ID[:])
@@ -421,6 +417,31 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 	}
 	committed = true
 	return result, seq, nil
+}
+
+// schemaOwned returns ErrReserved if application SQL renamed an object into
+// a reserved name (ALTER TABLE ... RENAME TO: the authorizer never sees the
+// new name) or declared a foreign key to a reserved table (the authorizer
+// never sees REFERENCES targets), which would make the library's own
+// statements on that table fail. Names are compared in Go.
+func (d *DB) schemaOwned() error {
+	rows, err := d.conn.QueryContext(context.Background(), `SELECT 0, name FROM sqlite_schema UNION ALL
+		SELECT 1, f."table" FROM sqlite_schema s, pragma_foreign_key_list(s.name) f WHERE s.type = 'table'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fk bool
+		var n string
+		if err := rows.Scan(&fk, &n); err != nil {
+			return err
+		}
+		if reserved(n) && (fk || n != "_state_meta" && n != "_state_receipts") {
+			return ErrReserved
+		}
+	}
+	return rows.Err()
 }
 
 // Read runs fn in a read-only scope inside a library read transaction, with

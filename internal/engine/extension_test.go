@@ -382,3 +382,47 @@ func TestRenameIntoReserved(t *testing.T) {
 		t.Fatalf("renamed shadow tables: %s", got)
 	}
 }
+
+// TestForeignKeyToReserved: the authorizer never sees REFERENCES targets, so
+// a foreign key to a library table would commit and make every later
+// mutation fail in the library's own receipt prune or meta update ("foreign
+// key mismatch", or a cascade into application rows). Mutate rolls it back.
+func TestForeignKeyToReserved(t *testing.T) {
+	f := newFixture(t, 4000)
+	f.mutate(t, "CREATE TABLE pin(a)")
+	schema := scalar(t, f.d.conn, "SELECT group_concat(sql) FROM sqlite_schema")
+	for _, q := range []string{
+		"CREATE TABLE p1(x REFERENCES _state_meta(sequence))",
+		"ALTER TABLE pin ADD COLUMN y REFERENCES _state_receipts(input_hash)",
+		"CREATE TABLE p2(x BLOB REFERENCES _state_receipts(operation_id) ON DELETE CASCADE)",
+		"CREATE TABLE p3(x, FOREIGN KEY (x) REFERENCES _STATE_META)",
+		"CREATE TABLE p4(x REFERENCES _state_none(a))",
+	} {
+		f.n++
+		if _, _, err := f.d.Mutate(commit(f.n), func(tx *Tx) ([]byte, error) {
+			_, err := tx.Exec(bg, q)
+			return nil, err
+		}); !errors.Is(err, ErrReserved) {
+			t.Errorf("%s: %v", q, err)
+		}
+		f.mutate(t, "INSERT INTO pin(a) VALUES (1)") // the entity stays writable
+	}
+	if got := scalar(t, f.d.conn, "SELECT group_concat(sql) FROM sqlite_schema"); got != schema {
+		t.Fatalf("schema %s, want %s", got, schema)
+	}
+	f.mutate(t, "CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(p REFERENCES parent(id))")
+	f.publish(t, true)
+	f.restore(t)
+
+	// Activation refuses an image holding such a key (an import of an image
+	// the library would not have published).
+	if err := f.d.inTx(func() error {
+		return f.d.exec("UPDATE _state_meta SET sequence = sequence + 1; CREATE TABLE p5(x REFERENCES _state_meta(sequence))")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.publish(t, false)
+	if _, err := Restore(bg, plain, filepath.Join(t.TempDir(), "r"), head.MaxPages, &f.head, readers(f.objs)); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("restore with a key to a reserved table: %v", err)
+	}
+}

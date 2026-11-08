@@ -76,7 +76,8 @@ func (d *DB) Rebase(ns head.ID, key string, inc head.ID) error {
 	})
 }
 
-// check verifies the metadata row against h and runs integrity_check.
+// check verifies the metadata row against h and the schema's use of
+// reserved names, and runs integrity_check.
 func (d *DB) check(h *head.Head) error {
 	m, err := d.Meta()
 	if err != nil {
@@ -84,6 +85,9 @@ func (d *DB) check(h *head.Head) error {
 	}
 	if m.Namespace != h.Namespace || m.Key != h.Key || m.Incarnation != h.Incarnation || m.Schema != h.Schema || m.Sequence != h.Sequence {
 		return fmt.Errorf("%w: _state_meta does not match the head", ErrCorrupt)
+	}
+	if err := d.schemaOwned(); err != nil { // an image the library never publishes (an import)
+		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	var res string
 	if err := d.conn.QueryRowContext(context.Background(), "PRAGMA integrity_check(1)").Scan(&res); err != nil {
