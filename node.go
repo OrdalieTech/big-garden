@@ -467,51 +467,37 @@ type limited struct {
 	sem chan struct{}
 }
 
-func (l limited) acquire(ctx context.Context, op, key string) error {
+// do runs f holding one in-flight slot; a request still waiting for a slot
+// when ctx ends is never sent.
+func (l limited) do(ctx context.Context, op, key string, f func() error) error {
 	select {
 	case l.sem <- struct{}{}:
-		return nil
 	case <-ctx.Done():
 		return &store.Error{Outcome: store.Unknown, Op: op, Key: key, Err: ctx.Err()} // never sent
 	}
+	defer func() { <-l.sem }()
+	return f()
 }
 
-func (l limited) Get(ctx context.Context, key, ifNoneMatch string, max int64) (store.Object, error) {
-	if err := l.acquire(ctx, "get", key); err != nil {
-		return store.Object{}, err
-	}
-	defer func() { <-l.sem }()
-	return l.Store.Get(ctx, key, ifNoneMatch, max)
+func (l limited) Get(ctx context.Context, key, ifNoneMatch string, max int64) (o store.Object, err error) {
+	err = l.do(ctx, "get", key, func() error { o, err = l.Store.Get(ctx, key, ifNoneMatch, max); return err })
+	return o, err
 }
 
 func (l limited) PutImmutable(ctx context.Context, key string, body []byte) error {
-	if err := l.acquire(ctx, "put", key); err != nil {
-		return err
-	}
-	defer func() { <-l.sem }()
-	return l.Store.PutImmutable(ctx, key, body)
+	return l.do(ctx, "put", key, func() error { return l.Store.PutImmutable(ctx, key, body) })
 }
 
-func (l limited) PutCAS(ctx context.Context, key string, body []byte, ifMatch string) (string, error) {
-	if err := l.acquire(ctx, "cas", key); err != nil {
-		return "", err
-	}
-	defer func() { <-l.sem }()
-	return l.Store.PutCAS(ctx, key, body, ifMatch)
+func (l limited) PutCAS(ctx context.Context, key string, body []byte, ifMatch string) (etag string, err error) {
+	err = l.do(ctx, "cas", key, func() error { etag, err = l.Store.PutCAS(ctx, key, body, ifMatch); return err })
+	return etag, err
 }
 
-func (l limited) List(ctx context.Context, prefix, after string, limit int) ([]store.Entry, bool, error) {
-	if err := l.acquire(ctx, "list", prefix); err != nil {
-		return nil, false, err
-	}
-	defer func() { <-l.sem }()
-	return l.Store.List(ctx, prefix, after, limit)
+func (l limited) List(ctx context.Context, prefix, after string, limit int) (es []store.Entry, more bool, err error) {
+	err = l.do(ctx, "list", prefix, func() error { es, more, err = l.Store.List(ctx, prefix, after, limit); return err })
+	return es, more, err
 }
 
 func (l limited) Delete(ctx context.Context, key string) error {
-	if err := l.acquire(ctx, "delete", key); err != nil {
-		return err
-	}
-	defer func() { <-l.sem }()
-	return l.Store.Delete(ctx, key)
+	return l.do(ctx, "delete", key, func() error { return l.Store.Delete(ctx, key) })
 }
