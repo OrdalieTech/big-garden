@@ -223,7 +223,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Receipt, error) {
 	limit := len(c.nonces) + 2 // D12: two re-proposals per call
 	for i := 0; ; i++ {
-		if i > 0 && sleep(ctx, i) != nil {
+		if i > 0 && pause(ctx, rand.N(10*time.Millisecond<<min(i, 7))) != nil { // full jitter, 10 ms doubling to 1 s
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown", cause: ctx.Err()}
 		}
 		obj, err := n.st.Get(ctx, head.HeadKey(e.key), "", maxHeadBytes)
@@ -317,18 +317,6 @@ func opOf(c *candidate) MutationID {
 		return MutationID{}
 	}
 	return MutationID(*c.op)
-}
-
-// sleep waits a full-jitter backoff (10 ms doubling to 1 s) or until ctx ends.
-func sleep(ctx context.Context, i int) error {
-	t := time.NewTimer(rand.N(10 * time.Millisecond << min(i, 7)))
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
 }
 
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting

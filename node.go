@@ -101,9 +101,9 @@ func (n *Node) room(self *entity) bool {
 	return resident < n.cfg.Limits.ResidentEntities || shed(lru)
 }
 
-// pause waits 10 ms or until ctx ends.
-func pause(ctx context.Context) error {
-	t := time.NewTimer(10 * time.Millisecond)
+// pause waits d or until ctx ends.
+func pause(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
@@ -337,12 +337,12 @@ func (n *Node) buildBytes() int64 { return 4*n.cfg.Limits.EntityBytes + 1<<20 }
 // releases the reserve with unreserve once the file is built.
 func (n *Node) cache(ctx context.Context, e *entity) error {
 	for i := 0; !n.room(e); i++ { // wait briefly while every resident entity is busy
-		if i == 100 || pause(ctx) != nil {
+		if i == 100 || pause(ctx, 10*time.Millisecond) != nil {
 			return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
 		}
 	}
 	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
-		if i == 100 || pause(ctx) != nil {
+		if i == 100 || pause(ctx, 10*time.Millisecond) != nil {
 			return newError(CodeCapacity, "cache bytes held by entities in use", ctx.Err())
 		}
 	}
