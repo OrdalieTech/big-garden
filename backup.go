@@ -35,9 +35,6 @@ type manifest struct {
 // manifest.json and snapshot.ltx (PROTOCOL §11). It requires ownership, like
 // Read. A write error is returned as is: the partial output is not a backup.
 func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error) {
-	if err := head.ValidKey(ref.Key); err != nil {
-		return Version{}, invalid(err.Error())
-	}
 	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil)
 	if err != nil {
 		return Version{}, err

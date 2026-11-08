@@ -36,9 +36,6 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 
 // Takeover claims the entity from the owner named by observed (PROTOCOL §7).
 func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
-	if err := head.ValidKey(observed.Ref.Key); err != nil {
-		return Route{}, invalid(err.Error())
-	}
 	e, err := n.enter(ctx, observed.Ref.Key, &MutationID{}, nil)
 	if err != nil {
 		return Route{}, err
@@ -84,9 +81,6 @@ func withRoute(err error, r *Route) error {
 
 // Release gives up ownership: owner null, epoch+1 (PROTOCOL §7).
 func (n *Node) Release(ctx context.Context, ref Ref) error {
-	if err := head.ValidKey(ref.Key); err != nil {
-		return invalid(err.Error())
-	}
 	e, err := n.enter(ctx, ref.Key, nil, nil)
 	if err != nil {
 		return err
@@ -115,9 +109,6 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 // Evict closes and deletes the local cache of ref; ownership is unchanged
 // (PROTOCOL §7).
 func (n *Node) Evict(ctx context.Context, ref Ref) error {
-	if err := head.ValidKey(ref.Key); err != nil {
-		return invalid(err.Error())
-	}
 	e, err := n.enter(ctx, ref.Key, nil, nil)
 	if err != nil {
 		return err

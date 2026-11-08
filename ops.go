@@ -58,6 +58,9 @@ func binding(kind byte, from, to uint32, hash [32]byte) head.Digest {
 // outcome_unknown and others unavailable; a mutation whose ctx ends while
 // queued gets outcome_unknown, since the candidate may be its own.
 func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter) (*entity, error) {
+	if err := head.ValidKey(key); err != nil {
+		return nil, invalid(err.Error())
+	}
 	e, err := n.entity(key)
 	if err != nil {
 		return nil, err
@@ -240,9 +243,6 @@ func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 // (CodeNotOwner otherwise; see Ownership in the package doc).
 func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) ([]byte, error)) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
-	if err := head.ValidKey(ref.Key); err != nil {
-		return Result{}, invalid(err.Error())
-	}
 	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil)
 	if err != nil {
 		return Result{}, err
@@ -267,9 +267,6 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 // requires ownership, like Read.
 func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
-	if err := head.ValidKey(ref.Key); err != nil {
-		return Result{}, invalid(err.Error())
-	}
 	e, err := n.enter(ctx, ref.Key, &id, nil)
 	if err != nil {
 		return Result{}, err
