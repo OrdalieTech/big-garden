@@ -273,6 +273,19 @@ func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) 
 		}
 		return resp
 	}
+	// sql.* and capture run only on the request path, before any head CAS:
+	// the killed operation cannot be published, so the restarted node, even
+	// on the killed one's cache, must not show it (no speculative exposure)
+	// and its retry must commit it anew.
+	preCAS := strings.HasPrefix(mode, "sql.") || mode == "capture"
+	if preCAS && inc != "" {
+		resp := call(Req{Op: "read", Key: "k", Inc: inc})
+		for _, o := range ops {
+			if o.outcome == "unknown" && contains(resp.IDs, o.req.ID) {
+				t.Fatalf("%s: unpublished %s visible after restart (reuse %v)", failpoint, o.req.ID, reuse)
+			}
+		}
+	}
 	committed := map[string]bool{}
 	for _, o := range ops {
 		if o.outcome != "unknown" {
@@ -283,6 +296,9 @@ func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) 
 		resp := call(r)
 		if !resp.OK {
 			t.Fatalf("%s: retry of unknown %s %s: %s %s", failpoint, r.Op, r.ID, resp.Code, resp.Err)
+		}
+		if preCAS && resp.Replayed {
+			t.Fatalf("%s: retry of an unpublished %s replayed", failpoint, r.ID)
 		}
 		tl.unknown++
 		if resp.Replayed {
