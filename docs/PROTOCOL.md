@@ -186,9 +186,9 @@ Snapshot: when replay pages (deltas plus tail) exceed `page_count + 256`: checkp
 
 `Export(ref, w)`:
 1. Lock; §3 steps 1–4 (validated head `H`, local image).
-2. Encode a snapshot LTX `1..H.sequence` of the checkpointed image into a temp file; its post-checksum must equal `H.database_checksum`.
+2. Encode a snapshot LTX `1..H.sequence` of the checkpointed image in memory; its post-checksum must equal `H.database_checksum`.
 3. `manifest.json`, canonical JSON ≤ 64 KiB: `format` 1, `namespace`, `key`, `incarnation`, `sequence`, `schema`, `codec`, `page_size`, `page_count`, `database_checksum`, `sha256`, `bytes`.
-4. `archive/tar`: `manifest.json` then `snapshot.ltx`, regular files, mode 0600, zero times, then the end-of-archive blocks. Return `Version{inc, H.sequence}`. Any write error: return it; the partial output is not a backup.
+4. Unlock (the snapshot and manifest are in memory, so a slow writer never blocks the entity). `archive/tar`: `manifest.json` then `snapshot.ltx`, regular files, mode 0600, zero times, then the end-of-archive blocks. Return `Version{inc, H.sequence}`. Any write error: return it; the partial output is not a backup.
 
 `Import(key, req, r)`:
 1. Read the tar strictly: exactly `manifest.json` then `snapshot.ltx`, regular files, sizes within 64 KiB and `EntityBytes`-derived bounds, then end of archive and nothing but zero padding to EOF.

@@ -1034,6 +1034,41 @@ func TestCreateCallbackPanic(t *testing.T) {
 	wantCode(t, err, CodeInvalidArgument)
 }
 
+// blockingWriter blocks every Write until release is closed.
+type blockingWriter struct{ entered, release chan struct{} }
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	select {
+	case w.entered <- struct{}{}:
+	default:
+	}
+	<-w.release
+	return len(p), nil
+}
+
+// TestExportWriterDoesNotBlockEntity: Export writes to the caller's writer
+// without holding the entity mutex.
+func TestExportWriterDoesNotBlockEntity(t *testing.T) {
+	mem := newStore(t)
+	n := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, n, "k", l)
+	w := &blockingWriter{make(chan struct{}, 1), make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { _, err := n.Export(bg, ref, w); done <- err }()
+	<-w.entered
+	ctx, cancel := context.WithTimeout(bg, 2*time.Second)
+	defer cancel()
+	_, err := n.Update(ctx, ref, newReq(t, "during export", 1), put("a", "1"))
+	close(w.release)
+	if err != nil {
+		t.Fatalf("update behind a blocked export: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
