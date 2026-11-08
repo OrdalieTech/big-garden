@@ -132,7 +132,8 @@ func (n *Node) readArchive(r io.Reader) (manifest, []byte, error) {
 	bad := func(msg string) (manifest, []byte, error) {
 		return m, nil, newError(CodeCorrupt, "archive: "+msg, nil)
 	}
-	tr := tar.NewReader(r)
+	cr := &counted{Reader: r}
+	tr := tar.NewReader(cr)
 	var files [2][]byte
 	for i, name := range []string{"manifest.json", "snapshot.ltx"} {
 		limit := int64(maxHeadBytes)
@@ -147,8 +148,10 @@ func (n *Node) readArchive(r io.Reader) (manifest, []byte, error) {
 			return bad("truncated " + name)
 		}
 	}
-	if _, err := tr.Next(); err != io.EOF {
-		return bad("entries after snapshot.ltx")
+	// archive/tar also ends at a bare EOF or one zero block: require both end blocks
+	blocks := func(b []byte) int64 { return 512 + (int64(len(b))+511)/512*512 }
+	if _, err := tr.Next(); err != io.EOF || cr.n != blocks(files[0])+blocks(files[1])+1024 {
+		return bad("entries after snapshot.ltx, or no end-of-archive blocks")
 	}
 	rest, err := io.ReadAll(io.LimitReader(r, 1<<20+1))
 	if err != nil || len(rest) > 1<<20 || bytes.ContainsFunc(rest, func(c rune) bool { return c != 0 }) {
@@ -171,4 +174,16 @@ func (n *Node) readArchive(r io.Reader) (manifest, []byte, error) {
 		return bad("snapshot.ltx differs from the manifest")
 	}
 	return m, files[1], nil
+}
+
+// counted counts the bytes read through it.
+type counted struct {
+	io.Reader
+	n int64
+}
+
+func (c *counted) Read(p []byte) (int, error) {
+	k, err := c.Reader.Read(p)
+	c.n += int64(k)
+	return k, err
 }

@@ -1,6 +1,7 @@
 package garden
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -803,4 +804,232 @@ func TestDatasetLargerThanCache(t *testing.T) {
 		t.Fatalf("heap grows with cycles: %v", heap)
 	}
 	l.verify(t, st, "a")
+}
+
+// TestImportWhileOldWritersWrite restores an export into another namespace
+// (fresh cache dir, different prefix) while the source keeps taking writes:
+// the import holds exactly the exported state, both entities stay writable,
+// and each reads back from its own namespace with an empty cache.
+func TestImportWhileOldWritersWrite(t *testing.T) {
+	st := newStore(t)
+	a := testNode(t, st, "a", nil)
+	l := newLedger()
+	src := mustCreate(t, a, "src", l)
+	for i := range 10 {
+		mustPut(t, a, src, fmt.Sprint("r", i), randText(30<<10), l)
+	}
+	var archive bytes.Buffer
+	v, err := a.Export(bg, src, &archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported := readAll(t, a, src)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() { // old writers keep writing to the old namespace
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			mustPut(t, a, src, fmt.Sprint("late", i%5), randText(8<<10), l)
+		}
+	})
+	other := newStore(t) // another prefix: another namespace
+	z := testNode(t, other, "z", nil)
+	l2 := newLedger()
+	var refs []Ref
+	for i := range 3 {
+		ref, res, err := z.Import(bg, fmt.Sprint("dst", i), newReq(t, fmt.Sprint("import", i), 1), bytes.NewReader(archive.Bytes()))
+		if err != nil || res.Version.Sequence != v.Sequence+1 {
+			t.Fatalf("import %+v %v", res, err)
+		}
+		if z.ns == a.ns || ref.Incarnation == src.Incarnation {
+			t.Fatal("import did not get its own namespace and incarnation")
+		}
+		got := readAll(t, z, ref)
+		if fmt.Sprint(got) != fmt.Sprint(exported) {
+			t.Fatalf("import %d holds %d rows, the export %d", i, len(got), len(exported))
+		}
+		for k, val := range got {
+			l2.ack(ref, k, val)
+		}
+		mustPut(t, z, ref, "new", "1", l2)
+		refs = append(refs, ref)
+	}
+	close(stop)
+	wg.Wait()
+	if got := readAll(t, a, src); got["late0"] == "" {
+		t.Fatal("old writers made no progress during the imports")
+	}
+	l.verify(t, st, "a")
+	l2.verify(t, other, "z")
+	if _, err := other.Get(bg, head.HeadKey("src"), "", maxHeadBytes); store.OutcomeOf(err) != store.NotFound {
+		t.Fatal("the import namespace has the source key")
+	}
+}
+
+type member struct {
+	name string
+	body []byte
+	typ  byte
+	size int64 // header size if not len(body)
+}
+
+func tarOf(ms ...member) []byte {
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	for _, m := range ms {
+		typ := cmpOr(m.typ, tar.TypeReg)
+		size := int64(len(m.body))
+		if m.size != 0 {
+			size = m.size
+		}
+		if typ != tar.TypeReg {
+			size = 0
+		}
+		tw.WriteHeader(&tar.Header{Name: m.name, Typeflag: typ, Mode: 0o600, Size: size, ModTime: time.Unix(0, 0),
+			Format: tar.FormatUSTAR, Linkname: map[bool]string{true: "x"}[typ == tar.TypeSymlink]})
+		if typ == tar.TypeReg {
+			tw.Write(m.body)
+		}
+	}
+	tw.Close()
+	return b.Bytes()
+}
+
+func cmpOr(a, b byte) byte {
+	if a != 0 {
+		return a
+	}
+	return b
+}
+
+// TestImportRejectsMalformedArchives: every deviation from the strict
+// archive shape (PROTOCOL §11 Import step 1-2) is corrupt and writes nothing.
+func TestImportRejectsMalformedArchives(t *testing.T) {
+	st := newStore(t)
+	a := testNode(t, st, "a", nil)
+	src := mustCreate(t, a, "src", nil)
+	a.Update(bg, src, newReq(t, "p", 1), put("a", "1"))
+	var archive bytes.Buffer
+	if _, err := a.Export(bg, src, &archive); err != nil {
+		t.Fatal(err)
+	}
+	m, snap, err := a.readArchive(bytes.NewReader(archive.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mj, _ := json.Marshal(m)
+	withManifest := func(edit func(*manifest)) []byte {
+		m2 := m
+		edit(&m2)
+		b, _ := json.Marshal(m2)
+		return tarOf(member{name: "manifest.json", body: b}, member{name: "snapshot.ltx", body: snap})
+	}
+	rawManifest := func(b []byte) []byte {
+		return tarOf(member{name: "manifest.json", body: b}, member{name: "snapshot.ltx", body: snap})
+	}
+	flipped := bytes.Clone(snap)
+	flipped[len(flipped)/2] ^= 1
+	big := a.cfg.Limits.EntityBytes + a.cfg.Limits.EntityBytes/head.PageSize*64 + 1<<20 + 1
+	cases := map[string][]byte{
+		"empty":               {},
+		"no snapshot":         tarOf(member{name: "manifest.json", body: mj}),
+		"wrong order":         tarOf(member{name: "snapshot.ltx", body: snap}, member{name: "manifest.json", body: mj}),
+		"extra member":        append(tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}, member{name: "x", body: []byte("y")})),
+		"duplicate":           tarOf(member{name: "manifest.json", body: mj}, member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}),
+		"renamed":             tarOf(member{name: "./manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap}),
+		"symlink":             tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", typ: tar.TypeSymlink}),
+		"directory":           tarOf(member{name: "manifest.json", typ: tar.TypeDir}, member{name: "snapshot.ltx", body: snap}),
+		"oversized":           tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: snap, size: big}),
+		"manifest too big":    tarOf(member{name: "manifest.json", body: append(mj, make([]byte, maxHeadBytes)...)}, member{name: "snapshot.ltx", body: snap}),
+		"truncated":           archive.Bytes()[:len(archive.Bytes())-1024-100],
+		"trailing data":       append(bytes.Clone(archive.Bytes()), 'x'),
+		"trailing zeros>1MiB": append(bytes.Clone(archive.Bytes()), make([]byte, 1<<20+1)...),
+		"bad sha":             withManifest(func(m *manifest) { m.SHA256[0] ^= 1 }),
+		"bad bytes":           withManifest(func(m *manifest) { m.Bytes++ }),
+		"flipped snapshot":    tarOf(member{name: "manifest.json", body: mj}, member{name: "snapshot.ltx", body: flipped}),
+		"format":              withManifest(func(m *manifest) { m.Format = 2 }),
+		"codec":               withManifest(func(m *manifest) { m.Codec = "zstd" }),
+		"page size":           withManifest(func(m *manifest) { m.PageSize = 8192 }),
+		"zero namespace":      withManifest(func(m *manifest) { m.Namespace = head.ID{} }),
+		"zero incarnation":    withManifest(func(m *manifest) { m.Incarnation = head.ID{} }),
+		"bad key":             withManifest(func(m *manifest) { m.Key = "../x" }),
+		"sequence 0":          withManifest(func(m *manifest) { m.Sequence = 0 }),
+		"sequence +1":         withManifest(func(m *manifest) { m.Sequence++ }),
+		"schema 0":            withManifest(func(m *manifest) { m.Schema = 0 }),
+		"page count 0":        withManifest(func(m *manifest) { m.PageCount = 0 }),
+		"page count +1":       withManifest(func(m *manifest) { m.PageCount++ }),
+		"page count huge":     withManifest(func(m *manifest) { m.PageCount = 1 << 30 }),
+		"checksum flag":       withManifest(func(m *manifest) { m.DatabaseChecksum &^= head.ChecksumFlag }),
+		"checksum":            withManifest(func(m *manifest) { m.DatabaseChecksum ^= 1 }),
+		"not canonical":       rawManifest(append([]byte(" "), mj...)),
+		"unknown field":       rawManifest(append(bytes.TrimSuffix(mj, []byte("}")), []byte(`,"x":1}`)...)),
+		"two objects":         rawManifest(append(bytes.Clone(mj), mj...)),
+	}
+	i := 0
+	for name, archive := range cases {
+		i++
+		t.Run(name, func(t *testing.T) {
+			key := fmt.Sprint("x", i)
+			_, _, err := a.Import(bg, key, newReq(t, name, 1), bytes.NewReader(archive))
+			wantCode(t, err, CodeCorrupt)
+			if _, err := st.Get(bg, head.BirthKey(key), "", 4<<10); store.OutcomeOf(err) != store.NotFound {
+				t.Fatal("a rejected import wrote birth.json")
+			}
+		})
+	}
+}
+
+// FuzzImport: the strict archive reader never panics, and whatever it
+// accepts is a canonical manifest whose snapshot matches its length and
+// SHA-256; Import of an accepted archive either succeeds with exactly the
+// manifest's state or fails corrupt.
+func FuzzImport(f *testing.F) {
+	mem := storetest.NewMem()
+	cfg, _ := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: f.TempDir(),
+		Limits: Limits{EntityBytes: 1 << 20}}.validate()
+	n, err := open(bg, cfg, mem)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Cleanup(func() { n.Close(bg) })
+	id, _ := NewMutationID(time.Now())
+	ref, _, err := n.Create(bg, "src", Request{ID: id, Hash: [32]byte{1}, Schema: 1}, createKV)
+	if err != nil {
+		f.Fatal(err)
+	}
+	id, _ = NewMutationID(time.Now())
+	n.Update(bg, ref, Request{ID: id, Hash: [32]byte{2}, Schema: 1}, put("a", "1"))
+	var archive bytes.Buffer
+	if _, err := n.Export(bg, ref, &archive); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(archive.Bytes())
+	f.Add(tarOf(member{name: "manifest.json", body: []byte("{}")}, member{name: "snapshot.ltx", body: []byte("x")}))
+	var keys atomic.Int64
+	f.Fuzz(func(t *testing.T, b []byte) {
+		m, snap, err := n.readArchive(bytes.NewReader(b))
+		if err != nil {
+			wantCode(t, err, CodeCorrupt)
+			return
+		}
+		canon, _ := json.Marshal(m)
+		if !bytes.Contains(b, canon) || uint64(len(snap)) != m.Bytes || sha256.Sum256(snap) != m.SHA256 {
+			t.Fatal("accepted an archive that differs from its manifest")
+		}
+		id, _ := NewMutationID(time.Now())
+		key := fmt.Sprint("f", keys.Add(1))
+		dst, res, err := n.Import(bg, key, Request{ID: id, Hash: [32]byte{3}, Schema: m.Schema}, bytes.NewReader(b))
+		if err != nil {
+			wantCode(t, err, CodeCorrupt)
+			return
+		}
+		if res.Version.Sequence != m.Sequence+1 {
+			t.Fatalf("imported sequence %d, manifest %d", res.Version.Sequence, m.Sequence)
+		}
+		n.Evict(bg, dst)
+	})
 }
