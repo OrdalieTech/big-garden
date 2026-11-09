@@ -104,7 +104,9 @@ type fixture struct {
 var fixtures = map[string]fixture{
 	"rustfs": {"state-rustfs", "127.0.0.1:9100", "rustfs_fixture", "staterustfs", "staterustfs-secret",
 		func(image string) []string {
-			return []string{"-p", "127.0.0.1:9100:9000", "-e", "RUSTFS_ACCESS_KEY=staterustfs", "-e", "RUSTFS_SECRET_KEY=staterustfs-secret",
+			// Host network: a rootless port forwarder (pasta) died mid-soak once
+			// and left the server running but unreachable for 15 hours.
+			return []string{"--network", "host", "-e", "RUSTFS_ADDRESS=127.0.0.1:9100", "-e", "RUSTFS_ACCESS_KEY=staterustfs", "-e", "RUSTFS_SECRET_KEY=staterustfs-secret",
 				"-e", "RUSTFS_CONSOLE_ENABLE=false", "--tmpfs", localTmpfs, image, "/data"}
 		}},
 	"minio": {"state-minio", "127.0.0.1:9000", "minio_fixture", "stateminio", "stateminio-secret",

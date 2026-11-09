@@ -133,13 +133,14 @@ func soak(args []string) error {
 	s.refs = refs
 	s.logx("created %d entities on %v", len(keys), s.view())
 
-	stop := make(chan struct{})
+	stop, halted := make(chan struct{}), make(chan struct{})
+	s.halt = sync.OnceFunc(func() { close(halted) })
 	var bg sync.WaitGroup
 	var issued atomic.Int64
 	deadline := s.t0.Add(*dur)
 	done := func() bool {
 		select {
-		case <-stop:
+		case <-halted:
 			return true
 		default:
 		}
@@ -273,6 +274,7 @@ type soakRun struct {
 	windows       map[string]*swindow
 	lastReportOps int64
 	lastReportAt  time.Time
+	halt          func() // ends the measured phase early
 }
 
 type seriesPoint struct {
@@ -1001,6 +1003,17 @@ func checkWindow(w *swindow, pre []unk) (porcupine.CheckResult, int) {
 // IDs (no duplicate commit). In the final check acknowledgments not yet
 // checked must all be found.
 func (s *soakRun) checkpoint(keys []string, final bool) {
+	s.smu.Lock()
+	acked := 0
+	for _, d := range s.lat {
+		acked += len(d)
+	}
+	s.smu.Unlock()
+	if !final && acked == 0 { // a whole interval without one acknowledgment: the store is gone, stop measuring
+		s.fail("no acknowledged operation since the last report: store unreachable, measured phase stopped")
+		s.halt()
+		keys = nil
+	}
 	c := &sclient{id: -5, s: s, owner: map[string]string{}, suspect: map[string]time.Time{}}
 	checked, unread := 0, 0
 	for _, k := range keys {
