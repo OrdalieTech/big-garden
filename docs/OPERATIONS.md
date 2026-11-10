@@ -65,8 +65,8 @@ behavior, the store or its proxy layer, or the publication code.
   changes only with their migration.
 - **Library format.** Heads and descriptors carry `format`/`codec` fields and
   decode strictly: a binary that does not know a format refuses the entity
-  (`corrupt`, the message names the unsupported format; `unsupported` for a
-  namespace descriptor at Open) instead of rewriting it. A downgrade is safe for
+  (`corrupt`, the message names the unsupported format; at Open for the
+  namespace descriptor) instead of rewriting it. A downgrade is safe for
   entities still at the old format and refused for the others.
 - **Rollback of data.** There is no in-place rollback. `Export` writes a
   verified archive at a `Version`; restoring means `Import` of that archive
