@@ -199,7 +199,7 @@ func (r *Registry) do(ctx context.Context, tenant string, op func(garden.Ref) er
 				return err
 			}
 		case garden.CodeOutcomeUnknown, garden.CodeUnavailable:
-			time.Sleep(ge.RetryAfter)
+			time.Sleep(100 * time.Millisecond) // same ID: a retry resolves or replays it
 		default:
 			return err
 		}

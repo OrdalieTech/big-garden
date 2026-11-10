@@ -55,7 +55,6 @@ type Error struct {
 	Route		*Route
 	At		Version
 	Schema		uint32
-	RetryAfter	time.Duration
 	Message		string
 }
 type Limits struct {

@@ -182,6 +182,8 @@ Compaction (fanout 8, PLAN §9.1):
 
 Snapshot: when replay pages (deltas plus tail) exceed `page_count + 256`: checkpointed main file = published image; encode `1..H.sequence`, verify its checksum equals `H.database_checksum`; `PUT_IMM` at base `H.revision`; `next = H` with the new snapshot, no deltas, tail null; `publish`.
 
+After a committed step, once the gate is released, the owner runs Collect (§10) on the entity, best effort within `CommitTimeout`: the superseded inputs stop costing storage without a caller schedule.
+
 ## 10. Collect(ref) (PLAN §9.2), any node, no SQLite
 
 1. `GET head` fresh, strict decode; `R = revision`; `live` = snapshot and delta keys (the tail is not an object).

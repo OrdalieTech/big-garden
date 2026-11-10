@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
-	"go/printer"
 	"go/scanner"
 	"go/token"
 	"os"
@@ -18,9 +17,10 @@ import (
 )
 
 // footprint measures the PLAN §12 budgets: production files and lines of the
-// runtime-reachable project packages, the exported API (snapshot diffed
-// against the committed -api file), the runtime module closure with licenses, native
-// artifacts, branchy functions, and minimal consumer binary sizes.
+// runtime-reachable project packages, exported types and callables (the API
+// snapshot itself is TestAPIFrozen's testdata/api.txt), the runtime module
+// closure with licenses, native artifacts, branchy functions, and minimal
+// consumer binary sizes.
 func footprint(args []string) error {
 	fs := flag.NewFlagSet("footprint", flag.ContinueOnError)
 	maxFiles := fs.Int("max-production-files", 25, "")
@@ -30,8 +30,6 @@ func footprint(args []string) error {
 	maxTypes := fs.Int("max-exported-types", 18, "")
 	maxCallables := fs.Int("max-exported-callables", 30, "")
 	maxBinary := fs.Int64("max-binary-mib", 35, "stripped consumer binary target")
-	apiPath := fs.String("api", "internal/qual/cmd/qual/testdata/api.txt", "committed API snapshot to diff against")
-	updateAPI := fs.Bool("update-api", false, "accept the current API as the new snapshot")
 	out := fs.String("out", "artifacts/footprint", "")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -119,18 +117,13 @@ func footprint(args []string) error {
 	slices.SortFunc(mods, func(a, b map[string]string) int { return strings.Compare(a["module"], b["module"]) })
 	r["modules"] = mods
 
-	api, types, callables, err := apiSnapshot(".")
+	types, callables, err := exported(".")
 	if err != nil {
 		return err
 	}
 	check("exported_types", int64(types), int64(*maxTypes))
 	check("exported_callables", int64(callables), int64(*maxCallables))
 	os.MkdirAll(*out, 0o755)
-	if old, err := os.ReadFile(*apiPath); err == nil && string(old) != api && !*updateAPI {
-		fails = append(fails, "public API changed against "+*apiPath+" (rerun with -update-api to accept)")
-	} else if err := os.WriteFile(*apiPath, []byte(api), 0o644); err != nil {
-		return err
-	}
 
 	sizes := map[string]int64{}
 	for _, arch := range []string{"amd64", "arm64"} {
@@ -219,55 +212,29 @@ func codeLines(path string) (int, []string, error) {
 	return len(lines), branchy, nil
 }
 
-// apiSnapshot prints the exported declarations of the package in dir, without
-// bodies or comments, sorted: the text CI diffs to catch API changes.
-func apiSnapshot(dir string) (string, int, int, error) {
-	fset := token.NewFileSet()
-	ps, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
-	if err != nil {
-		return "", 0, 0, err
-	}
-	var decls []string
-	types, callables := 0, 0
-	print := func(n any) string {
-		var b bytes.Buffer
-		printer.Fprint(&b, fset, n)
-		return b.String()
-	}
+// exported counts the exported types and callables (functions, and methods
+// of exported types) of the package in dir.
+func exported(dir string) (types, callables int, err error) {
+	ps, err := parser.ParseDir(token.NewFileSet(), dir, func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
 	for _, p := range ps {
 		for _, f := range p.Files {
 			for _, d := range f.Decls {
 				switch d := d.(type) {
 				case *ast.FuncDecl:
-					if !d.Name.IsExported() || d.Recv != nil && !ast.IsExported(recvName(d.Recv.List[0].Type)) {
-						continue
+					if d.Name.IsExported() && (d.Recv == nil || ast.IsExported(recvName(d.Recv.List[0].Type))) {
+						callables++
 					}
-					callables++
-					d.Body, d.Doc = nil, nil
-					decls = append(decls, print(d))
 				case *ast.GenDecl:
 					for _, s := range d.Specs {
-						switch s := s.(type) {
-						case *ast.TypeSpec:
-							if s.Name.IsExported() {
-								types++
-								s.Doc, s.Comment = nil, nil
-								decls = append(decls, "type "+print(s))
-							}
-						case *ast.ValueSpec:
-							for _, n := range s.Names {
-								if n.IsExported() {
-									decls = append(decls, d.Tok.String()+" "+n.Name)
-								}
-							}
+						if s, ok := s.(*ast.TypeSpec); ok && s.Name.IsExported() {
+							types++
 						}
 					}
 				}
 			}
 		}
 	}
-	slices.Sort(decls)
-	return strings.Join(decls, "\n") + "\n", types, callables, nil
+	return types, callables, err
 }
 
 func recvName(e ast.Expr) string {

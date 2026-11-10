@@ -26,17 +26,24 @@ func (n *Node) maintainLater(e *entity) {
 	go func() {
 		defer n.wg.Done()
 		e.mu.Lock()
-		defer n.leave(e)
-		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) {
-			n.maintain(e)
+		var ref *Ref
+		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) && n.maintain(e) {
+			ref = &Ref{e.key, e.h.Incarnation}
+		}
+		n.leave(e)
+		if ref != nil { // the step superseded objects: collect them now, outside the gate (best effort)
+			ctx, cancel := n.commitContext()
+			defer cancel()
+			n.Collect(ctx, *ref)
 		}
 	}()
 }
 
 // maintain publishes a snapshot when the replay pages exceed page_count+256,
-// else compacts the oldest run of fanout same-level deltas (PROTOCOL §9).
-// A failure abandons the step: nothing acknowledged depends on it.
-func (n *Node) maintain(e *entity) {
+// else compacts the oldest run of fanout same-level deltas (PROTOCOL §9),
+// and reports whether it committed one. A failure abandons the step:
+// nothing acknowledged depends on it.
+func (n *Node) maintain(e *entity) bool {
 	ctx, cancel := n.commitContext()
 	defer cancel()
 	h := e.h
@@ -49,7 +56,7 @@ func (n *Node) maintain(e *entity) {
 		snap, err := e.db.Snapshot(&buf)
 		if err != nil || snap.Ref.PostChecksum != h.DatabaseChecksum || snap.Ref.MaxSequence != h.Sequence {
 			e.discard()
-			return
+			return false
 		}
 		ref = placed(h, snap.Ref)
 		next.Snapshot, next.Deltas, next.Tail, c.pages = ref, []head.Ref{}, nil, []uint32{snap.Pages}
@@ -62,20 +69,20 @@ func (n *Node) maintain(e *entity) {
 			}
 		}
 		if i+fanout > len(h.Deltas) {
-			return
+			return false
 		}
 		run := h.Deltas[i : i+fanout]
 		objs := make([]io.ReaderAt, fanout)
 		for j, r := range run {
 			obj, err := n.st.Get(ctx, r.Key, "", int64(r.Bytes))
 			if err != nil {
-				return
+				return false
 			}
 			objs[j] = bytes.NewReader(obj.Body)
 		}
 		out, err := engine.Compact(ctx, &buf, run, objs) // checks lengths, SHA-256, the chain and the span
 		if err != nil {
-			return
+			return false
 		}
 		ref = placed(h, out.Ref)
 		ref.Level = run[0].Level + 1
@@ -84,12 +91,13 @@ func (n *Node) maintain(e *entity) {
 	}
 	failpoint("maint.put")
 	if n.putObject(ctx, ref.Key, buf.Bytes()) != nil {
-		return
+		return false
 	}
 	failpoint("maint.cas")
 	c.next, c.object = next, &ref
-	n.publish(e, c) // not committed: the object is abandoned to collection
+	_, err := n.publish(e, c) // not committed: the object is abandoned to collection
 	failpoint("maint.done")
+	return err == nil
 }
 
 // placed keys r as a new object based on h's revision.
