@@ -1502,7 +1502,10 @@ func TestCollect(t *testing.T) {
 	inflight := head.ObjectKey("k", h.Incarnation, h.Revision, head.NewID(), head.Digest{1}) // an upload not yet published
 	mem.PutImmutable(bg, inflight, []byte("x"))
 	mem.PutImmutable(bg, prefix+"junk", []byte("x")) // unparseable: never deleted
-	other := testNode(t, mem, "b", nil)              // any node may collect
+	// The owner already collected after each committed compaction; an
+	// abandoned upload of an earlier revision is left for any node's Collect.
+	mem.PutImmutable(bg, head.ObjectKey("k", h.Incarnation, h.Revision-1, head.NewID(), head.Digest{2}), []byte("x"))
+	other := testNode(t, mem, "b", nil) // any node may collect
 	if err := other.Collect(bg, ref); err != nil {
 		t.Fatal(err)
 	}
@@ -1523,7 +1526,7 @@ func TestCollect(t *testing.T) {
 	if st := other.Stats(); st.Collections != 1 || st.CollectedObjects == 0 || st.CollectedBytes == 0 {
 		t.Fatalf("collect stats %+v", st)
 	}
-	if st := n.Stats(); st.Compactions == 0 || st.Commits != 41 || st.CompactionInputBytes <= st.CompactionOutputBytes/2 ||
+	if st := n.Stats(); st.Compactions == 0 || st.Collections == 0 || st.CollectedObjects == 0 || st.Commits != 41 || st.CompactionInputBytes <= st.CompactionOutputBytes/2 ||
 		st.CompactionOutputBytes == 0 || st.StagingBytes != 0 || st.OldestUnresolved != 0 {
 		t.Fatalf("maintenance stats %+v", st)
 	}
