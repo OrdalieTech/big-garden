@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,7 +83,15 @@ func main() {
 	flag.StringVar(&cache, "cache", "", "cache directory")
 	flag.StringVar(&node, "node", "node", "node ID")
 	commit := flag.Duration("commit-timeout", 0, "Limits.CommitTimeout (0: default)")
+	fsize := flag.Uint64("fsize", 0, "RLIMIT_FSIZE in bytes: writes past it fail with EFBIG (0: no limit)")
 	flag.Parse()
+	if *fsize > 0 { // a full disk for every local file: cache, WAL, staging, checkpoint, restore
+		signal.Ignore(syscall.SIGXFSZ)
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: *fsize, Max: *fsize}); err != nil {
+			fmt.Fprintln(os.Stderr, "setrlimit:", err)
+			os.Exit(2)
+		}
+	}
 	ep.Region, ep.AccessKey, ep.SecretKey = "us-east-1", os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	ctx := context.Background()
 	batch, _ := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")) // Limits.BatchMax (unset: the default)
