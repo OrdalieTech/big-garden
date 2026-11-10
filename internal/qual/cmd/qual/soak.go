@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"encoding/hex"
@@ -1118,8 +1119,11 @@ func (s *soakRun) checkpoint(keys []string, final bool) {
 	for _, d := range s.lat {
 		acked += len(d)
 	}
+	since := time.Since(cmp.Or(s.lastReportAt, s.t0))
 	s.smu.Unlock()
-	if !final && acked == 0 { // a whole interval without one acknowledgment: the store is gone, stop measuring
+	// A whole interval without one acknowledgment: the store is gone, stop
+	// measuring. A checkpoint queued behind a slow one has no interval.
+	if !final && acked == 0 && since > time.Minute {
 		s.fail("no acknowledged operation since the last report: store unreachable, measured phase stopped")
 		s.halt()
 		keys = nil
