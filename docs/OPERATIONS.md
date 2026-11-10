@@ -19,6 +19,31 @@ Credentials: only this library's processes may write under the prefix.
 Normal collection deletes only immutable objects under `entities/*/*/objects/`;
 deleting heads, births or the namespace descriptor is an operator action.
 
+Enforce that in the bucket (D14). On Scaleway, as soon as a bucket policy
+exists every principal it does not name is refused, the owner included, so
+the policy must allow the library's application and an owner account, then
+deny the library's application the deletion of the roots (`<prefix>` is the
+namespace prefix):
+
+```json
+{"Version": "2023-04-17", "Statement": [
+  {"Sid": "Access", "Effect": "Allow",
+   "Principal": {"SCW": ["application_id:<library app>", "user_id:<owner>"]},
+   "Action": "s3:*", "Resource": ["<bucket>", "<bucket>/*"]},
+  {"Sid": "NoDeleteOfRoots", "Effect": "Deny",
+   "Principal": {"SCW": "application_id:<library app>"},
+   "Action": "s3:DeleteObject",
+   "Resource": ["<bucket>/<prefix>/*head.json", "<bucket>/<prefix>/*birth.json",
+                "<bucket>/<prefix>/*namespace.json"]}]}
+```
+
+Verified on fr-par (2026-11-10, bucket `big-garden-qual`, prefix
+`qual-state/d14`): deleting a `head.json` under the prefix answers 403, an
+object under `objects/` and anything outside the prefix still delete, and
+`qual stress --remote` (creates, updates, uploads, compaction, collection,
+cold activations) runs with zero errors under the policy. Delete (D25) never
+deletes a head, so it works under it too.
+
 ## Operational envelope
 
 - **No durable timers.** Nothing runs for an entity unless a caller calls
