@@ -41,16 +41,22 @@
 //
 // # Ownership
 //
-// Update, Migrate, Read, Lookup and Export run only on the entity's owner
-// session. Reads too: they run on the owner's cache, validated by a head GET
-// issued after the call began, which makes them strong (linearizable) with
-// no read lease. A Node that does not own the entity, including an unowned
-// one (after Release), gets CodeNotOwner with Error.Route set;
-// Takeover(*Error.Route) claims it, then retry the identical Request.
-// CodeRouteChanged means another session moved the entity first; its
-// Error.Route is current. A Node takes over implicitly from earlier sessions
-// of its own NodeID (a restarted process), never from other NodeIDs. Close
-// does not release ownership; Release does. Resolve costs one GET: keep the
+// Update and Migrate run only on the entity's owner session. A Node that
+// does not own the entity, including an unowned one (after Release), gets
+// CodeNotOwner with Error.Route set; Takeover(*Error.Route) claims it, then
+// retry the identical Request. CodeRouteChanged means another session moved
+// the entity first; its Error.Route is current. A Node takes over
+// implicitly, on a mutation, from earlier sessions of its own NodeID (a
+// restarted process), never from other NodeIDs. Close does not release
+// ownership; Release does.
+//
+// Read, Lookup and Export run on any Node and never change the owner. They
+// are strong (linearizable) with no read lease: the head is proven current
+// by a request issued after the call began, and the local image must be
+// exactly that head. Concurrent reads share one such GET, and reads queued
+// behind a publication share its CAS. A Node that reads an entity it does
+// not own keeps its file and catches up from it when the head moves (one
+// copy per reading Node, within CacheBytes). Resolve costs one GET: keep the
 // Ref of each key rather than resolving before every call.
 //
 //	for {

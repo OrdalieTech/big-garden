@@ -111,7 +111,6 @@ const (
 	pcUpdDone
 	pcRdBegin
 	pcRdGot
-	pcRdTook
 	pcRdExec
 	pcTkBegin
 	pcTkGot
@@ -404,21 +403,12 @@ func (x *px) run(ev, res uint8) {
 			return
 		}
 		cur := p.Cur
-		x.dropStale(cur)
-		switch {
-		case x.mine(cur):
-			x.activate(cur, pcRdExec)
-		case cur.Owner == int8(x.n+1):
-			x.takeover(cur, pcRdTook)
-		default:
-			x.finish(out{code: cNotOwner})
-		}
-	case pcRdTook:
-		if p.Res == sCommitted {
-			x.activate(p.Cur, pcRdExec)
+		if x.v == FollowerStaleRead && x.m.HasImg && !x.mine(cur) { // control: a follower reads its file unchecked
+			x.readExec()
 			return
 		}
-		x.subFail()
+		x.dropStale(cur) // owned or not: reads never CAS (D24); the local image only if it is cur's
+		x.activate(cur, pcRdExec)
 	case pcRdExec:
 		x.readExec()
 
@@ -948,16 +938,18 @@ func (x *px) admit() {
 	}
 	ni := img
 	x.local(&ni, r, p.Req)
-	if p.Mb != 0 { // D18: take the queued member
+	if p.Mb != 0 { // D18: take the queued member; a queued read does not stop the batch (D23)
 		mb := p.Mb - 1
 		mr := x.c.Reqs[mb]
 		p.Taken, p.Proof, p.Hold = true, false, ni
-		p.MbCode, p.MbSeq = x.verdict(&ni, mr, mb)
-		if mr.TS <= x.clock()-x.c.Retention {
-			p.MbCode, p.MbSeq = cIDExpired, 0
-		}
-		if p.MbCode == 0 {
-			x.local(&ni, mr, mb)
+		if mr.Kind == kUpdate {
+			p.MbCode, p.MbSeq = x.verdict(&ni, mr, mb)
+			if mr.TS <= x.clock()-x.c.Retention {
+				p.MbCode, p.MbSeq = cIDExpired, 0
+			}
+			if p.MbCode == 0 {
+				x.local(&ni, mr, mb)
+			}
 		}
 	}
 	x.m.Img = ni
@@ -1009,7 +1001,7 @@ func (x *px) publishUpdate(inline bool) {
 	next.Nonce = x.fresh()
 	next.Img = x.m.Img
 	c := Cand{Kind: p.Kind, Req: p.Req + 1, Base: h}
-	if p.Taken && p.MbCode == 0 {
+	if p.Taken && p.MbCode == 0 && x.c.Reqs[p.Mb-1].Kind == kUpdate {
 		c.More = p.Mb
 	}
 	switch {
@@ -1041,14 +1033,18 @@ func (x *px) readExec() {
 		}
 		return
 	}
+	x.finish(readOut(img, r))
+}
+
+// readOut is a read's answer computed from img.
+func readOut(img Image, r Req) out {
 	switch {
 	case img.Schema != r.Schema:
-		x.finish(out{code: cSchemaMismatch, img: img, hasImg: true})
+		return out{code: cSchemaMismatch, img: img, hasImg: true}
 	case fails(&img, r):
-		x.finish(out{code: cCallback, img: img, hasImg: true})
-	default:
-		x.finish(out{code: cOK, seq: img.Seq, img: img, hasImg: true})
+		return out{code: cCallback, img: img, hasImg: true}
 	}
+	return out{code: cOK, seq: img.Seq, img: img, hasImg: true}
 }
 
 func oldestRun(h *Head) int {

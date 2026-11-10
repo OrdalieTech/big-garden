@@ -101,7 +101,7 @@ func (cl *cluster) get(name string) *mnode {
 const routeTimeout = 1500 * time.Millisecond
 
 // rclient is a caller-side router: it sends to the believed owner (or the
-// Preferred node), follows the Route of not_owner/route_changed, and after a
+// Preferred node; half of the reads to any member, D24), follows the Route of not_owner/route_changed, and after a
 // timeout decides the node is dead (wrongly, when it is only stopped),
 // observes the Route elsewhere and calls Takeover on a Preferred live node.
 type rclient struct {
@@ -193,6 +193,9 @@ func (c *rclient) run(r Req) hop {
 		target := c.owner[r.Key]
 		if target == "" || !slices.Contains(c.cl.view(), target) {
 			target = c.pick(r.Key, "")
+		}
+		if m := c.cl.view(); r.Op == "read" && rand.N(2) == 0 { // D24: any member reads, a follower unless it owns the key
+			target = m[rand.N(len(m))]
 		}
 		resp, ok := c.attempt(target, r)
 		if !ok { // timed out or the process died: the attempt may still run

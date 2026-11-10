@@ -3,18 +3,22 @@ package garden
 import (
 	"context"
 	"errors"
+	"slices"
+	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/OrdalieTech/big-garden/internal/store"
 )
 
 // fetch revalidates e's cached head with a GET (If-None-Match: etag, if not
-// empty), discarding a local image that no longer matches or is no longer
-// owned.
+// empty), parking a local image that is not exactly the new head's: another
+// image, or the same one by other links, whose page counts it does not know.
 func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) error {
+	issued := time.Now()
 	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
+		e.valid = issued
 		return nil
 	case store.OK:
 	case store.NotFound:
@@ -27,16 +31,16 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	if err != nil {
 		return err
 	}
-	if e.db != nil && (e.db.Published() != imageOf(cur) || !n.mine(cur)) {
+	if e.db != nil && (e.db.Published() != imageOf(cur) || !slices.Equal(links(e.h), links(cur))) {
 		n.park(e) // the file of the previous head: a base for catching up later
 	}
-	e.h, e.etag = cur, obj.ETag
+	e.h, e.etag, e.valid = cur, obj.ETag, issued
 	return nil
 }
 
 // Takeover claims the entity from the owner named by observed (PROTOCOL §7).
 func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
-	e, err := n.enter(ctx, observed.Ref.Key, &MutationID{}, nil)
+	e, err := n.enter(ctx, observed.Ref.Key, &MutationID{}, nil, false)
 	if err != nil {
 		return Route{}, err
 	}
@@ -77,7 +81,7 @@ func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error) {
 
 // Release gives up ownership: owner null, epoch+1 (PROTOCOL §7).
 func (n *Node) Release(ctx context.Context, ref Ref) error {
-	e, err := n.enter(ctx, ref.Key, nil, nil)
+	e, err := n.enter(ctx, ref.Key, nil, nil, false)
 	if err != nil {
 		return err
 	}
@@ -105,7 +109,7 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 // Evict closes and deletes the local cache of ref; ownership is unchanged
 // (PROTOCOL §7).
 func (n *Node) Evict(ctx context.Context, ref Ref) error {
-	e, err := n.enter(ctx, ref.Key, nil, nil)
+	e, err := n.enter(ctx, ref.Key, nil, nil, false)
 	if err != nil {
 		return err
 	}

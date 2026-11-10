@@ -1,0 +1,31 @@
+{
+  "case": "BR",
+  "variant": "read-rides-unresolved",
+  "violation": "G2/G4: read r2 at n0 returned ok from image [r0 r1] schema=1 floor=0, which was never the head during the call",
+  "steps": [
+    {
+      "t": [
+        1,
+        1,
+        128
+      ],
+      "desc": " 1. client invokes r1 update on n0 (entity 0, id 2 hash 1 ts 1; r2 is queued behind it and joins its batch)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 2. store applies m0 PUT object #7 base 1 seq 2..2 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        7,
+        0,
+        0
+      ],
+      "desc": " 3. n0 entity 0 hits CommitTimeout"
+    }
+  ]
+}

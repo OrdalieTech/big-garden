@@ -437,12 +437,10 @@ func (n *Node) entity(key string) (*entity, error) {
 	return e, nil
 }
 
-// leave ends an operation on e: it drops a head this session does not own
-// (the next access GETs it anyway), unlocks e and drops the reference.
+// leave ends an operation on e: it unlocks e and drops the reference. A
+// head this session does not own stays resident like an owned one: a strong
+// read revalidates it anyway (D24).
 func (n *Node) leave(e *entity) {
-	if e.unresolved == nil && e.h != nil && !n.mine(e.h) {
-		e.discard()
-	}
 	e.mu.Unlock()
 	n.drop(e)
 }

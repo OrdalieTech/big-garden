@@ -3,7 +3,7 @@
 // M1 oracle of docs/PLAN.md §14: nodes with sessions, one linearizable register
 // per key with opaque tokens, immutable uploads, head CAS, independent apply and
 // reply delivery for every storage request, hedged duplicates and resolve (D3,
-// D12), takeover including D4, release, crash/restart with cache loss, receipts
+// D12), takeover including D4 (mutations only), strong reads on any node (D24), release, crash/restart with cache loss, receipts
 // with an expiry floor and bounded pruning, compaction at the exact head,
 // collection by base revision, and create including the D5 resume.
 //
@@ -288,6 +288,8 @@ const (
 	RetargetCompaction
 	TailWithoutObject
 	BatchLeaderReceipt
+	RideUnresolved
+	FollowerStaleRead
 	numVariants
 )
 
@@ -295,7 +297,8 @@ var variantNames = [...]string{
 	"correct", "unconditional-head-write", "owner-check-then-publish", "cached-strong-read",
 	"premature-ack", "floorless-receipt-pruning", "age-only-gc", "hedge-without-resolve",
 	"d5-resume-without-identity", "compaction-retargeted", "inline-tail-without-object",
-	"batch-ack-on-leader-receipt",
+	"batch-ack-on-leader-receipt", "read-rides-unresolved",
+	"follower-stale-read",
 }
 
 func (v Variant) String() string { return variantNames[v] }

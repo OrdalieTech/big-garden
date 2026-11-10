@@ -427,8 +427,9 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 		t.Fatalf("resumed stale owner's add: %+v", resp)
 	}
 	led.absent[q.ID] = true
-	if rd, _ := a.do(Req{Op: "read", Key: "k", Inc: inc}, 30*time.Second); rd.OK {
-		t.Fatalf("resumed stale owner served a strong read: %+v", rd)
+	rd, _ := a.do(Req{Op: "read", Key: "k", Inc: inc}, 30*time.Second) // a non-owner reads too (D24): the current state
+	if cur := must(owner, Req{Op: "read", Key: "k", Inc: inc}); !rd.OK || rd.Seq != cur.Seq || !slices.Equal(rd.IDs, cur.IDs) {
+		t.Fatalf("resumed stale owner's strong read %+v, the owner's %+v", rd, cur)
 	}
 	led.check(t, ep, "k", inc, issued)
 	return procWins, inWins, staleAck, stalls, late

@@ -19,7 +19,7 @@ import (
 //	ResultBytes            4 KiB [..64 KiB]         a stored result (receipt) of Create, Update, Migrate, Import
 //	ResidentEntities       256                      open entities
 //	InflightStorage        64                       concurrent storage requests
-//	PendingPerEntity       64                       queued requests per entity
+//	PendingPerEntity       256                      queued requests per entity
 //	Recoveries             8                        concurrent activations
 //	BatchMax               16 [..16]                mutations per publication (1: no batching)
 //	StorageAttemptTimeout  2s                       one storage request
@@ -60,7 +60,7 @@ func (l Limits) resolve() (Limits, error) {
 	orDefault(&l.ResultBytes, 4<<10)
 	orDefault(&l.ResidentEntities, 256)
 	orDefault(&l.InflightStorage, 64)
-	orDefault(&l.PendingPerEntity, 64)
+	orDefault(&l.PendingPerEntity, 256)
 	orDefault(&l.Recoveries, 8)
 	orDefault(&l.BatchMax, maxBatch) // group commit on (DECISIONS D18)
 	orDefault(&l.StorageAttemptTimeout, 2*time.Second)

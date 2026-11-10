@@ -14,6 +14,10 @@ func controlCase(v Variant) *Case {
 		return caseCD()
 	case BatchLeaderReceipt:
 		return caseB()
+	case RideUnresolved:
+		return caseBR()
+	case FollowerStaleRead:
+		return caseF()
 	}
 	return caseP()
 }
