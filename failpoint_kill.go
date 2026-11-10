@@ -5,6 +5,7 @@ package garden
 import (
 	"math/rand/v2"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -15,7 +16,9 @@ import (
 // GARDEN_FAILPOINT=name:n SIGKILLs the process at the nth pass through
 // failpoint(name); a name ending in ".mid" kills 0-3 ms later instead, while
 // the request that follows is in flight. name:n:stop sends SIGSTOP instead,
-// and the process carries on once continued.
+// and the process carries on once continued: the failing goroutine waits for
+// the SIGCONT, since a process-directed SIGSTOP may take effect a little after
+// kill returns and let the next request out first.
 var failName, failHits, failSig = func() (string, int64, syscall.Signal) {
 	f := strings.Split(os.Getenv("GARDEN_FAILPOINT")+"::", ":")
 	hits, _ := strconv.ParseInt(f[1], 10, 64)
@@ -26,6 +29,14 @@ var failName, failHits, failSig = func() (string, int64, syscall.Signal) {
 }()
 
 var failCount atomic.Int64
+
+var continued = func() chan os.Signal {
+	c := make(chan os.Signal, 1)
+	if failSig == syscall.SIGSTOP {
+		signal.Notify(c, syscall.SIGCONT)
+	}
+	return c
+}()
 
 func failpoint(name string) {
 	if name != failName || failCount.Add(1) != failHits {
@@ -42,4 +53,5 @@ func failpoint(name string) {
 	if failSig == syscall.SIGKILL {
 		select {}
 	}
+	<-continued
 }
