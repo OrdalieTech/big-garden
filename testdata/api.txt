@@ -28,6 +28,8 @@ func (*Node) Owner() Owner
 func (*Node) Read(context.Context, Ref, uint32, func(*View) ([]byte, error)) (Result, error)
 func (*Node) Release(context.Context, Ref) error
 func (*Node) Resolve(context.Context, string) (Route, error)
+func (*Node) Scan(context.Context, string) iter.Seq2[Route, error]
+func (*Node) Snapshot(context.Context, Ref) (Version, error)
 func (*Node) Stats() Stats
 func (*Node) Takeover(context.Context, Route) (Route, error)
 func (*Node) Update(context.Context, Ref, Request, func(*Tx) ([]byte, error)) (Result, error)

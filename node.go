@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"iter"
 	"os"
 	"path/filepath"
 	"strings"
@@ -638,4 +639,63 @@ func (l limited) List(ctx context.Context, prefix, after string, limit int) (es 
 
 func (l limited) Delete(ctx context.Context, key string) error {
 	return l.do(ctx, "delete", key, func() error { return l.Store.Delete(ctx, key) })
+}
+
+// Scan yields the Route of every entity of the namespace whose key hashes
+// after afterKey's ("" from the start), in key-hash order, so a scan resumes
+// from the last Route's key. Each Route is a point observation, as from
+// Resolve; an unreadable head is yielded as an error and the scan goes on.
+// Cost: one LIST per 1,000 stored objects and one GET per entity (D22).
+func (n *Node) Scan(ctx context.Context, afterKey string) iter.Seq2[Route, error] {
+	return func(yield func(Route, error) bool) {
+		after := ""
+		if afterKey != "" {
+			after = head.EntityDir(afterKey) + "/head.json"
+		}
+		for {
+			page, more, err := n.st.List(ctx, "entities/", after, 1000)
+			if err != nil {
+				yield(Route{}, storeError(err))
+				return
+			}
+			var keys []string
+			for _, o := range page {
+				if after = o.Key; strings.HasSuffix(o.Key, "/head.json") {
+					keys = append(keys, o.Key)
+				}
+			}
+			routes, errs, gone := make([]Route, len(keys)), make([]error, len(keys)), make([]bool, len(keys))
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, 4)
+			for i, k := range keys {
+				wg.Go(func() {
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					obj, err := n.st.Get(ctx, k, "", head.MaxHeadBytes)
+					if gone[i] = store.OutcomeOf(err) == store.NotFound; err != nil { // deleted meanwhile: skipped
+						errs[i] = storeError(err)
+						return
+					}
+					h, err := head.Decode(obj.Body)
+					switch {
+					case err != nil:
+						errs[i] = newError(CodeCorrupt, k+": "+err.Error(), nil)
+					case h.Namespace != n.ns || head.EntityDir(h.Key)+"/head.json" != k:
+						errs[i] = newError(CodeCorrupt, k+" names another namespace or key", nil)
+					default:
+						routes[i] = *routeOf(&h)
+					}
+				})
+			}
+			wg.Wait()
+			for i := range keys {
+				if !gone[i] && !yield(routes[i], errs[i]) {
+					return
+				}
+			}
+			if !more || len(page) == 0 {
+				return
+			}
+		}
+	}
 }

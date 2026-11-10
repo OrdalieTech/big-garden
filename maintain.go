@@ -27,7 +27,7 @@ func (n *Node) maintainLater(e *entity) {
 		defer n.wg.Done()
 		e.mu.Lock()
 		var ref *Ref
-		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) && n.maintain(e) {
+		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) && n.maintain(e, false) {
 			ref = &Ref{e.key, e.h.Incarnation}
 		}
 		n.leave(e)
@@ -39,11 +39,11 @@ func (n *Node) maintainLater(e *entity) {
 	}()
 }
 
-// maintain publishes a snapshot when the replay pages exceed page_count+256,
-// else compacts the oldest run of fanout same-level deltas (PROTOCOL §9),
-// and reports whether it committed one. A failure abandons the step:
-// nothing acknowledged depends on it.
-func (n *Node) maintain(e *entity) bool {
+// maintain publishes a snapshot when the replay pages exceed page_count+256
+// (or always with snapshot), else compacts the oldest run of fanout
+// same-level deltas (PROTOCOL §9), and reports whether it committed one. A
+// failure abandons the step: nothing acknowledged depends on it.
+func (n *Node) maintain(e *entity, snapshot bool) bool {
 	ctx, cancel := n.commitContext()
 	defer cancel()
 	h := e.h
@@ -52,7 +52,7 @@ func (n *Node) maintain(e *entity) bool {
 	c := &candidate{base: h, baseETag: e.etag}
 	var buf bytes.Buffer
 	var ref head.Ref
-	if e.replay() > uint64(h.PageCount)+256 {
+	if snapshot || e.replay() > uint64(h.PageCount)+256 {
 		snap, err := e.db.Snapshot(&buf)
 		if err != nil || snap.Ref.PostChecksum != h.DatabaseChecksum || snap.Ref.MaxSequence != h.Sequence {
 			e.discard()
@@ -104,6 +104,28 @@ func (n *Node) maintain(e *entity) bool {
 func placed(h *head.Head, r head.Ref) head.Ref {
 	r.Key, r.BaseRevision = head.ObjectKey(h.Key, h.Incarnation, h.Revision, head.NewID(), r.SHA256), h.Revision
 	return r
+}
+
+// Snapshot publishes the entity's current image as a new snapshot and
+// collects everything it supersedes, for erasure: afterwards no object holds
+// a page older than the image, and with secure_delete the image holds no
+// deleted bytes (D22). It requires ownership; it uploads the whole database.
+func (n *Node) Snapshot(ctx context.Context, ref Ref) (Version, error) {
+	e, err := n.enter(ctx, ref.Key, nil, nil)
+	if err != nil {
+		return Version{}, err
+	}
+	if err := n.owned(ctx, e, ref, true); err != nil {
+		n.leave(e)
+		return Version{}, err
+	}
+	if !n.maintain(e, true) {
+		n.leave(e)
+		return Version{}, newError(CodeUnavailable, "the snapshot was not published", nil)
+	}
+	v := Version{e.h.Incarnation, e.h.Sequence}
+	n.leave(e)
+	return v, n.Collect(ctx, ref)
 }
 
 // Collect deletes unreachable immutable artifacts of one entity (PLAN §9.2,

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"database/sql"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1129,5 +1131,141 @@ func TestAmplification(t *testing.T) {
 			}
 			l.verify(t, cs.Store, "a")
 		})
+	}
+}
+
+// TestSnapshotErases (D22): after a deleting Update and Snapshot, no stored
+// object of the entity holds the deleted bytes, and the head has no deltas.
+func TestSnapshotErases(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	ref, _, err := n.Create(bg, "k", newReq(t, "c", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := randText(600)
+	for i := range 30 {
+		v := randText(3000)
+		if i == 10 {
+			v = secret
+		}
+		if _, err := n.Update(bg, ref, newReq(t, fmt.Sprint("w", i), 1), put(fmt.Sprint("k", i), v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := n.Update(bg, ref, newReq(t, "erase", 1), func(tx *Tx) ([]byte, error) {
+		_, err := tx.Exec(bg, "DELETE FROM kv WHERE k = 'k10'")
+		return nil, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.wg.Wait()
+	h0, _ := headAt(t, mem, "k")
+	found := false // control: before Snapshot the deleted bytes are still stored
+	page0, _, _ := mem.List(bg, head.ObjectPrefix("k", h0.Incarnation), "", 1000)
+	for _, o := range page0 {
+		obj, _ := mem.Get(bg, o.Key, "", 1<<30)
+		found = found || bytes.Contains(obj.Body, []byte(secret[:64]))
+	}
+	if !found {
+		t.Fatal("control: the deleted bytes were in no object before Snapshot")
+	}
+	if _, err := n.Snapshot(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := headAt(t, mem, "k")
+	if len(h.Deltas) != 0 || h.Tail != nil {
+		t.Fatalf("head after Snapshot: %d deltas, tail %v", len(h.Deltas), h.Tail != nil)
+	}
+	page, _, _ := mem.List(bg, head.ObjectPrefix("k", h.Incarnation), "", 1000)
+	for _, o := range page {
+		obj, _ := mem.Get(bg, o.Key, "", 1<<30)
+		if bytes.Contains(obj.Body, []byte(secret[:64])) {
+			t.Fatalf("deleted bytes survive in %s", o.Key)
+		}
+	}
+	if len(page) != 1 {
+		t.Fatalf("%d objects left, want the new snapshot only", len(page))
+	}
+}
+
+// TestEntitySizeVisible (D22): application SQL can read the entity's page
+// and free-page counts, in reads and in mutations, before capacity arrives.
+func TestEntitySizeVisible(t *testing.T) {
+	n := testNode(t, newStore(t), "a", nil)
+	ref, _, err := n.Create(bg, "k", newReq(t, "c", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := func(q interface {
+		Query(context.Context, string, []any, func(*sql.Rows) error) error
+	}) (pages, free int) {
+		for _, p := range []struct {
+			q string
+			v *int
+		}{{"PRAGMA page_count", &pages}, {"PRAGMA freelist_count", &free}} {
+			if err := q.Query(bg, p.q, nil, func(r *sql.Rows) error { r.Next(); return r.Scan(p.v) }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return pages, free
+	}
+	if _, err := n.Update(bg, ref, newReq(t, "u", 1), func(tx *Tx) ([]byte, error) {
+		if p, _ := size(tx); p < 2 {
+			t.Errorf("page_count %d in a mutation", p)
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Read(bg, ref, 1, func(v *View) ([]byte, error) {
+		if p, f := size(v); p < 2 || f < 0 {
+			t.Errorf("page_count %d, freelist_count %d in a read", p, f)
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScan (D22): Scan yields every entity once, in key-hash order, skips
+// birth-only prefixes, and resumes after a key.
+func TestScan(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	want := map[string]bool{}
+	for i := range 30 {
+		k := fmt.Sprint("s", i)
+		if _, _, err := n.Create(bg, k, newReq(t, k, 1), createKV); err != nil {
+			t.Fatal(err)
+		}
+		want[k] = true
+	}
+	mem.PutImmutable(bg, head.BirthKey("orphan"), []byte("{}")) // a birth without head is not an entity
+	var keys []string
+	for r, err := range n.Scan(bg, "") {
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, r.Ref.Key)
+	}
+	if len(keys) != 30 || !slices.IsSortedFunc(keys, func(a, b string) int { return strings.Compare(head.EntityDir(a), head.EntityDir(b)) }) {
+		t.Fatalf("scan yielded %d keys %v", len(keys), keys)
+	}
+	for _, k := range keys {
+		delete(want, k)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing from the scan: %v", want)
+	}
+	var rest []string
+	for r, err := range n.Scan(bg, keys[9]) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		rest = append(rest, r.Ref.Key)
+	}
+	if !slices.Equal(rest, keys[10:]) {
+		t.Fatalf("resume after %s: %v, want %v", keys[9], rest, keys[10:])
 	}
 }

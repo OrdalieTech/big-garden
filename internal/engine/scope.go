@@ -54,8 +54,9 @@ var introspection = map[string]bool{"table_info": true, "table_xinfo": true, "in
 // data_version to validate its cached structure. modernc passes a missing
 // argument as "", so PRAGMA page_size=” and data_version=” pass too:
 // harmless, page_size ignores a size that is not a power of two (and is
-// fixed in WAL mode), data_version is read-only.
-var moduleReads = map[string]bool{"page_size": true, "data_version": true}
+// fixed in WAL mode), data_version is read-only. page_count and
+// freelist_count (read-only) give applications the entity's size (D22).
+var moduleReads = map[string]bool{"page_size": true, "data_version": true, "page_count": true, "freelist_count": true}
 
 // rtreeShadow reports whether name may be a shadow table of rtree or
 // geopoly. Both prepare their writes when they connect, which may happen
