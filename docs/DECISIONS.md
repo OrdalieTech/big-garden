@@ -137,4 +137,6 @@ M9 built two examples (`examples/counter`, `examples/kvregistry`) on the public 
 
 - **The stored schema on `schema_mismatch`.** A caller had no way to learn an entity's stored schema, so a rolling upgrade had to guess whether to `Migrate` (the entity is older than the code) or defer to a newer Node (the entity is newer). `Error` gains one field, `Schema uint32`, set on every `schema_mismatch`: the stored schema for `Read`, `Update` and `Migrate` (with `At`, the version at which it was observed), the archive's schema for `Import`. A Node learns it from the call it was making anyway, under ownership, so it is never stale; `Route` stays an ownership observation (adding the schema there would make a `Migrate` look like a route change to `Takeover`). (`TestSchemaMismatchReportsStored`.)
 
+- **No `Error.RetryAfter`.** PLAN §11.4 lists it as a hint, but the library never set it (2026-11-10 review): a field that is always zero invites callers to sleep zero. Retry pacing is the caller's (`examples/kvregistry` waits 100 ms before retrying with the same ID). Removed before release, while removing is free.
+
 Cost: +3 nonblank noncomment production lines in the root package (2,418 → 2,421).
