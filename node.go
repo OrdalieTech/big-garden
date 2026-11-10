@@ -60,7 +60,7 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage)}, entities: map[string]*entity{}, now: time.Now,
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {
@@ -593,7 +593,8 @@ func engineError(err error) *Error {
 // limited bounds the storage requests in flight to Limits.InflightStorage.
 type limited struct {
 	store.Store
-	sem chan struct{}
+	sem  chan struct{}
+	busy *[4]atomic.Int64 // nanoseconds in calls, by Stats.Storage class
 }
 
 // do runs f holding one in-flight slot; a request still waiting for a slot
@@ -604,7 +605,10 @@ func (l limited) do(ctx context.Context, op, key string, f func() error) error {
 	case <-ctx.Done():
 		return &store.Error{Outcome: store.Unknown, Op: op, Key: key, Err: ctx.Err()} // never sent
 	}
-	defer func() { <-l.sem }()
+	defer func(t time.Time) {
+		l.busy[map[string]int{"get": 0, "put": 1, "cas": 1, "list": 2, "delete": 3}[op]].Add(int64(time.Since(t)))
+		<-l.sem
+	}(time.Now())
 	return f()
 }
 

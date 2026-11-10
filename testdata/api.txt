@@ -108,6 +108,7 @@ type Stats struct {
 	Storage								[4]struct {
 		Attempts, Failures		uint64
 		UploadedBytes, DownloadedBytes	uint64
+		Time				time.Duration
 	}
 }
 type Tx struct{}

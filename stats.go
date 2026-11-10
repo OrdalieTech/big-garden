@@ -31,6 +31,7 @@ type Stats struct {
 	Storage                                                    [4]struct {
 		Attempts, Failures             uint64
 		UploadedBytes, DownloadedBytes uint64
+		Time                           time.Duration // in calls, retries and backoff included: Time/calls is the latency the caller pays
 	} // fixed order: GET, PUT (including CAS), LIST, DELETE
 }
 
@@ -147,6 +148,9 @@ func (n *Node) Stats() Stats {
 	}
 	n.mu.Unlock()
 	s.InflightStorage = int64(len(n.st.(limited).sem))
+	for i := range s.Storage {
+		s.Storage[i].Time = time.Duration(n.st.(limited).busy[i].Load())
+	}
 	if s3, ok := n.st.(limited).Store.(*store.S3); ok {
 		k := s3.Counts()
 		s.CASAttempts, s.CASConflicts, s.AmbiguousPuts = k.CASAttempts, k.CASConflicts, k.AmbiguousPuts

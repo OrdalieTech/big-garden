@@ -1523,7 +1523,8 @@ func TestCollect(t *testing.T) {
 	if len(want) != 0 {
 		t.Fatalf("objects that must survive were deleted: %v", want)
 	}
-	if st := other.Stats(); st.Collections != 1 || st.CollectedObjects == 0 || st.CollectedBytes == 0 {
+	if st := other.Stats(); st.Collections != 1 || st.CollectedObjects == 0 || st.CollectedBytes == 0 ||
+		st.Storage[0].Time == 0 || st.Storage[2].Time == 0 || st.Storage[3].Time == 0 { // GET, LIST, DELETE time
 		t.Fatalf("collect stats %+v", st)
 	}
 	if st := n.Stats(); st.Compactions == 0 || st.Collections == 0 || st.CollectedObjects == 0 || st.Commits != 41 || st.CompactionInputBytes <= st.CompactionOutputBytes/2 ||
