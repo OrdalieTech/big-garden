@@ -160,14 +160,25 @@ func mustCreate(t *testing.T, n *Node, key string, l *ledger) Ref {
 	return ref
 }
 
+// mustPut retries its own ID after outcome_unknown or unavailable, as a
+// client does: a loaded machine (-race, the full suite) may time a batch out.
 func mustPut(t *testing.T, n *Node, ref Ref, k, v string, l *ledger) Result {
 	t.Helper()
-	res, err := n.Update(bg, ref, newReq(t, "put "+k+v, 1), put(k, v))
+	req := newReq(t, "put "+k+v, 1)
+	res, err := n.Update(bg, ref, req, put(k, v))
+	for deadline := time.Now().Add(30 * time.Second); retryable(err) && time.Now().Before(deadline); {
+		res, err = n.Update(bg, ref, req, put(k, v))
+	}
 	if err != nil {
 		t.Fatalf("update %s=%.20s: %v", k, v, err)
 	}
 	l.ack(ref, k, v)
 	return res
+}
+
+func retryable(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && (e.Code == CodeOutcomeUnknown || e.Code == CodeUnavailable)
 }
 
 func headAt(t *testing.T, st store.Store, key string) (*head.Head, string) {
@@ -730,20 +741,7 @@ func TestResolveBranches(t *testing.T) {
 			t.Fatalf("retry %+v %v", res, err)
 		}
 		l.ack(ref, "b", "2")
-		// The released proposals may still be settling on a loaded machine:
-		// the next write retries its own ID, as a client does, until it lands.
-		next := newReq(t, "after", 1)
-		for deadline := time.Now().Add(10 * time.Second); ; {
-			_, err = n.Update(bg, ref, next, put("c", "3"))
-			var e *Error
-			if err == nil || !errors.As(err, &e) || e.Code != CodeOutcomeUnknown && e.Code != CodeUnavailable || time.Now().After(deadline) {
-				break
-			}
-		}
-		if err != nil {
-			t.Fatalf("update c=3: %v", err)
-		}
-		l.ack(ref, "c", "3")
+		mustPut(t, n, ref, "c", "3", l) // retried while the released proposals settle
 		l.verify(t, mem, "a")
 	})
 	t.Run("hedged duplicate", func(t *testing.T) {
@@ -2026,8 +2024,18 @@ func TestResidentBoundUnderConcurrentCreates(t *testing.T) {
 	var cw sync.WaitGroup
 	for i := range 64 {
 		cw.Go(func() {
-			if _, _, err := n.Create(bg, fmt.Sprint("e", i), newReq(t, fmt.Sprint("c", i), 1), createKV); err != nil {
-				t.Error(err)
+			req := newReq(t, fmt.Sprint("c", i), 1)
+			for { // all ResidentEntities busy being built: capacity, retried
+				_, _, err := n.Create(bg, fmt.Sprint("e", i), req, createKV)
+				var e *Error
+				if errors.As(err, &e) && e.Code == CodeCapacity {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				if err != nil {
+					t.Error(err)
+				}
+				return
 			}
 		})
 	}

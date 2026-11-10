@@ -3,14 +3,18 @@ package vec_test
 import (
 	"database/sql"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/OrdalieTech/big-garden/vec"
 	"modernc.org/sqlite"
 )
+
+var drivers atomic.Int64
 
 func open(t *testing.T) *sql.DB {
 	t.Helper()
@@ -18,8 +22,9 @@ func open(t *testing.T) *sql.DB {
 	if err := vec.Register(d); err != nil {
 		t.Fatal(err)
 	}
-	sql.Register("vec-test-"+t.Name(), d)
-	db, err := sql.Open("vec-test-"+t.Name(), ":memory:")
+	name := fmt.Sprint("vec-test-", drivers.Add(1)) // -count=N opens again
+	sql.Register(name, d)
+	db, err := sql.Open(name, ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}

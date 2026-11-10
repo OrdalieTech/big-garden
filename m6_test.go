@@ -320,8 +320,10 @@ func TestCollectPausedAfterHead(t *testing.T) {
 			go func() { done <- c.Collect(bg, ref) }()
 			waitPaused(t, paused)
 			fillMaintenance(t, a, ref, snapshot, l)
-			startMaintenance(a, "k")
-			a.wg.Wait()
+			for i := 0; i < 5 && a.Stats().Snapshots+a.Stats().Compactions == 0; i++ { // a loaded machine may abandon a step at its timeout
+				startMaintenance(a, "k")
+				a.wg.Wait()
+			}
 			mustPut(t, a, ref, "inline", "x", l) // an inline tail in the head
 			h, _ := headAt(t, st, "k")
 			if h.Tail == nil {

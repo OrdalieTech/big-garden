@@ -3,7 +3,6 @@ package garden
 import (
 	"bytes"
 	"database/sql"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -254,8 +253,7 @@ func TestFollowerRead(t *testing.T) {
 						}
 						return nil, err
 					})
-					var e *Error
-					if err == nil || !errors.As(err, &e) || e.Code != CodeOutcomeUnknown && e.Code != CodeUnavailable || time.Now().After(deadline) {
+					if !retryable(err) || time.Now().After(deadline) {
 						break
 					}
 				}
