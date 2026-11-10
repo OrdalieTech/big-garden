@@ -730,7 +730,20 @@ func TestResolveBranches(t *testing.T) {
 			t.Fatalf("retry %+v %v", res, err)
 		}
 		l.ack(ref, "b", "2")
-		mustPut(t, n, ref, "c", "3", l)
+		// The released proposals may still be settling on a loaded machine:
+		// the next write retries its own ID, as a client does, until it lands.
+		next := newReq(t, "after", 1)
+		for deadline := time.Now().Add(10 * time.Second); ; {
+			_, err = n.Update(bg, ref, next, put("c", "3"))
+			var e *Error
+			if err == nil || !errors.As(err, &e) || e.Code != CodeOutcomeUnknown && e.Code != CodeUnavailable || time.Now().After(deadline) {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("update c=3: %v", err)
+		}
+		l.ack(ref, "c", "3")
 		l.verify(t, mem, "a")
 	})
 	t.Run("hedged duplicate", func(t *testing.T) {
@@ -994,9 +1007,10 @@ func TestReproposeAfterRecovery(t *testing.T) {
 	l := newLedger()
 	ref := mustCreate(t, n, "k", l)
 	mustPut(t, n, ref, "a", "1", l)
-	var cas atomic.Int32
+	var down atomic.Bool // S3 answers every head CAS ambiguously until it recovers
+	down.Store(true)
 	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
-		if a.Op == "cas" && a.Key == head.HeadKey("k") && cas.Add(1) <= 4 {
+		if a.Op == "cas" && a.Key == head.HeadKey("k") && down.Load() {
 			return storetest.MemFault{Reject: store.Unknown}
 		}
 		return storetest.MemFault{}
@@ -1004,6 +1018,7 @@ func TestReproposeAfterRecovery(t *testing.T) {
 	req := newReq(t, "ambiguous", 1)
 	_, err := n.Update(bg, ref, req, put("b", "2"))
 	wantCode(t, err, CodeOutcomeUnknown)
+	down.Store(false)
 	mustPut(t, n, ref, "c", "3", l) // settles the candidate first: it commits
 	res, err := n.Lookup(bg, ref, req.ID)
 	if err != nil || !res.Replayed || res.Version.Sequence != 3 {

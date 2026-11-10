@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
 // s3Env returns the environment of a counter process: the caller's S3
@@ -17,6 +20,11 @@ import (
 func s3Env(t *testing.T) []string {
 	if os.Getenv("GARDEN_TEST_S3") != "1" {
 		t.Skip("set GARDEN_TEST_S3=1 to run against the local S3 fixture")
+	}
+	if os.Getenv("GARDEN_S3_ENDPOINT") == "" { // start the fixture if no other test did
+		if _, err := storetest.StartLocal(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	b := make([]byte, 6)
 	rand.Read(b)

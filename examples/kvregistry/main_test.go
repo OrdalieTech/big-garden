@@ -12,6 +12,7 @@ import (
 	"time"
 
 	garden "github.com/OrdalieTech/big-garden"
+	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
 func keys(hits []Hit) []string {
@@ -25,6 +26,11 @@ func keys(hits []Hit) []string {
 func TestRegistry(t *testing.T) {
 	if os.Getenv("GARDEN_TEST_S3") != "1" {
 		t.Skip("set GARDEN_TEST_S3=1 to run against the local S3 fixture")
+	}
+	if os.Getenv("GARDEN_S3_ENDPOINT") == "" { // start the fixture if no other test did
+		if _, err := storetest.StartLocal(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for k, v := range map[string]string{"AWS_ACCESS_KEY_ID": "staterustfs", "AWS_SECRET_ACCESS_KEY": "staterustfs-secret"} {
 		if os.Getenv(k) == "" {

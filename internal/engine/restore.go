@@ -153,7 +153,9 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 		if err == io.EOF {
 			break
 		}
-		if err == nil {
+		if err != nil { // the bytes matched their SHA-256: what fails to decode is corrupt
+			err = fmt.Errorf("%w: %v", ErrCorrupt, err)
+		} else {
 			err = ctx.Err()
 		}
 		if err == nil && (ph.Pgno <= prev || ph.Pgno > hd.Commit || (snapshot && ph.Pgno != prev+1)) {

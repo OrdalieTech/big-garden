@@ -6,6 +6,7 @@
 package storetest
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -168,7 +169,7 @@ func StartLocal(ctx context.Context) (Endpoint, error) {
 	switch {
 	case err != nil: // absent: start it, detached from this process group
 		cmd := exec.CommandContext(ctx, "setsid", append([]string{"podman", "run", "-d", "--name", f.name}, f.run(image)...)...)
-		if b, err := cmd.CombinedOutput(); err != nil {
+		if b, err := cmd.CombinedOutput(); err != nil && !bytes.Contains(b, []byte("already in use")) { // in use: a parallel test process started it
 			return e, fmt.Errorf("podman run %s: %v: %s", f.name, err, b)
 		}
 	case strings.TrimSpace(string(out)) != "true "+image:
