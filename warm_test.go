@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
+	"github.com/OrdalieTech/big-garden/internal/store"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -213,6 +215,19 @@ func TestWarmBudget(t *testing.T) {
 	if s.WarmEntities == 0 || s.WarmEvictions == 0 || s.CacheBytes > 6<<20 {
 		t.Fatalf("want parked and evicted entities within the budget: %+v", s)
 	}
+	var lru Ref // the least recently used warm entity: fit must not evict its own file to activate it
+	n.wmu.Lock()
+	for _, ref := range refs {
+		w, ok := n.warm[filepath.Base(head.EntityDir(ref.Key))]
+		if old, had := n.warm[filepath.Base(head.EntityDir(lru.Key))]; ok && (!had || w.used.Before(old.used)) {
+			lru = ref
+		}
+	}
+	n.wmu.Unlock()
+	wantRows(t, n, lru, 20)
+	if s := n.Stats(); s.WarmHits != 1 {
+		t.Fatalf("the least recently used warm entity did not activate warm: %+v", s)
+	}
 	for _, ref := range refs {
 		wantRows(t, n, ref, 20)
 	}
@@ -279,5 +294,52 @@ func TestWarmActivationCost(t *testing.T) {
 			}
 		}, func() { takeOver(t, a, key); readA() })
 		median("cold", func() { a.Evict(bg, ref); takeOver(t, b, key) }, func() { takeOver(t, a, key); readA() })
+	}
+}
+
+// TestWarmKeepsFileOnStoreError: a store failure while fetching the links of
+// a catch-up puts the warm file back; the next activation catches up (D21).
+func TestWarmKeepsFileOnStoreError(t *testing.T) {
+	mem := storetest.NewMem()
+	dir := t.TempDir()
+	a := warmNode(t, mem, "a", dir, nil)
+	ref, _, err := a.Create(bg, "k", newReq(t, "c", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeN(t, a, ref, 0, 12)
+	a.Close(bg)
+	b := warmNode(t, mem, "b", t.TempDir(), nil)
+	takeOver(t, b, "k")
+	for i := range 2 { // uploaded deltas after a's file: the catch-up must GET them
+		if _, err := b.Update(bg, ref, newReq(t, fmt.Sprint("big", i), 1), put(fmt.Sprint("big", i), hex.EncodeToString(random(40<<10)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b.Close(bg)
+	var failing atomic.Bool
+	failing.Store(true)
+	mem.SetPlan(func(at storetest.Attempt) storetest.MemFault {
+		if failing.Load() && at.Op == "get" && strings.Contains(at.Key, "/objects/") {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	a2 := warmNode(t, mem, "a", dir, func(l *Limits) { l.StorageAttemptTimeout = 50 * time.Millisecond })
+	route, err := a2.Resolve(bg, "k")
+	if err == nil {
+		_, err = a2.Takeover(bg, route)
+	}
+	if err == nil {
+		t.Fatal("activation succeeded while object GETs fail")
+	}
+	if s := a2.Stats(); s.WarmEntities != 1 {
+		t.Fatalf("a store error deleted the warm file: %+v", s)
+	}
+	failing.Store(false)
+	takeOver(t, a2, "k")
+	readAll(t, a2, ref)
+	if s := a2.Stats(); s.CatchUps != 1 {
+		t.Fatalf("want a catch-up after the store recovered: %+v", s)
 	}
 }

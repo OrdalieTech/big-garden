@@ -184,16 +184,18 @@ func (n *Node) warmIndex() error {
 	}
 	entries, _ := os.ReadDir(n.warmDir)
 	for _, d := range entries {
-		name := filepath.Join(n.warmDir, strings.TrimSuffix(strings.TrimSuffix(d.Name(), ".db"), ".json"))
+		path := filepath.Join(n.warmDir, d.Name())
+		name, db := strings.TrimSuffix(strings.TrimSuffix(path, ".db"), ".json"), strings.HasSuffix(path, ".db")
 		var w warmFile
 		b, err := os.ReadFile(name + ".json")
 		st, serr := os.Lstat(name + ".db")
-		if err != nil || serr != nil || !st.Mode().IsRegular() || json.Unmarshal(b, &w) != nil {
-			os.Remove(filepath.Join(n.warmDir, d.Name()))
-			continue
+		switch {
+		case db && err == nil && serr == nil && st.Mode().IsRegular() && json.Unmarshal(b, &w) == nil:
+			w.bytes, w.used = st.Size(), st.ModTime()
+			n.warm[filepath.Base(name)] = w
+		case db || !strings.HasSuffix(path, ".json") || serr != nil: // a .json is removed with its .db
+			os.Remove(path)
 		}
-		w.bytes, w.used = st.Size(), st.ModTime()
-		n.warm[filepath.Base(name)] = w
 	}
 	return nil
 }
@@ -217,17 +219,13 @@ func (n *Node) park(e *entity) {
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
 	delete(n.warm, hash)
-	err := e.db.Park(name + ".db")
+	size, err := e.db.Park(name + ".db")
 	failpoint("warm.park")
 	if err == nil {
 		err = os.WriteFile(name+".json", b, 0o600)
 	}
-	var st os.FileInfo
 	if err == nil {
-		st, err = os.Stat(name + ".db")
-	}
-	if err == nil {
-		w.bytes = st.Size()
+		w.bytes = size
 		os.Chtimes(name+".db", w.used, w.used)
 		n.warm[hash] = w
 		e.clear()
@@ -238,8 +236,8 @@ func (n *Node) park(e *entity) {
 	e.discard()
 }
 
-// claimWarm moves key's warm file, if any, to path (deletes it if path is
-// empty) and returns its hint.
+// claimWarm moves key's warm file, if any, to path and returns its hint;
+// with path empty it deletes the file and its hint.
 func (n *Node) claimWarm(key, path string) (warmFile, bool) {
 	hash := filepath.Base(head.EntityDir(key))
 	name := filepath.Join(n.warmDir, hash)
@@ -249,20 +247,31 @@ func (n *Node) claimWarm(key, path string) (warmFile, bool) {
 	delete(n.warm, hash)
 	if path == "" {
 		os.Remove(name + ".db")
-		ok = false
+		os.Remove(name + ".json")
+		return w, false
 	}
-	ok = ok && os.Rename(name+".db", path) == nil
-	os.Remove(name + ".json")
-	return w, ok
+	return w, ok && os.Rename(name+".db", path) == nil
 }
 
-// evictWarm deletes the least recently used warm file: S3 keeps the state.
-func (n *Node) evictWarm() bool {
+// unclaimWarm puts back a file claimWarm moved to path.
+func (n *Node) unclaimWarm(key, path string, w warmFile) {
+	hash := filepath.Base(head.EntityDir(key))
+	n.wmu.Lock()
+	defer n.wmu.Unlock()
+	if os.Rename(path, filepath.Join(n.warmDir, hash)+".db") == nil {
+		n.warm[hash] = w
+	}
+}
+
+// evictWarm deletes the least recently used warm file other than keep's:
+// S3 keeps the state.
+func (n *Node) evictWarm(keep string) bool {
+	keep = filepath.Base(head.EntityDir(keep))
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
 	lru := ""
 	for h, w := range n.warm {
-		if lru == "" || w.used.Before(n.warm[lru].used) {
+		if h != keep && (lru == "" || w.used.Before(n.warm[lru].used)) {
 			lru = h
 		}
 	}
@@ -495,7 +504,7 @@ func (n *Node) fit(self *entity) bool {
 			n.reserved += n.buildBytes()
 			return true
 		}
-		if !n.evictWarm() && !n.shed(lru) {
+		if !n.evictWarm(self.key) && !n.shed(lru) {
 			return false
 		}
 	}

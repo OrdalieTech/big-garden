@@ -337,7 +337,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 	}
 	for {
 		objs, err := n.objects(ctx, links(h), h)
-		if err != nil && store.OutcomeOf(err) != store.NotFound && !errors.Is(err, engine.ErrCorrupt) {
+		if err != nil && !miss(err) {
 			return storeError(err)
 		}
 		if err != nil { // collection race, or a missing or corrupt object
@@ -398,7 +398,7 @@ func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head) ([]io
 	wg.Wait()
 	var err error
 	for _, e := range errs {
-		if e != nil && store.OutcomeOf(e) != store.NotFound && !errors.Is(e, engine.ErrCorrupt) {
+		if e != nil && !miss(e) {
 			return nil, e
 		}
 		err = cmp.Or(err, e)
@@ -433,7 +433,11 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 	failpoint("warm.claim")
 	if ok && i > 0 && w.Image.Sequence <= h.Sequence {
 		objs, err := n.objects(ctx, refs[i:], h)
-		failpoint("warm.apply.mid") // the kill lands inside Restore's overlay
+		failpoint("warm.apply.mid")   // the kill lands inside Restore's overlay
+		if err != nil && !miss(err) { // the store, not the file: keep it for the next attempt
+			n.unclaimWarm(e.key, path, w)
+			return false
+		}
 		if err == nil {
 			db, p, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs, &w.Image)
 			if err == nil {
@@ -445,12 +449,19 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 				}
 				e.db, e.h, e.etag, e.pages = db, h, etag, append(pages, p...)
 				e.bytes.Store(db.Bytes())
+				n.claimWarm(e.key, "")
 				return true
 			}
 		}
 	}
 	os.Remove(path)
+	n.claimWarm(e.key, "")
 	return false
+}
+
+// miss reports a missing or corrupt object, as opposed to a store failure.
+func miss(err error) bool {
+	return store.OutcomeOf(err) == store.NotFound || errors.Is(err, engine.ErrCorrupt)
 }
 
 // replay is the decoded page count of the deltas plus the tail.
