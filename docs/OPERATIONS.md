@@ -74,6 +74,33 @@ behavior, the store or its proxy layer, or the publication code.
   Nodes still running on the old namespace cannot write into the restored one
   (PLAN §10.3-10.4).
 
+## Costs and behaviors to plan for
+
+Measured on local RustFS with Scaleway-like delays (GET +9 ms, PUT +35 ms),
+2026-11-10 review (`.work/paradigm-probe.md`):
+
+- **Routing.** A request on the owner costs 42 ms and 1 PUT; a misrouted
+  one 195 ms, 5.8 GET and 2.9 PUT (takeover, activation, and the old owner's
+  `not_owner` on its next request). Keep requests for a key on one Node:
+  route by `Resolve`/the error `Route`, and back off on `route_changed`.
+- **NodeIDs.** One `NodeID` per live process. Two processes with one
+  `NodeID` (a blue/green overlap) are safe, but every alternation is an
+  implicit takeover (D4): a `not_owner` and two activations.
+- **Restart.** After a restart the first read of an entity costs 2 GET and
+  1 PUT (68 ms, takeover of the dead session's ownership), the first write
+  148 ms; the warm tier (D21) avoids re-downloading the database.
+- **Create.** 2 GET, 3 PUT and 1 LIST (birth, genesis snapshot, head;
+  namespace check), p50 185 ms.
+- **Retry horizon.** A `MutationID` older than `ReceiptRetention` gets
+  `id_expired`, even if never used (`Create` too). A job retried later than
+  that needs a fresh ID and its own idempotency record in the entity (a row
+  keyed by the job's ID, checked by its callback).
+- **Store outage.** An `Update` waits up to `CommitTimeout` (10 s), then
+  returns `outcome_unknown`; the node keeps resolving and commits or abandons
+  it once the store answers (`Lookup` tells). Size caller deadlines for it.
+- **Re-entrancy.** A callback must not call the library on its own entity:
+  the entity mutex is held, so the inner call waits until its context ends.
+
 ## Runbooks
 
 - **Ambiguous mutation (`outcome_unknown`).** Retry with the same
