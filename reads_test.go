@@ -334,3 +334,28 @@ func TestExportFollower(t *testing.T) {
 		t.Fatalf("the export changed the owner: %+v", h.Owner)
 	}
 }
+
+// TestHundredReaders: 100 concurrent reads of one entity queue within the
+// default PendingPerEntity (256), with no capacity rejection, and the
+// publication they wait behind validates them all.
+func TestHundredReaders(t *testing.T) {
+	st := newStore(t)
+	n := testNode(t, st, "a", func(l *Limits) { l.PendingPerEntity = 0 }) // the default
+	ref := mustCreate(t, n, "k", newLedger())
+	release := make(chan struct{})
+	leader := hold(t, n, ref, newReq(t, "leader", 1), release)
+	from := len(st.Journal())
+	group := queueReads(t, n, ref, 100)
+	close(release)
+	if o := <-leader; o.err != nil {
+		t.Fatal(o.err)
+	}
+	for range 100 {
+		if got := <-group; got["l"] != "0" {
+			t.Fatalf("read %v", got)
+		}
+	}
+	if s := n.Stats(); s.ReadRejections != 0 || headGets(st, "k", from) != 0 {
+		t.Fatalf("%d read rejections, %d head GETs", s.ReadRejections, headGets(st, "k", from))
+	}
+}
