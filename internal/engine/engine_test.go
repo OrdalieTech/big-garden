@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -461,5 +462,38 @@ func TestScopeRace(t *testing.T) {
 	}
 	if got := scalar(t, f.d.conn, "SELECT count(*) FROM _state_meta"); got != "1" {
 		t.Fatalf("%s meta rows", got)
+	}
+}
+
+// TestSecureDelete: a deleted row's bytes leave the image at the commit that
+// deletes it: they are in neither the checkpointed file, that commit's delta,
+// nor a fresh snapshot (secure_delete=FAST with auto_vacuum=FULL).
+func TestSecureDelete(t *testing.T) {
+	f := newFixture(t, head.MaxPages)
+	f.mutate(t, "CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB)")
+	f.publish(t, true)
+	secret := make([]byte, 600)
+	crand.Read(secret)
+	for i := range 20 { // the secret between neighbors on the same pages
+		if i == 10 {
+			f.mutate(t, "INSERT INTO t VALUES (100, ?)", secret)
+		}
+		f.mutate(t, "INSERT INTO t VALUES (?, randomblob(600))", 200+i)
+	}
+	f.publish(t, false)
+	f.mutate(t, "DELETE FROM t WHERE k = 100")
+	f.publish(t, false)
+	file, err := os.ReadFile(f.d.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap bytes.Buffer
+	if _, err := f.d.Snapshot(&snap); err != nil {
+		t.Fatal(err)
+	}
+	for name, b := range map[string][]byte{"file": file, "delta": f.objs[len(f.objs)-1], "snapshot": snap.Bytes()} {
+		if bytes.Contains(b, secret[:64]) {
+			t.Errorf("deleted bytes still in the %s", name)
+		}
 	}
 }

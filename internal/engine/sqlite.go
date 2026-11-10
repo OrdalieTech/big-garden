@@ -253,6 +253,7 @@ func (d *DB) setup(maxPages uint32) error {
 		{"PRAGMA synchronous=OFF", "PRAGMA synchronous", "0"}, // D1
 		{"PRAGMA trusted_schema=OFF", "PRAGMA trusted_schema", "0"},
 		{"PRAGMA foreign_keys=ON", "PRAGMA foreign_keys", "1"},
+		{"PRAGMA secure_delete=FAST", "PRAGMA secure_delete", "2"}, // deleted bytes leave the image at once (with auto_vacuum=FULL)
 		{"PRAGMA cache_size=-1024", "PRAGMA cache_size", "-1024"},
 		{"PRAGMA busy_timeout=1000", "PRAGMA busy_timeout", "1000"},
 		{fmt.Sprintf("PRAGMA max_page_count=%d", maxPages), "PRAGMA max_page_count", fmt.Sprint(maxPages)},
