@@ -4,8 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"database/sql"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -75,7 +75,9 @@ func (p *pauseStore) PutCAS(ctx context.Context, key string, body []byte, ifMatc
 }
 
 // pauseOnce arms ps to pause the first call matching op/phase (and key
-// filter) until release is closed; paused receives the matched key.
+// filter) until release is closed, and every later matching call until then
+// (a stopped process cannot send the hedged twin of its CAS either: D3);
+// paused receives the first matched key.
 func pauseOnce(ps *pauseStore, op, phase string, match func(key string) bool) (paused chan string, release chan struct{}) {
 	paused, release = make(chan string, 1), make(chan struct{})
 	var once sync.Once
@@ -83,13 +85,19 @@ func pauseOnce(ps *pauseStore, op, phase string, match func(key string) bool) (p
 		if o != op || ph != phase || (match != nil && !match(key)) {
 			return false
 		}
-		hit := false
-		once.Do(func() { hit = true })
-		if hit {
+		first := false
+		once.Do(func() { first = true })
+		if first {
 			paused <- key
-			<-release
+		} else {
+			select {
+			case <-release: // resumed: later calls go out unpaused
+				return false
+			default: // a stopped process sends nothing, its hedged twin included
+			}
 		}
-		return hit
+		<-release
+		return true
 	})
 	return paused, release
 }

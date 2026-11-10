@@ -177,11 +177,31 @@ type op struct {
 
 type tally struct{ killed, acked, unknown, replayed int }
 
+// runDir is a cache directory of one run, removed by removeAll when the run
+// returns: t.TempDir would keep every run's caches until the subtest ends, and
+// at GARDEN_KILL_RUNS=100 those fill a tmpfs /tmp.
+func runDir(t *testing.T, dirs *[]string) string {
+	d, err := os.MkdirTemp("", "killnode-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	*dirs = append(*dirs, d)
+	return d
+}
+
+func removeAll(dirs *[]string) {
+	for _, d := range *dirs {
+		os.RemoveAll(d)
+	}
+}
+
 // killRun restarts with an empty cache directory, or with the killed
 // process's own one when reuse is set (its residue must be ignored).
 func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) (tl tally) {
 	t.Helper()
-	cache := t.TempDir()
+	var dirs []string
+	defer removeAll(&dirs)
+	cache := runDir(t, &dirs)
 	mode, k, _ := strings.Cut(failpoint, ":")
 	armAt, _ := strconv.Atoi(k)
 	var px *storetest.Proxy
@@ -262,7 +282,7 @@ func killRun(t *testing.T, ep storetest.Endpoint, failpoint string, reuse bool) 
 	}
 	// restart with an empty cache; retry every unknown with the same ID and input
 	if !reuse {
-		cache = t.TempDir()
+		cache = runDir(t, &dirs)
 	}
 	p = start(t, ep, cache, "")
 	defer p.stop()

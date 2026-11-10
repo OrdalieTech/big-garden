@@ -235,25 +235,31 @@ func (l *ledger) check(t *testing.T, ep storetest.Endpoint, key, inc string, iss
 // in-process nodes call Takeover on the same observed Route at once. Exactly
 // one wins per epoch, every loser gets route_changed or not_owner carrying the
 // winner's Route, the previous owner and the losers cannot commit, the
-// resumed a publishes nothing new, and the ledger survives.
+// resumed a publishes nothing new, and the ledger survives. A loser may
+// instead answer unavailable or outcome_unknown (PLAN §18.1): RustFS queues
+// the head GETs behind the contended conditional PUTs of the round for up to
+// about a second, past the node processes' 1 s CommitTimeout, and sometimes
+// resets a losing CAS instead of answering 412 (research.lock.json). Such a
+// loser must then resolve to the winner: its next add is not_owner with the
+// winner's Route.
 func TestConcurrentTakeover(t *testing.T) {
 	base := storetest.Local(t)
 	runs := killRuns()
-	var procWins, inWins, staleAcks, stalls int
+	var procWins, inWins, staleAcks, stalls, late int
 	for i := range runs {
 		ep := base.Sub(fmt.Sprintf("takeover-%d", i))
-		p, n, s, w := takeoverRun(t, ep)
-		procWins, inWins, staleAcks, stalls = procWins+p, inWins+n, staleAcks+s, stalls+w
+		p, n, s, w, l := takeoverRun(t, ep)
+		procWins, inWins, staleAcks, stalls, late = procWins+p, inWins+n, staleAcks+s, stalls+w, late+l
 		clean(t, ep)
 		if t.Failed() {
 			return
 		}
 	}
-	t.Logf("%d runs x 3 rounds of 35 candidates: %d rounds won by a process, %d by an in-process node; stopped owner's in-flight add acknowledged in %d runs; %d resolves waited for MinIO to drop a stalled CAS",
-		runs, procWins, inWins, staleAcks, stalls)
+	t.Logf("%d runs x 3 rounds of 35 candidates: %d rounds won by a process, %d by an in-process node; stopped owner's in-flight add acknowledged in %d runs; %d resolves waited for MinIO to drop a stalled CAS; %d losers answered unavailable or outcome_unknown, then resolved to the winner",
+		runs, procWins, inWins, staleAcks, stalls, late)
 }
 
-func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAck, stalls int) {
+func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAck, stalls, late int) {
 	a := startNode(t, ep, "a")
 	defer a.kill()
 	cands := map[string]endpoint{}
@@ -347,8 +353,14 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 		if wr.Node != win.name || wr.Epoch != rt.Epoch+1 {
 			t.Fatalf("round %d: winner %s route %+v after observed %+v", round, win.name, wr, rt)
 		}
+		check := []string{"b", "c", "d", "m00", "m31"}
 		for _, r := range all {
 			if r.name == win.name || (r.resp.OK && r.name == ownerName) {
+				continue
+			}
+			if r.resp.Code == "unavailable" || r.resp.Code == "outcome_unknown" {
+				late++
+				check = append(check, r.name) // must resolve to the winner below
 				continue
 			}
 			if (r.resp.Code != "route_changed" && r.resp.Code != "not_owner") || r.resp.Route == nil ||
@@ -362,7 +374,7 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 			procWins++
 		}
 		// losers and a live previous owner cannot commit: not_owner with the winner's Route
-		for _, name := range []string{"b", "c", "d", "m00", "m31"} {
+		for _, name := range check {
 			if name == win.name {
 				continue
 			}
@@ -419,7 +431,7 @@ func takeoverRun(t *testing.T, ep storetest.Endpoint) (procWins, inWins, staleAc
 		t.Fatalf("resumed stale owner served a strong read: %+v", rd)
 	}
 	led.check(t, ep, "k", inc, issued)
-	return procWins, inWins, staleAck, stalls
+	return procWins, inWins, staleAck, stalls, late
 }
 
 // TestSameIDSeveralNodes sends one Request (same ID and hash) to two node

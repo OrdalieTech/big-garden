@@ -828,6 +828,47 @@ func TestResolveBranches(t *testing.T) {
 		}
 		l.verify(t, mem, "a")
 	})
+	t.Run("refused takeover, head unreadable", func(t *testing.T) {
+		// a 412 to the only proposal of a takeover proves it never applied:
+		// a reread that cannot finish is unavailable, not outcome_unknown
+		mem := newStore(t)
+		a := testNode(t, mem, "a", nil)
+		b := testNode(t, mem, "b", nil)
+		l := newLedger()
+		ref := mustCreate(t, a, "k", l)
+		mustPut(t, a, ref, "a", "1", l)
+		route, err := b.Resolve(bg, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var refused atomic.Bool
+		mem.SetPlan(func(at storetest.Attempt) storetest.MemFault {
+			switch {
+			case at.Key != head.HeadKey("k"):
+			case at.Op == "cas" && refused.CompareAndSwap(false, true):
+				return storetest.MemFault{Reject: store.PreconditionFailed}
+			case at.Op == "get" && refused.Load():
+				return storetest.MemFault{Reject: store.Unknown}
+			}
+			return storetest.MemFault{}
+		})
+		_, err = b.Takeover(bg, route)
+		wantCode(t, err, CodeUnavailable)
+		e, _ := b.entity("k")
+		e.mu.Lock()
+		if e.unresolved != nil {
+			t.Fatal("refused takeover still unresolved")
+		}
+		e.mu.Unlock()
+		mem.SetPlan(nil)
+		if got, err := b.Takeover(bg, route); err != nil || got.Epoch != route.Epoch+1 {
+			t.Fatalf("takeover after recovery %+v %v", got, err)
+		}
+		_, err = a.Update(bg, ref, newReq(t, "stale", 1), put("b", "2"))
+		wantCode(t, err, CodeNotOwner)
+		mustPut(t, b, ref, "c", "3", l)
+		l.verify(t, mem, "b")
+	})
 	t.Run("ambiguous then definite stays unknown", func(t *testing.T) {
 		mem := newStore(t)
 		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
@@ -2001,5 +2042,53 @@ func TestOutageFailsFast(t *testing.T) {
 	var ge *Error
 	if _, err := n.Lookup(bg, ref, req.ID); err != nil && !(errors.As(err, &ge) && ge.Code == CodeAbsentAtVersion) {
 		t.Fatalf("the unknown update did not resolve once the store returned: %v", err)
+	}
+}
+
+// TestNewerHeadFormatRefused (PLAN §16 row 25, downgraded binary): a head
+// written by a newer format is refused by every path of this binary (strong
+// read, update, resolve, takeover by a fresh node) before any write, and the
+// head stays byte for byte what the newer writer left.
+func TestNewerHeadFormatRefused(t *testing.T) {
+	mem := newStore(t)
+	a := testNode(t, mem, "a", nil)
+	l := newLedger()
+	ref := mustCreate(t, a, "k", l)
+	mustPut(t, a, ref, "a", "1", l)
+	route, err := a.Resolve(bg, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, err := mem.Get(bg, head.HeadKey("k"), "", head.MaxHeadBytes)
+	if err != nil || !bytes.HasPrefix(cur.Body, []byte(`{"format":1,`)) {
+		t.Fatalf("head %q %v", cur.Body, err)
+	}
+	newer := append([]byte(`{"format":2,`), cur.Body[len(`{"format":1,`):]...)
+	if _, err := mem.PutCAS(bg, head.HeadKey("k"), newer, cur.ETag); err != nil {
+		t.Fatal(err)
+	}
+	b := testNode(t, mem, "b", nil)
+	for _, c := range []struct {
+		name string
+		op   func() error
+	}{
+		{"read", func() error {
+			_, err := a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+			return err
+		}},
+		{"resolve", func() error { _, err := b.Resolve(bg, "k"); return err }},
+		{"takeover", func() error { _, err := b.Takeover(bg, route); return err }},
+		// the owner publishes on its cached head: the refused CAS's reread
+		// cannot decode the newer head, so the candidate stays unresolved
+		// (PROTOCOL §2 resolve rule 5)
+		{"update", func() error { _, err := a.Update(bg, ref, newReq(t, "after", 1), put("b", "2")); return err }},
+	} {
+		var e *Error
+		if err := c.op(); !errors.As(err, &e) || (e.Code != CodeCorrupt && e.Code != CodeUnsupported && !(c.name == "update" && e.Code == CodeOutcomeUnknown)) {
+			t.Errorf("%s on a newer head: %v", c.name, err)
+		}
+		if now, err := mem.Get(bg, head.HeadKey("k"), "", head.MaxHeadBytes); err != nil || !bytes.Equal(now.Body, newer) {
+			t.Fatalf("%s changed the newer head: %q %v", c.name, now.Body, err)
+		}
 	}
 }
