@@ -92,7 +92,7 @@ func (n *Node) exportFiles(ctx context.Context, ref Ref) (*head.Head, [2][]byte,
 // with the receipts and floor preserved. req.Schema must equal the archive's
 // schema, else CodeSchemaMismatch with Error.Schema set to it.
 func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader) (Ref, Result, error) {
-	if err := cmp.Or(checkRequest(key, req), n.checkClock(req)); err != nil {
+	if err := cmp.Or(checkRequest(key, req), n.checkClock(ctx, req)); err != nil {
 		return Ref{}, Result{}, err
 	}
 	m, snap, err := n.readArchive(r)

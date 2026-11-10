@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // Retry budget of the idempotent calls (Get, PutImmutable, List, Delete).
@@ -50,6 +53,7 @@ type S3 struct {
 	attempt time.Duration // deadline of each physical attempt, body read included
 	n       [4]struct{ attempts, failures, up, down atomic.Uint64 }
 	cas     [3]atomic.Uint64 // attempts, conflicts, ambiguous PUTs
+	skew    atomic.Int64     // nanoseconds, see Skew
 }
 
 // NewS3 returns a Store on bucket under prefix (joined with "/"; "" for the
@@ -74,7 +78,26 @@ func (s *S3) Counts() Counts {
 
 // once forces exactly one SDK attempt whatever the client's retry settings:
 // an applied write whose reply is lost must not come back as a 412 (§8.1).
-func once(o *s3.Options) { o.Retryer, o.RetryMaxAttempts = aws.NopRetryer{}, 0 }
+// It also samples the store's clock from the Date header of every reply.
+func (s *S3) once(o *s3.Options) {
+	o.Retryer, o.RetryMaxAttempts = aws.NopRetryer{}, 0
+	o.APIOptions = append(o.APIOptions, func(st *middleware.Stack) error {
+		return st.Deserialize.Add(middleware.DeserializeMiddlewareFunc("garden-date", func(ctx context.Context, in middleware.DeserializeInput,
+			next middleware.DeserializeHandler) (middleware.DeserializeOutput, middleware.Metadata, error) {
+			out, md, err := next.HandleDeserialize(ctx, in)
+			if r, ok := out.RawResponse.(*smithyhttp.Response); ok {
+				if t, perr := http.ParseTime(r.Header.Get("Date")); perr == nil {
+					s.skew.Store(int64(time.Since(t)))
+				}
+			}
+			return out, md, err
+		}), middleware.Before)
+	})
+}
+
+// Skew is the local clock minus the store's, from the latest reply with a
+// Date header (second resolution; 0 before any).
+func (s *S3) Skew() time.Duration { return time.Duration(s.skew.Load()) }
 
 func (s *S3) Get(ctx context.Context, key, ifNoneMatch string, max int64) (Object, error) {
 	var obj Object
@@ -89,7 +112,7 @@ func (s *S3) get(ctx context.Context, key, ifNoneMatch string, max int64) (Objec
 	if ifNoneMatch != "" {
 		in.IfNoneMatch = &ifNoneMatch
 	}
-	out, err := s.client.GetObject(ctx, in, once)
+	out, err := s.client.GetObject(ctx, in, s.once)
 	if err != nil {
 		return Object{}, s.done(opGet, 0, 0, classify("get", key, err))
 	}
@@ -137,7 +160,7 @@ func (s *S3) put(ctx context.Context, op, key string, body []byte, ifMatch strin
 	} else {
 		in.IfMatch = &ifMatch
 	}
-	out, err := s.client.PutObject(ctx, in, once)
+	out, err := s.client.PutObject(ctx, in, s.once)
 	if err == nil && op == "cas" && (out.ETag == nil || *out.ETag == "") {
 		// Applied, but the next CAS needs the token: let resolve read it.
 		err = failed(op, key, Unknown, "success without ETag")
@@ -170,7 +193,7 @@ func (s *S3) list(ctx context.Context, prefix, after string, limit int) ([]Entry
 	if after != "" {
 		in.StartAfter = aws.String(s.prefix + after)
 	}
-	out, err := s.client.ListObjectsV2(ctx, in, once)
+	out, err := s.client.ListObjectsV2(ctx, in, s.once)
 	if err != nil {
 		return nil, false, s.done(opList, 0, 0, classify("list", prefix, err))
 	}
@@ -191,7 +214,7 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 	return retry(ctx, func() error {
 		ctx, cancel := context.WithTimeout(ctx, s.attempt)
 		defer cancel()
-		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + key)}, once)
+		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + key)}, s.once)
 		if err = classify("delete", key, err); OutcomeOf(err) == NotFound {
 			err = nil
 		}

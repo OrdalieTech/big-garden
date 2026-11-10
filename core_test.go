@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1890,5 +1891,41 @@ func TestHeadDropsItsCandidate(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc) - (journaled() - j0); grew > 4<<20 {
 		t.Fatalf("heap grew %d bytes over 1,900 updates: publications are retained", grew)
+	}
+}
+
+type roundTripper func(*http.Request) (*http.Response, error)
+
+func (f roundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestClockGuard (D22): with the store's Date 10 min behind the node,
+// mutations are refused as unavailable while reads still work; once the
+// clocks agree again, the next mutation re-samples and goes through.
+func TestClockGuard(t *testing.T) {
+	ep := storetest.Local(t)
+	var offset atomic.Int64
+	date := roundTripper(func(r *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err == nil {
+			resp.Header.Set("Date", time.Now().Add(time.Duration(offset.Load())).UTC().Format(http.TimeFormat))
+		}
+		return resp, err
+	})
+	n, err := Open(bg, Config{S3: ep.Client(&http.Client{Transport: date}), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: "a", CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close(bg)
+	ref, _, err := n.Create(bg, "k", newReq(t, "c", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset.Store(int64(-10 * time.Minute))
+	readAll(t, n, ref)
+	_, err = n.Update(bg, ref, newReq(t, "skewed", 1), put("a", "1"))
+	wantCode(t, err, CodeUnavailable)
+	offset.Store(0)
+	if _, err := n.Update(bg, ref, newReq(t, "agreed", 1), put("a", "2")); err != nil {
+		t.Fatal(err)
 	}
 }
