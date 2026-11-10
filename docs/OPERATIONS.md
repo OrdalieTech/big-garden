@@ -49,7 +49,7 @@ If-None-Match and If-Match on PUT, read-after-write, exact attempt counts).
 
 | Store | Status | Evidence |
 |---|---|---|
-| Scaleway Object Storage, fr-par | Qualified (2026-11-08) | `qual doctor --remote`: 1000 rounds × 32 contenders, one winner each; stalled conditional PUT neither blocks reads nor other writes and gets 412 if overtaken; core suite, kill and linearizability harness passed; latencies in docs/PERFORMANCE.md. 24 h soak from three hosts: artifacts/remote-soak |
+| Scaleway Object Storage, fr-par | Qualified (2026-11-08) | `qual doctor --remote`: 1000 rounds × 32 contenders, one winner each; stalled conditional PUT neither blocks reads nor other writes and gets 412 if overtaken; core suite, kill and linearizability harness passed; latencies in docs/PERFORMANCE.md. 3.5 h soak from three hosts (2026-11-10, 449,101 writes, re-verified by `qual check`); the 24 h remote soak has not run |
 | RustFS 1.0.4 (pinned digest) | Qualified, local tests | research.lock.json `rustfs_fixture`; under heavy contention it may reset a losing conditional PUT's connection instead of answering 412, resolved by reading the head |
 | MinIO (pinned digest) | Qualified, local tests | research.lock.json `minio_fixture`; a GET blocks ~29 s behind a stalled conditional PUT: an availability gap, not a safety one |
 | AWS S3, others | Not qualified | run `qual doctor` and the suites against them first |
