@@ -35,6 +35,7 @@ func faults(args []string) error {
 	rows := fs.String("rows", "", "comma-separated row numbers (empty: every row)")
 	out := fs.String("out", "", "output directory (empty: artifacts/local-faults or artifacts/remote-faults)")
 	list := fs.Bool("list", false, "print the matrix and exit")
+	resume := fs.Bool("resume", false, "keep the passed lanes of --out's faults.json (same mode and repetitions), run the others")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -83,6 +84,18 @@ func faults(args []string) error {
 		}
 	}
 	results := map[string]*laneResult{}
+	if *resume {
+		var prev faultsReport
+		if b, err := os.ReadFile(filepath.Join(*out, "faults.json")); err == nil && json.Unmarshal(b, &prev) == nil &&
+			prev.Mode == mode && prev.Repetitions == *reps {
+			for _, l := range prev.Lanes {
+				if l.Status == "pass" {
+					results[l.Name] = &l
+				}
+			}
+			rep.Started, rep.Commit = prev.Started, prev.Commit+" resumed at "+rep.Commit
+		}
+	}
 	write := func() error {
 		rep.Rows, rep.Lanes, rep.Verdict = nil, nil, "pass"
 		for _, r := range matrix {
@@ -125,6 +138,9 @@ func faults(args []string) error {
 			continue
 		}
 		l := lanes[name]
+		if results[name] != nil {
+			continue // passed before --resume
+		}
 		res := &laneResult{Name: name, Pkg: l.Pkg, Run: l.Run, Status: "pending"}
 		if *remote {
 			res.Run = cmp.Or(l.RemoteRun, l.Run)
@@ -298,7 +314,7 @@ var lanes = map[string]lane{
 	"create":      {Pkg: ".", Run: "^Test(ConcurrentCreates|ConcurrentSameCreate|CreateIdempotentAndConflicts|CreateResumeD5|CreateAfterBirthIsUnknown|IDExpiredByFloor)$", Count: 20, Remote: true},
 	"firstopen":   {Pkg: ".", Run: "^TestConcurrentFirstOpen$", Count: 100},
 	"batch":       {Pkg: ".", Run: "^TestBatch(Members|NeverPassesRead|Unresolved|Cancellation|HotLedger)$", Count: 20, Remote: true},
-	"ownership":   {Pkg: ".", Run: "^Test(OwnershipAndMigrate|CreateUpdateReadLookup|SchemaMismatchReportsStored)$", Count: 20, Remote: true},
+	"ownership":   {Pkg: ".", Run: "^Test(OwnershipAndMigrate|CreateUpdateReadLookup|SchemaMismatchReportsStored|NewerHeadFormatRefused)$", Count: 20, Remote: true},
 	"maintenance": {Pkg: ".", Run: "^Test(StaleMaintenanceAcrossTakeover|CollectPausedAfterHead|CollectedObjectReuploaded|CollectDuringActivation)$", Count: 20, Remote: true},
 	"corrupt":     {Pkg: ".", Run: "^Test(CorruptRetainedObjects|CorruptBirthAndNamespace|ImportRejectsMalformedArchives)$", Count: 20},
 	"missing":     {Pkg: ".", Run: "^Test(MissingHeadFailsClosed|OpenNamespace)$", Count: 20, Remote: true},
@@ -358,7 +374,7 @@ var matrix = []faultRow{
 	{22, "SQL caller attempts COMMIT, ATTACH, storage PRAGMA, reserved-table write, escaping cursor", "covered", []string{"authorizer", "authconn", "extend"}, ""},
 	{23, "ENOSPC/EIO during WAL, staging, checkpoint, replay, rename or export", "partial", []string{"diskfull"}, "real EFBIG write errors under RLIMIT_FSIZE on node processes (WAL, staging, checkpoint, replay); EIO and export to a failing writer are not injected"},
 	{24, "Head missing beside birth/data; namespace descriptor missing beside existing data", "covered", []string{"missing", "create", "corrupt"}, ""},
-	{25, "Wrong incarnation/namespace/key, unknown codec/schema, downgraded binary", "partial", []string{"ownership", "head", "restore", "import"}, "format-2 heads rejected by the decoder; no end-to-end older-binary-meets-newer-head run"},
+	{25, "Wrong incarnation/namespace/key, unknown codec/schema, downgraded binary", "partial", []string{"ownership", "head", "restore", "import"}, "a newer-format head is refused by every path before any write (TestNewerHeadFormatRefused); no older-binary process run"},
 	{26, "Import old backup while old nodes still run", "covered", []string{"import"}, ""},
 	{27, "Store ignores conditions or serves provably stale overwritten heads", "partial", []string{"missing", "doctor", "doctorneg"}, "condition-ignoring store rejected (doctor negative control, Open probe); no stale-read negative control"},
 	{28, "S3 unavailable for 60 seconds; all queues reach limits", "partial", []string{"bounds", "publication", "batch"}, "short outages with bounded queues; the 60 s outage runs in qual soak only"},
