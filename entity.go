@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -82,8 +83,22 @@ func (e *entity) discard() {
 	if e.db != nil {
 		e.db.Discard()
 	}
+	e.clear()
+}
+
+// clear drops the local image (closed) and the cached head.
+func (e *entity) clear() {
 	e.db, e.h, e.etag, e.pages = nil, nil, "", nil
 	e.bytes.Store(0)
+}
+
+// links are h's snapshot, deltas and tail, in order.
+func links(h *head.Head) []head.Ref {
+	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
+	if h.Tail != nil {
+		refs = append(refs, h.Tail.Ref())
+	}
+	return refs
 }
 
 // resolved clears the unresolved candidate and its since.
@@ -317,30 +332,13 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 		return err
 	}
 	defer n.unreserve()
+	if n.warmStart(ctx, e, h, etag) {
+		return nil
+	}
 	for {
-		refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
-		objs := make([]io.ReaderAt, len(refs), len(refs)+1)
-		errs := make([]error, len(refs))
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, 4)
-		for i, r := range refs {
-			wg.Go(func() {
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				obj, err := n.st.Get(ctx, r.Key, "", int64(r.Bytes))
-				if err == nil && (uint64(len(obj.Body)) != r.Bytes || sha256.Sum256(obj.Body) != r.SHA256) {
-					err = engine.ErrCorrupt
-				}
-				objs[i], errs[i] = bytes.NewReader(obj.Body), err
-			})
-		}
-		wg.Wait()
-		var err error
-		for _, e := range errs {
-			if e != nil && store.OutcomeOf(e) != store.NotFound && !errors.Is(e, engine.ErrCorrupt) {
-				return storeError(e)
-			}
-			err = cmp.Or(err, e)
+		objs, err := n.objects(ctx, links(h), h)
+		if err != nil && store.OutcomeOf(err) != store.NotFound && !errors.Is(err, engine.ErrCorrupt) {
+			return storeError(err)
 		}
 		if err != nil { // collection race, or a missing or corrupt object
 			obj, gerr := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
@@ -361,11 +359,8 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 			}
 			return storeError(gerr)
 		}
-		if h.Tail != nil {
-			objs = append(objs, bytes.NewReader(h.Tail.Data))
-		}
 		path := filepath.Join(n.dir, head.NewID().String()+".db")
-		db, pages, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs)
+		db, pages, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs, nil)
 		if err != nil {
 			n.counters.activationFailures.Add(1)
 			return engineError(err)
@@ -375,6 +370,87 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 		e.bytes.Store(db.Bytes())
 		return nil
 	}
+}
+
+// objects GETs the links refs of h, four at a time, checking each one's
+// length and SHA-256; h's tail, if refs ends with it, is read from h. err is
+// the first failure, a store error before NotFound or corruption.
+func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head) ([]io.ReaderAt, error) {
+	tail := h.Tail != nil && len(refs) > 0 && refs[len(refs)-1] == h.Tail.Ref()
+	if tail {
+		refs = refs[:len(refs)-1]
+	}
+	objs, errs := make([]io.ReaderAt, len(refs), len(refs)+1), make([]error, len(refs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for i, r := range refs {
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			obj, err := n.st.Get(ctx, r.Key, "", int64(r.Bytes))
+			if err == nil && (uint64(len(obj.Body)) != r.Bytes || sha256.Sum256(obj.Body) != r.SHA256) {
+				err = engine.ErrCorrupt
+			}
+			objs[i], errs[i] = bytes.NewReader(obj.Body), err
+			n.counters.activationBytes.Add(uint64(len(obj.Body)))
+		})
+	}
+	wg.Wait()
+	var err error
+	for _, e := range errs {
+		if e != nil && store.OutcomeOf(e) != store.NotFound && !errors.Is(e, engine.ErrCorrupt) {
+			return nil, e
+		}
+		err = cmp.Or(err, e)
+	}
+	if tail {
+		objs = append(objs, bytes.NewReader(h.Tail.Data))
+	}
+	return objs, err
+}
+
+// warmStart activates e at h from its warm file, if it has one (D21): an
+// unchanged file only passes the checksum gate of a cold restore; one behind
+// h gets the links after it, the first overlaid. The file leaves the warm
+// tier either way; false means activate cold.
+func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag string) bool {
+	path := filepath.Join(n.dir, head.NewID().String()+".db")
+	w, ok := n.claimWarm(e.key, path)
+	if !ok {
+		return false
+	}
+	refs := links(h)
+	i := slices.IndexFunc(refs, func(r head.Ref) bool { return r.MaxSequence > w.Image.Sequence })
+	if i < 0 {
+		i = len(refs)
+	}
+	var pages []uint32
+	for _, r := range refs[:i] {
+		p, known := w.Pages[r.SHA256]
+		ok = ok && known
+		pages = append(pages, p)
+	}
+	failpoint("warm.claim")
+	if ok && i > 0 && w.Image.Sequence <= h.Sequence {
+		objs, err := n.objects(ctx, refs[i:], h)
+		failpoint("warm.apply.mid") // the kill lands inside Restore's overlay
+		if err == nil {
+			db, p, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs, &w.Image)
+			if err == nil {
+				n.counters.activations.Add(1)
+				if i == len(refs) {
+					n.counters.warmHits.Add(1)
+				} else {
+					n.counters.catchUps.Add(1)
+				}
+				e.db, e.h, e.etag, e.pages = db, h, etag, append(pages, p...)
+				e.bytes.Store(db.Bytes())
+				return true
+			}
+		}
+	}
+	os.Remove(path)
+	return false
 }
 
 // replay is the decoded page count of the deltas plus the tail.

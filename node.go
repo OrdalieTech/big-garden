@@ -3,9 +3,11 @@ package garden
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -29,6 +31,9 @@ type Node struct {
 
 	mu         sync.Mutex
 	entities   map[string]*entity
+	wmu        sync.Mutex          // the warm tier below; after mu, never before
+	warm       map[string]warmFile // by EntityDir hash (D21)
+	warmDir    string
 	reserved   int64         // cache bytes reserved by activations in progress
 	recoveries chan struct{} // one token per activation in progress (Limits.Recoveries)
 	staging    atomic.Int64  // bytes of objects being uploaded (Stats)
@@ -71,6 +76,9 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 	if err := n.sessionDir(); err != nil {
 		return nil, err
 	}
+	if err := n.warmIndex(); err != nil {
+		return nil, err
+	}
 	n.done = make(chan struct{})
 	go n.sweeper()
 	return n, nil
@@ -98,7 +106,7 @@ func (n *Node) room(self *entity) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	resident, _, lru := n.scan(time.Time{}, self)
-	return resident < n.cfg.Limits.ResidentEntities || shed(lru)
+	return resident < n.cfg.Limits.ResidentEntities || n.shed(lru)
 }
 
 // pause waits d or until ctx ends.
@@ -128,7 +136,7 @@ func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, l
 			continue
 		}
 		if e.db != nil && e.unresolved == nil && e.used.Before(cutoff) {
-			e.discard()
+			n.park(e)
 		}
 		if e.db != nil {
 			e.bytes.Store(e.db.Bytes())
@@ -143,8 +151,8 @@ func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, l
 	return resident, used, lru
 }
 
-// shed discards lru if it is still resident, idle and settled.
-func shed(lru *entity) bool {
+// shed parks lru if it is still resident, idle and settled.
+func (n *Node) shed(lru *entity) bool {
 	if lru == nil || !lru.mu.TryLock() {
 		return false
 	}
@@ -152,8 +160,131 @@ func shed(lru *entity) bool {
 	if lru.db == nil || lru.unresolved != nil {
 		return false
 	}
-	lru.discard()
+	n.park(lru)
 	return true
+}
+
+// warmFile is a file of the warm tier (D21): <hash>.db holds Image, and
+// <hash>.json this struct; Pages are the replay pages of the links it was
+// parked with. Both are hints: activation trusts the file only after the
+// checksum gate of a cold restore.
+type warmFile struct {
+	Image engine.Image
+	Pages map[head.Digest]uint32
+	bytes int64
+	used  time.Time
+}
+
+// warmIndex lists this namespace's warm tier, left by earlier sessions:
+// each <hash>.db with a readable <hash>.json; anything else is removed.
+func (n *Node) warmIndex() error {
+	n.warmDir, n.warm = filepath.Join(n.cfg.CacheDir, "warm", n.ns.String()), map[string]warmFile{}
+	if err := os.MkdirAll(n.warmDir, 0o700); err != nil {
+		return newError(CodeUnavailable, "warm dir", err)
+	}
+	entries, _ := os.ReadDir(n.warmDir)
+	for _, d := range entries {
+		name := filepath.Join(n.warmDir, strings.TrimSuffix(strings.TrimSuffix(d.Name(), ".db"), ".json"))
+		var w warmFile
+		b, err := os.ReadFile(name + ".json")
+		st, serr := os.Lstat(name + ".db")
+		if err != nil || serr != nil || !st.Mode().IsRegular() || json.Unmarshal(b, &w) != nil {
+			os.Remove(filepath.Join(n.warmDir, d.Name()))
+			continue
+		}
+		w.bytes, w.used = st.Size(), st.ModTime()
+		n.warm[filepath.Base(name)] = w
+	}
+	return nil
+}
+
+// park moves e's settled file to the warm tier instead of deleting it (D21);
+// e keeps nothing. Anything unsettled, or any failure, deletes the file as
+// discard does.
+func (n *Node) park(e *entity) {
+	if e.db == nil || e.h == nil || e.unresolved != nil || e.db.Published() != imageOf(e.h) || len(e.pages) != len(links(e.h)) {
+		e.discard()
+		return
+	}
+	refs := links(e.h)
+	w := warmFile{Image: imageOf(e.h), Pages: map[head.Digest]uint32{}, used: e.used}
+	for i, r := range refs {
+		w.Pages[r.SHA256] = e.pages[i]
+	}
+	b, _ := json.Marshal(w)
+	hash := filepath.Base(head.EntityDir(e.key))
+	name := filepath.Join(n.warmDir, hash)
+	n.wmu.Lock()
+	defer n.wmu.Unlock()
+	delete(n.warm, hash)
+	err := e.db.Park(name + ".db")
+	failpoint("warm.park")
+	if err == nil {
+		err = os.WriteFile(name+".json", b, 0o600)
+	}
+	var st os.FileInfo
+	if err == nil {
+		st, err = os.Stat(name + ".db")
+	}
+	if err == nil {
+		w.bytes = st.Size()
+		os.Chtimes(name+".db", w.used, w.used)
+		n.warm[hash] = w
+		e.clear()
+		return
+	}
+	os.Remove(name + ".db")
+	os.Remove(name + ".json")
+	e.discard()
+}
+
+// claimWarm moves key's warm file, if any, to path (deletes it if path is
+// empty) and returns its hint.
+func (n *Node) claimWarm(key, path string) (warmFile, bool) {
+	hash := filepath.Base(head.EntityDir(key))
+	name := filepath.Join(n.warmDir, hash)
+	n.wmu.Lock()
+	defer n.wmu.Unlock()
+	w, ok := n.warm[hash]
+	delete(n.warm, hash)
+	if path == "" {
+		os.Remove(name + ".db")
+		ok = false
+	}
+	ok = ok && os.Rename(name+".db", path) == nil
+	os.Remove(name + ".json")
+	return w, ok
+}
+
+// evictWarm deletes the least recently used warm file: S3 keeps the state.
+func (n *Node) evictWarm() bool {
+	n.wmu.Lock()
+	defer n.wmu.Unlock()
+	lru := ""
+	for h, w := range n.warm {
+		if lru == "" || w.used.Before(n.warm[lru].used) {
+			lru = h
+		}
+	}
+	if lru == "" {
+		return false
+	}
+	delete(n.warm, lru)
+	name := filepath.Join(n.warmDir, lru)
+	os.Remove(name + ".db")
+	os.Remove(name + ".json")
+	n.counters.warmEvictions.Add(1)
+	return true
+}
+
+// warmBytes sums the sizes of the warm files.
+func (n *Node) warmBytes() (b int64) {
+	n.wmu.Lock()
+	defer n.wmu.Unlock()
+	for _, w := range n.warm {
+		b += w.bytes
+	}
+	return b
 }
 
 func (n *Node) namespace(ctx context.Context) error {
@@ -350,8 +481,9 @@ func (n *Node) cache(ctx context.Context, e *entity) error {
 }
 
 // fit reserves buildBytes for self if it fits in CacheBytes beside the other
-// reserves and the files of the other resident entities, discarding idle,
-// settled entities least recently admitted first until it does. A busy
+// reserves, the files of the other resident entities and the warm tier,
+// deleting warm files then parking idle, settled entities, least recently
+// used first, until it does. A busy
 // entity is pinned and counts with its last seen size. It never blocks on an
 // entity mutex.
 func (n *Node) fit(self *entity) bool {
@@ -359,11 +491,11 @@ func (n *Node) fit(self *entity) bool {
 	defer n.mu.Unlock()
 	for {
 		_, used, lru := n.scan(time.Time{}, self)
-		if n.reserved+used+n.buildBytes() <= n.cfg.Limits.CacheBytes {
+		if n.reserved+used+n.warmBytes()+n.buildBytes() <= n.cfg.Limits.CacheBytes {
 			n.reserved += n.buildBytes()
 			return true
 		}
-		if !shed(lru) {
+		if !n.evictWarm() && !n.shed(lru) {
 			return false
 		}
 	}
@@ -406,7 +538,7 @@ func (n *Node) Close(ctx context.Context) error {
 			n.resolve(ctx, e, e.unresolved)
 			unknown = unknown || e.unresolved != nil
 		}
-		e.discard()
+		n.park(e)
 		e.mu.Unlock()
 	}
 	n.mu.Lock()

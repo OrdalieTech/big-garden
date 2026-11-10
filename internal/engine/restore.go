@@ -24,7 +24,7 @@ import (
 const maxFrame = pageSize + pageSize/255 + 16
 
 // Restore reconstructs the image named by h into a new file at path, which
-// must not exist, then opens and checks it (PROTOCOL §4 steps 3–6). objs
+// must not exist, then opens and checks it (PROTOCOL §4 steps 4–7). objs
 // holds the snapshot followed by every delta of h, in order. With from set
 // (D21), path is an existing file believed to hold the image from, and objs
 // holds only the last len(objs) links of h: the first one overlays from (its

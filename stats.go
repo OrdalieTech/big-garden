@@ -24,6 +24,8 @@ type Stats struct {
 	CollectedBytes, UploadedBytes, DownloadedBytes             uint64
 	ResidentEntities, QueuedRequests, InflightStorage          int64
 	CacheBytes, StagingBytes                                   int64
+	WarmHits, CatchUps, ActivationBytes, WarmEvictions         uint64 // D21: activations from a warm file as is or caught up; bytes GET by activations
+	WarmEntities, WarmBytes                                    int64  // the warm tier (also in CacheBytes)
 	OldestUnresolved                                           time.Duration
 	Batches                                                    [maxBatch]uint64 // [16]: committed publications by member count - 1
 	Storage                                                    [4]struct {
@@ -39,6 +41,7 @@ type counters struct {
 	snapshots, compactions, collections, collected                                             atomic.Uint64
 	snapshotBytes, compactionIn, compactionOut, collectedBytes                                 atomic.Uint64
 	batches                                                                                    [maxBatch]atomic.Uint64
+	warmHits, catchUps, activationBytes, warmEvictions                                         atomic.Uint64
 }
 
 // observe counts the outcome of one public operation on key, and logs one
@@ -115,12 +118,18 @@ func (n *Node) Stats() Stats {
 		Corruptions: c.corruptions.Load(), Snapshots: c.snapshots.Load(), Compactions: c.compactions.Load(),
 		Collections: c.collections.Load(), CollectedObjects: c.collected.Load(), SnapshotBytes: c.snapshotBytes.Load(),
 		CompactionInputBytes: c.compactionIn.Load(), CompactionOutputBytes: c.compactionOut.Load(),
-		CollectedBytes: c.collectedBytes.Load(), StagingBytes: n.staging.Load()}
+		CollectedBytes: c.collectedBytes.Load(), StagingBytes: n.staging.Load(), WarmHits: c.warmHits.Load(),
+		CatchUps: c.catchUps.Load(), ActivationBytes: c.activationBytes.Load(), WarmEvictions: c.warmEvictions.Load()}
 	for i := range s.Batches {
 		s.Batches[i] = c.batches[i].Load()
 	}
 	n.mu.Lock()
-	s.CacheBytes = n.reserved
+	n.wmu.Lock()
+	for _, w := range n.warm {
+		s.WarmEntities, s.WarmBytes = s.WarmEntities+1, s.WarmBytes+w.bytes
+	}
+	n.wmu.Unlock()
+	s.CacheBytes = n.reserved + s.WarmBytes
 	for _, e := range n.entities {
 		s.CacheBytes += e.bytes.Load()
 		if t := e.since.Load(); t != 0 {

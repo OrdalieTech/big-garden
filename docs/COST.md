@@ -139,23 +139,33 @@ costs **time**, not money.
 - **Placement.** Compute in the store's region makes every download free
   on both providers. Outside it, egress dominates on Scaleway.
 
-## Warm local cache tier (D21 estimate)
+## Warm local cache tier (D21, measured)
 
-Today a reactivation, the first access after eviction or a restart,
-downloads the snapshot and every delta. With a warm local file verified
-by checksum:
-- **Unchanged:** the head is unchanged, so the cost is one conditional head
-  GET, answered 304 with 0 bytes.
-- **Changed:** the head changed, typically because another node wrote. The
-  cost is a head GET 200 (≤ 31 KiB tail + head) plus the deltas newer than
-  the file, usually one compacted delta. The estimate is ≤ 2 GETs and
-  ≤ 64 KB.
+A cold reactivation, the first access after eviction or a restart,
+downloads the snapshot and every delta. With D21 an idle entity parks its
+file; the next activation does the head GET it always does (a 200: a warm
+entity has no decoded head to send a 304 against), then:
+- **Warm hit:** the file is at the head. No object GET; the local checksum
+  and `integrity_check` gate it.
+- **Catch-up:** another node wrote since. GET only the links after the
+  file's sequence (often none: the inline tail is in the head), overlay
+  them, same gate.
+- **Cold:** a snapshot newer than the file, an unknown earlier link, or a
+  file failing the gate: today's full restore.
 
-| Per reactivation | Cold today | Warm, unchanged | Warm, catch-up |
+Measured with `GARDEN_MEASURE=1 GARDEN_TEST_S3=1 go test -run
+TestWarmActivationCost` (local RustFS on tmpfs, so the S3 round trips are
+~1 ms; medians of 7; catch-up and cold include a takeover CAS):
+
+| Per reactivation | Cold | Warm hit | Catch-up after 3 updates elsewhere |
 |---|---|---|---|
-| 1 MiB entity | 4 GET, 1.066 MB, 71 / 122 ms on fr-par | 1 GET, 0 B, ~9 / 15 ms | ≤ 2 GET, ≤ 64 KB, ~20-30 ms |
-| 16 MiB entity | 6 GET, 17.0 MB, 581 / 639 ms | 1 GET, 0 B, ~9 / 15 ms + local checksum | ≤ 2 GET, ≤ 64 KB |
-| per MiB of entity | 1.013 MB | 0 | 0 |
+| 1 MiB entity, local | 22.6 ms, 1.07 MB of objects | 4.1 ms, 0 B | 10.6 ms, 0 B (tail in the head) |
+| 16 MiB entity, local | 211 ms, 17.0 MB | 29 ms, 0 B | 35 ms; 6 of 7 caught up, 1 went cold (an earlier link compacted by the writer, unknown to the hint) |
+| 1 MiB on Scaleway fr-par | 71 / 122 ms (p50 / p95, measured) | ≈ one head GET (8-11 ms) + 4 ms | ≈ head GET + takeover + 11 ms |
+| 16 MiB on Scaleway fr-par | 581 / 639 ms (measured) | ≈ head GET + 29 ms | ≈ head GET + 35 ms |
+
+The 16 MiB warm hit is the full-file checksum and `integrity_check`; under
+50 ms it does not justify a second path that skips them.
 
 Savings by scenario, if every activation becomes a warm hit:
 
@@ -172,28 +182,30 @@ avoid 45 TB a month, 136 Mbit/s sustained. So the warm tier is a
 hundreds of ms to one GET RTT. It is a money win only when egress is
 billed. On AWS the money saved is three GET requests per activation,
 negligible next to PUTs. It never removes the strong-read head GET, which
-is already 304 and 0 bytes on a warm entity.
+is already 304 and 0 bytes on a hot entity.
 
 ## Monitoring: counters that exist and gaps
 
 Existing `Stats` counters:
 - **Operations:** Reads, Mutations, Commits, Replays, Conflicts,
   rejections, UnknownOutcomes, Batches[16].
-- **Activations:** Activations and ActivationFailures (counts only).
+- **Activations:** Activations, ActivationFailures, and (D21) WarmHits, CatchUps, ActivationBytes, WarmEvictions.
 - **Maintenance:** Snapshots/SnapshotBytes, Compactions and compaction
   input/output bytes, Collections/CollectedObjects/CollectedBytes.
 - **Storage requests:** CASAttempts/CASConflicts/AmbiguousPuts, and
   Storage[GET, PUT, LIST, DELETE] attempts, failures, uploaded and
   downloaded bytes.
-- **Gauges:** CacheBytes, StagingBytes, ResidentEntities, InflightStorage.
+- **Gauges:** CacheBytes, StagingBytes, ResidentEntities, InflightStorage, WarmEntities, WarmBytes.
 
 From these you get PUT and GET counts (the AWS bill) and total downloaded
 bytes (the egress upper bound). Object PUTs = PUT attempts − CASAttempts.
 
-Missing to watch cost in production:
-- **Activations by kind.** Full restore, delta catch-up and (with D21) warm
-  hit, each with its bytes. Today `Activations` is one count and
-  activation bytes are mixed into GET DownloadedBytes.
+With D21: `WarmHits` and `CatchUps` count activations from a warm file
+(cold = `Activations` − both), `ActivationBytes` the object bytes they
+downloaded, `WarmEvictions` warm files deleted for space, and the gauges
+`WarmEntities`/`WarmBytes` the tier itself.
+
+Still missing to watch cost in production:
 - **Head GET outcomes.** 304 vs 200 vs 404. Head GETs and object GETs share
   `Storage[GET]`; `qual stress` counts them on the wire only.
 - **Downloaded bytes by purpose.** Activation, compaction input and

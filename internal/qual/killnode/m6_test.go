@@ -124,3 +124,83 @@ func staleMaintenanceRun(t *testing.T, ep storetest.Endpoint, fp string) {
 		t.Fatalf("%s: %d IDs committed, %d acknowledged", fp, len(ids), len(committed))
 	}
 }
+
+// TestWarmKill (D21): a node is SIGKILLed while parking its file at Close,
+// after claiming it at activation, or while catching it up; the next process
+// on the same cache must read exactly the committed rows. A run without a
+// kill must have activated warm; "control" runs never kill.
+func TestWarmKill(t *testing.T) {
+	base := storetest.Local(t)
+	runs := 20
+	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
+		runs, _ = strconv.Atoi(s)
+	}
+	for _, fp := range []string{"control", "warm.park", "warm.claim", "warm.apply.mid"} {
+		t.Run(fp, func(t *testing.T) {
+			killed := 0
+			for i := range runs {
+				ep := base.Sub(fmt.Sprintf("warm-%s-%d", fp, i))
+				if warmKillRun(t, ep, fp) {
+					killed++
+				}
+				clean(t, ep)
+				if t.Failed() {
+					return
+				}
+			}
+			if want := map[bool]int{true: 0, false: runs}[fp == "control"]; killed != want {
+				t.Fatalf("%s: killed in %d of %d runs", fp, killed, runs)
+			}
+			t.Logf("%s: %d runs, %d killed, every row recovered", fp, runs, killed)
+		})
+	}
+}
+
+func warmKillRun(t *testing.T, ep storetest.Endpoint, fp string) (killed bool) {
+	cache := t.TempDir()
+	must := func(p *proc, r Req) Resp {
+		resp, alive := p.call(t, r)
+		if !alive || !resp.OK {
+			t.Fatalf("%s: %+v: %+v", fp, r, resp)
+		}
+		return resp
+	}
+	var ids []string
+	add := func(p *proc, inc string, n int) {
+		for i := range n {
+			r := Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: strconv.Itoa(len(ids)), Big: i%4 == 0}
+			must(p, r)
+			ids = append(ids, r.ID)
+		}
+	}
+	parkFP := map[bool]string{true: fp + ":1", false: ""}[fp == "warm.park"]
+	a := start(t, ep, cache, parkFP, "-node", "a")
+	inc := must(a, Req{Op: "create", Key: "k", ID: newID()}).Inc
+	add(a, inc, 12)
+	killed = a.stop() // Close parks the file
+	b := start(t, ep, t.TempDir(), "", "-node", "b")
+	must(b, Req{Op: "takeover", Key: "k"})
+	add(b, inc, 6) // a's file is now behind: activation catches up
+	b.stop()
+	activateFP := map[bool]string{true: "", false: fp + ":1"}[fp == "warm.park"]
+	a2 := start(t, ep, cache, activateFP, "-node", "a")
+	resp, alive := a2.call(t, Req{Op: "takeover", Key: "k"})
+	if alive && resp.OK {
+		resp, alive = a2.call(t, Req{Op: "read", Key: "k", Inc: inc})
+	}
+	if k := a2.stop(); k || !alive {
+		killed = true
+		a2 = start(t, ep, cache, "", "-node", "a")
+		must(a2, Req{Op: "takeover", Key: "k"})
+		resp = must(a2, Req{Op: "read", Key: "k", Inc: inc})
+		defer a2.stop()
+	} else if !resp.OK {
+		t.Fatalf("%s: read: %+v", fp, resp)
+	} else if resp.Warm == 0 && !killed {
+		t.Fatalf("%s: a run without a kill activated cold", fp)
+	}
+	if !slices.Equal(resp.IDs, ids) {
+		t.Fatalf("%s: read %d rows %v, committed %d %v", fp, len(resp.IDs), resp.IDs, len(ids), ids)
+	}
+	return killed
+}

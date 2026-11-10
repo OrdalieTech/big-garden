@@ -28,7 +28,7 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 		return err
 	}
 	if e.db != nil && (e.db.Published() != imageOf(cur) || !n.mine(cur)) {
-		e.discard()
+		n.park(e) // the file of the previous head: a base for catching up later
 	}
 	e.h, e.etag = cur, obj.ETag
 	return nil
@@ -111,5 +111,6 @@ func (n *Node) Evict(ctx context.Context, ref Ref) error {
 	}
 	defer n.leave(e)
 	e.discard()
+	n.claimWarm(ref.Key, "") // and nothing in the warm tier: the next activation is cold
 	return nil
 }

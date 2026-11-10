@@ -102,6 +102,8 @@ type Stats struct {
 	CollectedBytes, UploadedBytes, DownloadedBytes			uint64
 	ResidentEntities, QueuedRequests, InflightStorage		int64
 	CacheBytes, StagingBytes					int64
+	WarmHits, CatchUps, ActivationBytes, WarmEvictions		uint64
+	WarmEntities, WarmBytes						int64
 	OldestUnresolved						time.Duration
 	Batches								[maxBatch]uint64
 	Storage								[4]struct {

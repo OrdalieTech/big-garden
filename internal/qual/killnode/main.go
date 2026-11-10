@@ -70,6 +70,7 @@ type Resp struct {
 	Tag      string
 	Route    *Rt      // takeover/resolve result, or the Route of a typed error
 	Batches  []uint64 // add: the node's Stats.Batches when it answered (index k-1: k members)
+	Warm     uint64   // read: the node's Stats.WarmHits + CatchUps (D21)
 }
 
 func main() {
@@ -217,6 +218,7 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 		b := n.Stats().Batches
 		batches = b[:]
 	}
+	st := n.Stats()
 	return Resp{OK: true, Value: string(res.Value), Seq: res.Version.Sequence, Replayed: res.Replayed,
-		Inc: hex.EncodeToString(ref.Incarnation[:]), IDs: ids, Route: rt, Batches: batches}
+		Inc: hex.EncodeToString(ref.Incarnation[:]), IDs: ids, Route: rt, Batches: batches, Warm: st.WarmHits + st.CatchUps}
 }
