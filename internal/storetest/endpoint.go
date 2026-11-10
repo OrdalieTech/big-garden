@@ -7,6 +7,7 @@ package storetest
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -94,7 +95,7 @@ const (
 	legacyLocalEnv = "GARDEN_TEST_MINIO"     // older name of LocalEnv, still honored
 	ServerEnv      = "GARDEN_TEST_S3_SERVER" // "rustfs" (default) or "minio"
 	localBucket    = "state-test"
-	localTmpfs     = "/data:rw,size=1g,mode=1777"
+	SizeEnv        = "GARDEN_TEST_S3_SIZE" // the fixture's tmpfs size (default 1g; qualification campaigns need more)
 )
 
 type fixture struct {
@@ -108,13 +109,13 @@ var fixtures = map[string]fixture{
 			// Host network: a rootless port forwarder (pasta) died mid-soak once
 			// and left the server running but unreachable for 15 hours.
 			return []string{"--network", "host", "-e", "RUSTFS_ADDRESS=127.0.0.1:9100", "-e", "RUSTFS_ACCESS_KEY=staterustfs", "-e", "RUSTFS_SECRET_KEY=staterustfs-secret",
-				"-e", "RUSTFS_CONSOLE_ENABLE=false", "--tmpfs", localTmpfs, image, "/data"}
+				"-e", "RUSTFS_CONSOLE_ENABLE=false", "--tmpfs", tmpfs(), image, "/data"}
 		}},
 	"minio": {"state-minio", "127.0.0.1:9000", "minio_fixture", "stateminio", "stateminio-secret",
 		func(image string) []string {
 			return []string{"-p", "127.0.0.1:9000:9000", "-p", "127.0.0.1:9001:9001",
 				"-e", "MINIO_ROOT_USER=stateminio", "-e", "MINIO_ROOT_PASSWORD=stateminio-secret",
-				"--tmpfs", localTmpfs, image, "server", "/data", "--console-address", ":9001"}
+				"--tmpfs", tmpfs(), image, "server", "/data", "--console-address", ":9001"}
 		}},
 }
 
@@ -187,6 +188,8 @@ func StartLocal(ctx context.Context) (Endpoint, error) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+func tmpfs() string { return "/data:rw,size=" + cmp.Or(os.Getenv(SizeEnv), "1g") + ",mode=1777" }
 
 // lockedImage reads image@digest of research.lock.json's key at the module root.
 func lockedImage(key string) (string, error) {
