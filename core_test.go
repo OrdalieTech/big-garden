@@ -12,12 +12,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1927,5 +1928,78 @@ func TestClockGuard(t *testing.T) {
 	offset.Store(0)
 	if _, err := n.Update(bg, ref, newReq(t, "agreed", 1), put("a", "2")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestResidentBoundUnderConcurrentCreates: entities being built count as
+// resident, so 64 concurrent creates never hold more than ResidentEntities
+// database files (the 2026-11-10 review saw 269 residents for a limit of 256).
+func TestResidentBoundUnderConcurrentCreates(t *testing.T) {
+	n := testNode(t, newStore(t), "a", func(l *Limits) { l.ResidentEntities = 16 })
+	stop := make(chan struct{})
+	peak := 0
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			files, _ := filepath.Glob(filepath.Join(n.dir, "*.db"))
+			peak = max(peak, len(files))
+		}
+	})
+	var cw sync.WaitGroup
+	for i := range 64 {
+		cw.Go(func() {
+			if _, _, err := n.Create(bg, fmt.Sprint("e", i), newReq(t, fmt.Sprint("c", i), 1), createKV); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	cw.Wait()
+	close(stop)
+	wg.Wait()
+	if peak > 16 {
+		t.Fatalf("%d database files in the session dir, ResidentEntities 16", peak)
+	}
+}
+
+// TestOutageFailsFast (D22): while the store is unreachable, the update whose
+// publication is unresolved waits CommitTimeout, but other operations on the
+// entity try once for one attempt timeout and then fail at once; when the
+// store returns, the unknown update resolves.
+func TestOutageFailsFast(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil) // StorageAttemptTimeout 200 ms, CommitTimeout 1 s
+	ref, _, err := n.Create(bg, "k", newReq(t, "c", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var down atomic.Int32 // 1: head writes fail, 2: everything fails
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		if d := down.Load(); d == 2 || d == 1 && a.Op == "cas" {
+			return storetest.MemFault{Reject: store.Unknown}
+		}
+		return storetest.MemFault{}
+	})
+	down.Store(1)
+	req := newReq(t, "during the outage", 1)
+	_, err = n.Update(bg, ref, req, put("a", "1"))
+	wantCode(t, err, CodeOutcomeUnknown)
+	down.Store(2)
+	for i, most := range []time.Duration{time.Second, 50 * time.Millisecond} {
+		t0 := time.Now()
+		_, err := n.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+		wantCode(t, err, CodeUnavailable)
+		if d := time.Since(t0); d > most {
+			t.Fatalf("read %d during the outage took %v, want at most %v", i, d, most)
+		}
+	}
+	down.Store(0)
+	var ge *Error
+	if _, err := n.Lookup(bg, ref, req.ID); err != nil && !(errors.As(err, &ge) && ge.Code == CodeAbsentAtVersion) {
+		t.Fatalf("the unknown update did not resolve once the store returned: %v", err)
 	}
 }

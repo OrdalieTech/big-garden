@@ -106,7 +106,8 @@ func (n *Node) room(self *entity) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	resident, _, lru := n.scan(time.Time{}, self)
-	return resident < n.cfg.Limits.ResidentEntities || n.shed(lru)
+	self.building = resident < n.cfg.Limits.ResidentEntities || n.shed(lru) // counted resident until unreserve
+	return self.building
 }
 
 // pause waits d or until ctx ends.
@@ -130,7 +131,7 @@ func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, l
 	var at time.Time
 	for _, e := range n.entities {
 		if e == self || !e.mu.TryLock() {
-			if b := e.bytes.Load(); b > 0 {
+			if b := e.bytes.Load(); b > 0 || e.building && e != self {
 				resident, used = resident+1, used+b
 			}
 			continue
@@ -483,6 +484,9 @@ func (n *Node) cache(ctx context.Context, e *entity) error {
 	}
 	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
 		if i == 100 || pause(ctx, 10*time.Millisecond) != nil {
+			n.mu.Lock()
+			e.building = false
+			n.mu.Unlock()
 			return newError(CodeCapacity, "cache bytes held by entities in use", ctx.Err())
 		}
 	}
@@ -510,9 +514,10 @@ func (n *Node) fit(self *entity) bool {
 	}
 }
 
-func (n *Node) unreserve() {
+func (n *Node) unreserve(e *entity) {
 	n.mu.Lock()
 	n.reserved -= n.buildBytes()
+	e.building = false
 	n.mu.Unlock()
 }
 

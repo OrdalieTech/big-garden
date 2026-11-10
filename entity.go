@@ -35,6 +35,8 @@ type entity struct {
 	qmu        sync.Mutex
 	queue      []*waiter    // Updates waiting on mu that a batch may take (PROTOCOL §6 Batches)
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	building   bool         // under Node.mu: between room and unreserve, counted as resident
+	tried      time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
 	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
@@ -331,7 +333,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 	if err := n.cache(ctx, e); err != nil {
 		return err
 	}
-	defer n.unreserve()
+	defer n.unreserve(e)
 	if n.warmStart(ctx, e, h, etag) {
 		return nil
 	}

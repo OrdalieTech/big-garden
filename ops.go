@@ -105,9 +105,19 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter)
 		return nil, newError(CodeClosed, "", nil)
 	}
 	if c := e.unresolved; c != nil {
-		ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout) // cut short: c stays unresolved
-		n.resolve(ctx, e, c)
-		cancel()
+		// The candidate's own retry may wait CommitTimeout for the store; any
+		// other operation tries for one attempt, at most once per attempt
+		// timeout, then fails fast (D22). Cut short, c stays unresolved.
+		own := id != nil && (c.op != nil && *c.op == head.OpID(*id) || slices.Contains(c.more, head.OpID(*id)))
+		if wait := n.cfg.Limits.StorageAttemptTimeout; own || time.Since(e.tried) >= wait {
+			if own {
+				wait = n.cfg.Limits.CommitTimeout
+			}
+			ctx, cancel := context.WithTimeout(ctx, wait)
+			n.resolve(ctx, e, c)
+			cancel()
+			e.tried = time.Now()
+		}
 		if e.unresolved != nil {
 			n.leave(e)
 			if id == nil || (c.op != nil && *c.op == head.OpID(*id)) {
@@ -398,14 +408,17 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			return Ref{}, Result{}, err
 		}
 		db, result, err := func() (*engine.DB, []byte, error) {
-			defer n.unreserve() // also on a callback panic
-			return build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
+			defer n.unreserve(e) // also on a callback panic
+			db, result, err := build(filepath.Join(n.dir, head.NewID().String()+".db"), inc)
+			if err == nil {
+				e.bytes.Store(db.Bytes()) // resident from here on, for the other entities' room
+			}
+			return db, result, err
 		}()
 		if err != nil {
 			return Ref{}, Result{}, err
 		}
 		e.db = db
-		e.bytes.Store(db.Bytes())
 		op := head.OpID(req.ID)
 		var buf bytes.Buffer
 		snap, err := db.Snapshot(&buf)
