@@ -145,6 +145,22 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter,
 // a head proven current after t0 (D23), else the conditional GET, and an
 // image exactly that head, owned or not (D24): it publishes nothing.
 func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) error {
+	if err := n.ownedHead(ctx, e, ref, t0); err != nil || e.db != nil {
+		return err
+	}
+	if err := n.activate(ctx, e, e.h, e.etag); err != nil {
+		return err
+	}
+	if t0.IsZero() && !n.mine(e.h) {
+		e.discard()
+		return newError(CodeRouteChanged, "the head changed during activation", nil)
+	}
+	return nil
+}
+
+// ownedHead is owned without the activation: the current head, owned for a
+// write (Delete needs nothing more, so it works on a cold or damaged entity).
+func (n *Node) ownedHead(ctx context.Context, e *entity, ref Ref, t0 time.Time) error {
 	write := t0.IsZero()
 	if e.h == nil || e.db == nil || write && !n.mine(e.h) || !write && !e.current(t0) {
 		if err := n.fetch(ctx, e, ref.Incarnation, e.etag); err != nil {
@@ -163,15 +179,6 @@ func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) erro
 		}
 		if err := n.claim(e); err != nil { // D4: an earlier session of this node
 			return err
-		}
-	}
-	if e.db == nil {
-		if err := n.activate(ctx, e, e.h, e.etag); err != nil {
-			return err
-		}
-		if write && !n.mine(e.h) {
-			e.discard()
-			return newError(CodeRouteChanged, "the head changed during activation", nil)
 		}
 	}
 	return nil
@@ -760,7 +767,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 			tbytes = out.Bytes()
 		}
 		c.pages = append(slices.Clone(e.pages[:1+len(h.Deltas)]), t.Pages) // the tail, or the new last delta
-		uploaded := slices.ContainsFunc(append([]head.Ref{h.Snapshot}, h.Deltas...), func(r head.Ref) bool { return r.BaseRevision >= 1 })
+		uploaded := slices.ContainsFunc(links(h), func(r head.Ref) bool { return r.BaseRevision >= 1 })
 		if t.Ref.Bytes <= head.InlineBytes && uploaded {
 			r := t.Ref
 			next.Tail = &head.Tail{SHA256: r.SHA256, Bytes: r.Bytes, MinSequence: r.MinSequence, MaxSequence: r.MaxSequence,

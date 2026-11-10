@@ -1587,8 +1587,15 @@ func TestCollect(t *testing.T) {
 		st.CompactionOutputBytes == 0 || st.StagingBytes != 0 || st.OldestUnresolved != 0 {
 		t.Fatalf("maintenance stats %+v", st)
 	}
-	err := other.Collect(bg, Ref{"k", [16]byte{9}})
-	wantCode(t, err, CodeIncarnationMismatch)
+	// Another incarnation than the current one is dead (D25): Collect reaps
+	// only under its own prefix, so the live incarnation is untouched.
+	before, _, _ := mem.List(bg, prefix, "", 1000)
+	if err := other.Collect(bg, Ref{"k", [16]byte{9}}); err != nil {
+		t.Fatalf("Collect of a dead incarnation: %v", err)
+	}
+	if after, _, _ := mem.List(bg, prefix, "", 1000); len(after) != len(before) {
+		t.Fatalf("Collect of another incarnation touched the live one: %d objects, then %d", len(before), len(after))
+	}
 	l.verify(t, mem, "a")
 }
 

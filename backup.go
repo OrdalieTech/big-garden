@@ -35,7 +35,7 @@ type manifest struct {
 // manifest.json and snapshot.ltx (PROTOCOL §11), on any Node, like Read. A
 // write error is returned as is: the partial output is not a backup.
 func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error) {
-	h, files, err := n.exportFiles(ctx, ref, time.Now()) // in memory: w never blocks the entity
+	h, files, err := n.exportFiles(ctx, ref) // in memory: w never blocks the entity
 	if err != nil {
 		return Version{}, err
 	}
@@ -58,7 +58,8 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 
 // exportFiles returns the validated head of ref and the manifest and
 // snapshot of its image, under the entity mutex, for an Export invoked at t0.
-func (n *Node) exportFiles(ctx context.Context, ref Ref, t0 time.Time) (*head.Head, [2][]byte, error) {
+func (n *Node) exportFiles(ctx context.Context, ref Ref) (*head.Head, [2][]byte, error) {
+	t0 := time.Now()
 	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil, false)
 	if err != nil {
 		return nil, [2][]byte{}, err

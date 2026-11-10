@@ -134,9 +134,15 @@ func (n *Node) Snapshot(ctx context.Context, ref Ref) (Version, error) {
 // the current head's revision and that the head does not reference. It runs
 // on any node and opens no SQLite.
 func (n *Node) Collect(ctx context.Context, ref Ref) error {
-	h, err := n.current(ctx, ref.Key, ref.Incarnation)
+	h, err := n.current(ctx, ref.Key, head.ID{})
 	if err != nil {
 		return err
+	}
+	if ref.Incarnation != (head.ID{}) && h.Incarnation != ref.Incarnation {
+		// The key was recreated: ref's incarnation ended in a tombstone below
+		// h's revision (revisions are monotonic across incarnations), so all
+		// of it is dead (D25).
+		h = &head.Head{Key: ref.Key, Incarnation: ref.Incarnation, Revision: h.Revision, Deleted: true}
 	}
 	return n.reap(ctx, h)
 }
@@ -145,7 +151,7 @@ func (n *Node) Collect(ctx context.Context, ref Ref) error {
 // its incarnation (D25).
 func (n *Node) reap(ctx context.Context, h *head.Head) error {
 	live := map[string]bool{}
-	for _, r := range append([]head.Ref{h.Snapshot}, h.Deltas...) {
+	for _, r := range links(h) {
 		live[r.Key] = !h.Deleted
 	}
 	prefix := head.ObjectPrefix(h.Key, h.Incarnation)

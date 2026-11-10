@@ -297,8 +297,7 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 	committed := false
 	var rec *engine.Receipt
 	switch {
-	case c.object != nil && slices.ContainsFunc(append([]head.Ref{cur.Snapshot}, cur.Deltas...),
-		func(r head.Ref) bool { return r.Key == c.object.Key }):
+	case c.object != nil && slices.ContainsFunc(links(cur), func(r head.Ref) bool { return r.Key == c.object.Key }):
 		committed = true
 	case c.next.Deleted: // Delete: done iff the incarnation is gone, by this delete or another (D25)
 		committed = cur.Deleted || cur.Incarnation != c.next.Incarnation
@@ -342,7 +341,10 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 	}
 	e.discard()
 	e.resolved()
-	if !n.mine(cur) {
+	switch {
+	case cur.Deleted: // not committed, and the entity is gone (D25)
+		return nil, n.deleted(e)
+	case !n.mine(cur):
 		return nil, notOwner(cur)
 	}
 	return nil, &Error{Code: CodeRouteChanged, Route: routeOf(cur), Message: "the head changed during publication"}
@@ -382,6 +384,9 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 			case store.OK:
 				if h, gerr = n.decodeHead(obj.Body, e.key, h.Incarnation); gerr != nil {
 					return gerr
+				}
+				if h.Deleted { // deleted meanwhile: its refs are the dead incarnation's (D25)
+					return n.deleted(e)
 				}
 				etag, e.valid = obj.ETag, time.Time{} // h is no longer the head e.valid proved
 				continue

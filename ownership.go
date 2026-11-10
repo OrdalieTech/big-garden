@@ -130,12 +130,14 @@ func (n *Node) Delete(ctx context.Context, ref Ref) error {
 		return err
 	}
 	var tomb *head.Head
-	if err = n.owned(ctx, e, ref, time.Time{}); err == nil { // a zero t0: a write, owner only
+	if err = n.ownedHead(ctx, e, ref, time.Time{}); err == nil { // a zero t0: a write, owner only; no activation
 		next := *e.h
 		next.Owner, next.Tail, next.Deleted = nil, nil, true
 		next.Epoch, next.Revision, next.Nonce = next.Epoch+1, next.Revision+1, head.NewID()
-		if _, err = n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next}); err == nil {
-			tomb = &next
+		if _, err = n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next}); err == nil && e.h.Deleted && e.h.Incarnation == ref.Incarnation {
+			tomb = e.h // the settled head: a later tombstone if resolution found one
+		}
+		if err == nil {
 			n.deleted(e)
 		}
 	}
@@ -144,8 +146,8 @@ func (n *Node) Delete(ctx context.Context, ref Ref) error {
 	switch {
 	case tomb != nil:
 		return n.reap(ctx, tomb)
-	case errors.As(err, &pe) && pe.Code == CodeNotFound: // deleted already, or never created
-		return n.Collect(ctx, ref)
+	case err == nil, errors.As(err, &pe) && (pe.Code == CodeNotFound || pe.Code == CodeIncarnationMismatch):
+		return n.Collect(ctx, ref) // deleted already (maybe recreated since), or never created
 	}
 	return err
 }

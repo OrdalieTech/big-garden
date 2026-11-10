@@ -124,10 +124,11 @@ func pause(ctx context.Context, d time.Duration) error {
 }
 
 // scan walks the entities other than self under n.mu, never blocking on an
-// entity mutex: it discards the idle, settled resident ones last used before
+// entity mutex: it parks the idle, settled resident ones last used before
 // cutoff and forgets unneeded ones. It returns the number of resident
-// entities (a busy one only with a file), their cache bytes (a busy one with
-// its last seen size) and the least recently admitted idle, settled one.
+// entities (a busy one with a file or being built), their cache bytes (a busy
+// one with its last seen size) and the least recently admitted idle, settled
+// one.
 func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, lru *entity) {
 	var at time.Time
 	for _, e := range n.entities {
@@ -595,6 +596,9 @@ func engineError(err error) *Error {
 }
 
 // limited bounds the storage requests in flight to Limits.InflightStorage.
+// storageClass is the Stats.Storage index of a limited call.
+var storageClass = map[string]int{"get": 0, "put": 1, "cas": 1, "list": 2, "delete": 3}
+
 type limited struct {
 	store.Store
 	sem  chan struct{}
@@ -610,7 +614,7 @@ func (l limited) do(ctx context.Context, op, key string, f func() error) error {
 		return &store.Error{Outcome: store.Unknown, Op: op, Key: key, Err: ctx.Err()} // never sent
 	}
 	defer func(t time.Time) {
-		l.busy[map[string]int{"get": 0, "put": 1, "cas": 1, "list": 2, "delete": 3}[op]].Add(int64(time.Since(t)))
+		l.busy[storageClass[op]].Add(int64(time.Since(t)))
 		<-l.sem
 	}(time.Now())
 	return f()
@@ -639,8 +643,9 @@ func (l limited) Delete(ctx context.Context, key string) error {
 	return l.do(ctx, "delete", key, func() error { return l.Store.Delete(ctx, key) })
 }
 
-// Scan yields the Route of every live entity (a tombstone is skipped, D25) of the namespace whose key hashes
-// after afterKey's ("" from the start), in key-hash order, so a scan resumes
+// Scan yields the Route of every live entity of the namespace (tombstones
+// are skipped, D25) whose key hashes after afterKey's ("" from the start), in
+// key-hash order, so a scan resumes
 // from the last Route's key. Each Route is a point observation, as from
 // Resolve; an unreadable head is yielded as an error and the scan goes on.
 // Cost: one LIST per 1,000 stored objects and one GET per entity (D22).
@@ -670,7 +675,7 @@ func (n *Node) Scan(ctx context.Context, afterKey string) iter.Seq2[Route, error
 					sem <- struct{}{}
 					defer func() { <-sem }()
 					obj, err := n.st.Get(ctx, k, "", head.MaxHeadBytes)
-					if gone[i] = store.OutcomeOf(err) == store.NotFound; err != nil { // deleted meanwhile: skipped
+					if gone[i] = store.OutcomeOf(err) == store.NotFound; err != nil { // a head vanished between LIST and GET (an operator's deletion): skipped
 						errs[i] = storeError(err)
 						return
 					}

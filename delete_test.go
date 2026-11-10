@@ -13,6 +13,7 @@ import (
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/OrdalieTech/big-garden/internal/store"
+	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
 // entityKeys lists every stored key of key's entity directory.
@@ -227,4 +228,67 @@ func TestDeleteFollower(t *testing.T) {
 		t.Fatalf("%d reads, %d not_found", reads, gone)
 	}
 	t.Logf("%d reads during 40 writes and the delete, then not_found", reads)
+}
+
+// TestDeleteReviewCases: the 2026-11-10 final review's findings on deletion.
+func TestDeleteReviewCases(t *testing.T) {
+	t.Run("activation re-reads a tombstone", func(t *testing.T) { // D1: never serve the dead incarnation
+		mem := storetest.NewMem()
+		a, b := testNode(t, mem, "a", nil), testNode(t, mem, "b", nil)
+		ref := mustCreate(t, a, "k", newLedger())
+		for i := range 3 {
+			mustPut(t, a, ref, fmt.Sprint("x", i), randText(40<<10), newLedger())
+		}
+		done := make(chan struct{})
+		var once atomic.Bool // b's first object GET waits for a's Delete, then misses
+		mem.SetPlan(func(at storetest.Attempt) storetest.MemFault {
+			if at.Op == "get" && strings.Contains(at.Key, "/objects/") && once.CompareAndSwap(false, true) {
+				go func() {
+					defer close(done)
+					if err := a.Delete(bg, ref); err != nil {
+						t.Error(err)
+					}
+				}()
+				return storetest.MemFault{Hold: done}
+			}
+			return storetest.MemFault{}
+		})
+		_, err := b.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+		wantCode(t, err, CodeNotFound)
+	})
+	t.Run("recreated key: the old Ref still collects and deletes", func(t *testing.T) { // D2
+		mem := storetest.NewMem()
+		a := testNode(t, mem, "a", nil)
+		old := mustCreate(t, a, "k", newLedger())
+		if err := a.Delete(bg, old); err != nil {
+			t.Fatal(err)
+		}
+		mem.PutImmutable(bg, head.ObjectKey("k", old.Incarnation, 1, head.NewID(), head.Digest{3}), []byte("left over")) // an Unknown delete
+		if _, _, err := a.Create(bg, "k", newReq(t, "again", 1), createKV); err != nil {
+			t.Fatal(err)
+		}
+		for _, op := range []func() error{func() error { return a.Collect(bg, old) }, func() error { return a.Delete(bg, old) }} {
+			if err := op(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if page, _, _ := mem.List(bg, head.ObjectPrefix("k", old.Incarnation), "", 10); len(page) != 0 {
+			t.Fatalf("old incarnation objects left: %v", page)
+		}
+	})
+	t.Run("delete works without the objects", func(t *testing.T) { // D5: no activation needed
+		mem := storetest.NewMem()
+		a := testNode(t, mem, "a", nil)
+		ref := mustCreate(t, a, "k", newLedger())
+		mustPut(t, a, ref, "x", randText(40<<10), newLedger())
+		a.Evict(bg, ref)
+		h, _ := headAt(t, mem, "k")
+		mem.Delete(bg, h.Snapshot.Key) // damaged: activation would fail state_missing
+		if err := a.Delete(bg, ref); err != nil {
+			t.Fatalf("Delete of a damaged entity: %v", err)
+		}
+		if h, _ := headAt(t, mem, "k"); !h.Deleted {
+			t.Fatal("no tombstone")
+		}
+	})
 }
