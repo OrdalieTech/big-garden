@@ -16,6 +16,8 @@ func controlCase(v Variant) *Case {
 		return caseB()
 	case RideUnresolved:
 		return caseBR()
+	case FollowerStaleRead:
+		return caseF()
 	}
 	return caseP()
 }

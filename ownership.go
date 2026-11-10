@@ -3,6 +3,7 @@ package garden
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
@@ -10,8 +11,8 @@ import (
 )
 
 // fetch revalidates e's cached head with a GET (If-None-Match: etag, if not
-// empty), discarding a local image that no longer matches or is no longer
-// owned.
+// empty), parking a local image that is not exactly the new head's: another
+// image, or the same one by other links, whose page counts it does not know.
 func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) error {
 	issued := time.Now()
 	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
@@ -30,7 +31,7 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	if err != nil {
 		return err
 	}
-	if e.db != nil && (e.db.Published() != imageOf(cur) || !n.mine(cur)) {
+	if e.db != nil && (e.db.Published() != imageOf(cur) || !slices.Equal(links(e.h), links(cur))) {
 		n.park(e) // the file of the previous head: a base for catching up later
 	}
 	e.h, e.etag, e.valid = cur, obj.ETag, issued

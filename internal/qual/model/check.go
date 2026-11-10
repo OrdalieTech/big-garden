@@ -118,7 +118,7 @@ func (x *px) member(o out) {
 	r := x.c.Reqs[mb]
 	var m out
 	switch {
-	case r.Kind == kRead: // C11: a read queued behind the batch rides its publication
+	case r.Kind == kRead: // D23: a read queued behind the batch rides its publication
 		switch {
 		case o.code == cOK && x.m.HasH && x.m.HasImg && x.m.Img == x.m.H.Img: // proven by the CAS or resolve GET
 			m = readOut(x.m.Img, r)

@@ -39,9 +39,10 @@ const all = 0xff
 // cases: C (Create, the D5 resume and an administrative head deletion at any
 // time: finding F1, accepted by D14), C0 (no deletion) and CD (deletion only
 // while no create of the key is in flight, D14's scope), and the group-commit
-// case B (D18) and its read-member variant BR (C11).
+// case B (D18), its read-member variant BR (D23) and the follower-read case
+// F (D24).
 func Cases() []*Case {
-	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB(), caseBR()}
+	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB(), caseBR(), caseF()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -184,7 +185,7 @@ func caseB() *Case {
 	return c
 }
 
-// BR: reads ride a batch's publication (C11). B with the queued member a
+// BR: reads ride a batch's publication (D23). B with the queued member a
 // read: r1 may run alone or with the read r2 queued behind it, which then
 // answers from the state r1's committed publication proved; r2 may also run
 // alone on either node; one takeover by n1, one crash, one hedge.
@@ -192,6 +193,28 @@ func caseBR() *Case {
 	c := caseB()
 	c.Name = "BR"
 	c.Reqs[2] = Req{Kind: kRead, Nodes: 3, Tries: 2, Schema: 1}
+	return c
+}
+
+// F: strong reads on a node that owns nothing (D24). Three nodes, one entity
+// with a two-delta root owned by n0; n2 only reads (twice, so the second may
+// reuse its local image), while n0 or n1 updates, n1 takes over, the owner
+// compacts and n0 collects. One hedge, no crash.
+func caseF() *Case {
+	c := &Case{Name: "F", Nodes: 3, Ents: 1, Msgs: 4, Active: 3, Depth: 64,
+		Hedges: 1, Retention: 8, Age: 1}
+	c.Reqs = []Req{
+		genesisReq(1),
+		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kCompact, Nodes: 3, Tries: 1},
+		{Kind: kTakeover, Nodes: 2, Tries: 1},
+		{Kind: kUpdate, Nodes: 3, Tries: 1, ID: 4, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kRead, Nodes: 4, Tries: 2, Schema: 1},
+		{Kind: kCollect, Nodes: 1, Tries: 1},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, []int{1, 2}, 0, true)
 	return c
 }
 

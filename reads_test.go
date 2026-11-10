@@ -1,6 +1,7 @@
 package garden
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -217,5 +218,119 @@ func TestReadRidesCAS(t *testing.T) {
 	}
 	if n.cfg.Limits.BatchMax > 1 && multi == 0 {
 		t.Fatalf("no batch of several members formed beside the readers: %v", b)
+	}
+}
+
+// TestFollowerRead (D24): a reader on a node that never owns the entity,
+// while the owner writes and maintenance compacts, snapshots and collects
+// under it. A counter read is linearizable iff acknowledged before it began
+// <= value <= started before it ended, and sequences never go back. The
+// follower never changes the owner and catches up from its own file.
+func TestFollowerRead(t *testing.T) {
+	st := newStore(t)
+	a, b := testNode(t, st, "a", nil), testNode(t, st, "b", nil)
+	l := newLedger()
+	ref := mustCreate(t, a, "k", l)
+	mustPut(t, a, ref, "n", "0", l)
+	writes := 400
+	if storetest.LocalOn() {
+		writes = 100
+	}
+	var started, acked atomic.Int64
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := range 4 {
+		wg.Go(func() {
+			for i := range writes {
+				started.Add(1)
+				_, err := a.Update(bg, ref, newReq(t, fmt.Sprint(w, "-", i), 1), func(tx *Tx) ([]byte, error) {
+					_, err := tx.Exec(bg, "UPDATE kv SET v = CAST(v AS INTEGER) + 1 WHERE k='n'")
+					if err == nil { // grow and churn pages so compaction and snapshots run
+						_, err = tx.Exec(bg, "INSERT OR REPLACE INTO kv VALUES(?, hex(randomblob(600)))", fmt.Sprint("f", i%40))
+					}
+					return nil, err
+				})
+				if err != nil {
+					t.Errorf("update: %v", err)
+					return
+				}
+				acked.Add(1)
+			}
+		})
+	}
+	go func() { wg.Wait(); close(done) }()
+	reads, last := 0, uint64(0)
+	for stop := false; !stop; reads++ {
+		select {
+		case <-done:
+			stop = true // one last read after every write
+		default:
+		}
+		lo := acked.Load()
+		v, res, err := counter(b, ref)
+		hi := started.Load()
+		switch {
+		case err != nil:
+			t.Fatalf("follower read %d: %v", reads, err)
+		case v < lo || v > hi:
+			t.Fatalf("follower read %d not linearizable: %d outside [%d, %d]", reads, v, lo, hi)
+		case res.Version.Sequence < last:
+			t.Fatalf("follower read %d went back: sequence %d after %d", reads, res.Version.Sequence, last)
+		}
+		last = res.Version.Sequence
+	}
+	sa, sb := a.Stats(), b.Stats()
+	t.Logf("%d follower reads; owner: %d commits, %d snapshots, %d compactions, %d objects collected; follower: %d activations, %d catch-ups, %d warm hits, %d owner changes",
+		reads, sa.Commits, sa.Snapshots, sa.Compactions, sa.CollectedObjects, sb.Activations, sb.CatchUps, sb.WarmHits, sb.OwnerChanges)
+	if v, _, err := counter(b, ref); err != nil || v != int64(4*writes) {
+		t.Fatalf("final follower read %d (%v), want %d", v, err, 4*writes)
+	}
+	if h, _ := headAt(t, st, "k"); sb.OwnerChanges != 0 || *h.Owner != a.self {
+		t.Fatalf("the follower changed the owner: %d owner changes, owner %+v", sb.OwnerChanges, h.Owner)
+	}
+	if sb.CatchUps == 0 || sb.Activations >= uint64(reads) {
+		t.Fatalf("%d activations (%d catch-ups) for %d reads: the follower does not keep its file", sb.Activations, sb.CatchUps, reads)
+	}
+	req := newReq(t, "last", 1)
+	if _, err := a.Update(bg, ref, req, increment); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := b.Lookup(bg, ref, req.ID); err != nil || !res.Replayed { // Lookup inherits the rule
+		t.Fatalf("follower lookup %+v %v", res, err)
+	}
+	_, err := b.Update(bg, ref, newReq(t, "follower", 1), increment)
+	wantCode(t, err, CodeNotOwner)
+}
+
+// TestExportFollower (D24): Export on a node that does not own the entity
+// returns the owner's current state, as an archive Import accepts.
+func TestExportFollower(t *testing.T) {
+	st := newStore(t)
+	a, b := testNode(t, st, "a", nil), testNode(t, st, "b", nil)
+	l := newLedger()
+	ref := mustCreate(t, a, "k", l)
+	for i := range 5 {
+		mustPut(t, a, ref, fmt.Sprint("k", i), randText(2000), l)
+	}
+	if _, err := rows(b, ref); err != nil { // the follower holds an image
+		t.Fatal(err)
+	}
+	mustPut(t, a, ref, "last", "1", l) // and then falls behind
+	var out bytes.Buffer
+	v, err := b.Export(bg, ref, &out)
+	h, _ := headAt(t, st, "k")
+	if err != nil || v.Sequence != h.Sequence {
+		t.Fatalf("follower export %+v %v, head at %d", v, err, h.Sequence)
+	}
+	ref2, _, err := b.Import(bg, "copy", newReq(t, "import", 1), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := rows(a, ref)
+	if got, err := rows(b, ref2); err != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("imported %v (%v), want %v", got, err, want)
+	}
+	if h, _ := headAt(t, st, "k"); *h.Owner != a.self || b.Stats().OwnerChanges != 0 {
+		t.Fatalf("the export changed the owner: %+v", h.Owner)
 	}
 }

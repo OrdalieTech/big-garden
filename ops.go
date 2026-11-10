@@ -139,12 +139,14 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter,
 	return e, nil
 }
 
-// owned makes e's cached head current enough, owned by this session and
-// activated (PROTOCOL §3 steps 2–4, §6 step 2). A read invoked at t0 needs a
-// head proven current after t0 (D23), else the conditional GET; a mutation
-// (t0 zero) uses a cached head owned by this session as is.
+// owned makes e's cached head current enough and activated (PROTOCOL §3
+// steps 2–4, §6 step 2). A mutation (t0 zero) needs this session's
+// ownership and uses a cached head it owns as is. A read invoked at t0 needs
+// a head proven current after t0 (D23), else the conditional GET, and an
+// image exactly that head, owned or not (D24): it publishes nothing.
 func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) error {
-	if e.h == nil || !n.mine(e.h) || e.db == nil || !t0.IsZero() && !e.current(t0) {
+	write := t0.IsZero()
+	if e.h == nil || e.db == nil || write && !n.mine(e.h) || !write && !e.current(t0) {
 		if err := n.fetch(ctx, e, ref.Incarnation, e.etag); err != nil {
 			return err
 		}
@@ -152,7 +154,7 @@ func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) erro
 	if e.h.Incarnation != ref.Incarnation {
 		return &Error{Code: CodeIncarnationMismatch, Route: routeOf(e.h), Message: "the key has another incarnation"}
 	}
-	if !n.mine(e.h) {
+	if write && !n.mine(e.h) {
 		if e.h.Owner == nil || e.h.Owner.Node != n.cfg.NodeID {
 			return notOwner(e.h)
 		}
@@ -164,7 +166,7 @@ func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) erro
 		if err := n.activate(ctx, e, e.h, e.etag); err != nil {
 			return err
 		}
-		if !n.mine(e.h) {
+		if write && !n.mine(e.h) {
 			e.discard()
 			return newError(CodeRouteChanged, "the head changed during activation", nil)
 		}
@@ -278,10 +280,9 @@ func (n *Node) current(ctx context.Context, key string, inc head.ID) (*head.Head
 	return nil, storeError(err)
 }
 
-// Read runs fn on the state validated by a head GET issued after the call
-// began (PROTOCOL §3). It requires ownership, like Lookup and Export: the
-// owner's cache revalidated by that GET is what makes the read strong
-// (CodeNotOwner otherwise; see Ownership in the package doc).
+// Read runs fn on the state named by a head proven current by a request
+// issued after the call began (PROTOCOL §3), on any Node: ownership is not
+// needed, the image is checked against that head (D24).
 func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) ([]byte, error)) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
 	t0 := time.Now()
@@ -305,8 +306,8 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	return Result{Value: v, Version: Version{e.h.Incarnation, e.h.Sequence}}, nil
 }
 
-// Lookup returns the stored outcome of id in freshly validated state. It
-// requires ownership, like Read.
+// Lookup returns the stored outcome of id in freshly validated state, on
+// any Node, like Read.
 func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
 	t0 := time.Now()

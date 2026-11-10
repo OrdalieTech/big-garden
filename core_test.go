@@ -549,20 +549,28 @@ func TestRestartRecoversEverything(t *testing.T) {
 		}
 		mustPut(t, n, refs[i%2], fmt.Sprint("k", i%5), v, l)
 	}
-	// a new process of the same node takes over implicitly and sees everything
+	// a new process of the same node sees everything, and its first write
+	// takes over implicitly: reads never do (D24)
 	l.verify(t, mem, "a")
 	n2 := testNode(t, mem, "a", nil)
 	mustPut(t, n2, refs[0], "after", "restart", l)
 	h, _ := headAt(t, mem, "x")
-	if *h.Owner != n2.self || h.Epoch != 3 { // a's verify node claimed it at epoch 2
+	if *h.Owner != n2.self || h.Epoch != 2 {
 		t.Fatalf("owner %+v epoch %d", h.Owner, h.Epoch)
 	}
 	// the old session is fenced: its cached head is stale, its CAS fails
 	_, err := n.Update(bg, refs[0], newReq(t, "stale", 1), put("stale", "1"))
 	wantCode(t, err, CodeNotOwner)
-	// another node never takes over implicitly
-	_, err = testNode(t, mem, "b", nil).Read(bg, refs[0], 1, func(*View) ([]byte, error) { return nil, nil })
+	// another node reads without owning (D24) and never takes over implicitly
+	b := testNode(t, mem, "b", nil)
+	if got := readAll(t, b, refs[0]); got["after"] != "restart" {
+		t.Fatalf("read on another node %v", got)
+	}
+	_, err = b.Update(bg, refs[0], newReq(t, "b", 1), put("b", "1"))
 	wantCode(t, err, CodeNotOwner)
+	if h, _ := headAt(t, mem, "x"); *h.Owner != n2.self || h.Epoch != 2 {
+		t.Fatalf("owner %+v epoch %d after another node's read", h.Owner, h.Epoch)
+	}
 	l.verify(t, mem, "a")
 }
 
@@ -1219,8 +1227,9 @@ func TestOwnershipAndMigrate(t *testing.T) {
 	if e := wantCode(t, err, CodeNotOwner); e.Route == nil || e.Route.Owner != b.Owner() {
 		t.Fatalf("route %+v", e.Route)
 	}
-	_, err = a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
-	wantCode(t, err, CodeNotOwner)
+	if got := readAll(t, a, ref); got["c"] != "3" { // a non-owner reads the current state (D24)
+		t.Fatalf("read on the old owner %v", got)
+	}
 
 	// release, then the unowned entity is claimable
 	if err := b.Release(bg, ref); err != nil {
@@ -1229,8 +1238,9 @@ func TestOwnershipAndMigrate(t *testing.T) {
 	if err := b.Release(bg, ref); err != nil {
 		t.Fatalf("release by a non-owner is nil: %v", err)
 	}
-	_, err = b.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
-	wantCode(t, err, CodeNotOwner)
+	if got := readAll(t, b, ref); got["c"] != "3" { // an unowned entity reads too
+		t.Fatalf("read of the released entity %v", got)
+	}
 	route, _ = a.Resolve(bg, "k")
 	if route.Owner != (Owner{}) {
 		t.Fatalf("released route %+v", route)
@@ -1381,7 +1391,7 @@ func TestEntityMapBounded(t *testing.T) {
 	}
 	n := testNode(t, mem, "a", nil)
 	for i := range 1000 {
-		_, err := n.Read(bg, refs[i%len(refs)], 1, func(*View) ([]byte, error) { return nil, nil })
+		_, err := n.Update(bg, refs[i%len(refs)], newReq(t, fmt.Sprint(i), 1), put("a", "1"))
 		wantCode(t, err, CodeNotOwner)
 	}
 	_, err := n.Read(bg, Ref{Key: "missing"}, 1, func(*View) ([]byte, error) { return nil, nil })
@@ -1392,7 +1402,7 @@ func TestEntityMapBounded(t *testing.T) {
 		return len(n.entities)
 	}
 	if got := entries(); got != 0 {
-		t.Fatalf("%d entries after misrouted reads", got)
+		t.Fatalf("%d entries after misrouted updates", got)
 	}
 	l := newLedger()
 	ref := mustCreate(t, n, "mine", l)

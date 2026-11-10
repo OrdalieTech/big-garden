@@ -32,8 +32,8 @@ type manifest struct {
 }
 
 // Export writes a snapshot of ref's validated state as a tar archive of
-// manifest.json and snapshot.ltx (PROTOCOL §11). It requires ownership, like
-// Read. A write error is returned as is: the partial output is not a backup.
+// manifest.json and snapshot.ltx (PROTOCOL §11), on any Node, like Read. A
+// write error is returned as is: the partial output is not a backup.
 func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error) {
 	h, files, err := n.exportFiles(ctx, ref, time.Now()) // in memory: w never blocks the entity
 	if err != nil {
