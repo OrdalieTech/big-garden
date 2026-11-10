@@ -1,0 +1,139 @@
+const CodeAbsentAtVersion
+const CodeCapacity
+const CodeClosed
+const CodeCorrupt
+const CodeIDConflict
+const CodeIDExpired
+const CodeIncarnationMismatch
+const CodeInvalidArgument
+const CodeNotFound
+const CodeNotOwner
+const CodeOutcomeUnknown
+const CodeRouteChanged
+const CodeSchemaMismatch
+const CodeStateMissing
+const CodeUnavailable
+const CodeUnsupported
+func (e *Error) Error() string
+func (e *Error) Unwrap() error
+func (n *Node) Close(ctx context.Context) error
+func (n *Node) Collect(ctx context.Context, ref Ref) error
+func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx) ([]byte, error)) (Ref, Result, error)
+func (n *Node) Evict(ctx context.Context, ref Ref) error
+func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error)
+func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader) (Ref, Result, error)
+func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, err error)
+func (n *Node) Migrate(ctx context.Context, ref Ref, req Request, to uint32, fn func(*Tx) error) (Result, error)
+func (n *Node) Owner() Owner
+func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) ([]byte, error)) (res Result, err error)
+func (n *Node) Release(ctx context.Context, ref Ref) error
+func (n *Node) Resolve(ctx context.Context, key string) (Route, error)
+func (n *Node) Stats() Stats
+func (n *Node) Takeover(ctx context.Context, observed Route) (Route, error)
+func (n *Node) Update(ctx context.Context, ref Ref, req Request, fn func(*Tx) ([]byte, error)) (Result, error)
+func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error)
+func (t *Tx) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error
+func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error
+func NewMutationID(t time.Time) (MutationID, error)
+func Open(ctx context.Context, cfg Config) (*Node, error)
+func Preferred(key string, nodeIDs []string) (string, error)
+type Code string
+type Config struct {
+	S3		*s3.Client
+	Bucket		string
+	Prefix		string
+	NodeID		string
+	CacheDir	string
+	Limits		Limits
+	Logger		*slog.Logger
+
+	Extend	func(*sqlite.Driver) error
+}
+type Error struct {
+	Code		Code
+	Operation	MutationID
+	Route		*Route
+	At		Version
+	Schema		uint32
+	RetryAfter	time.Duration
+	Message		string
+	cause		error
+}
+type Limits struct {
+	EntityBytes, CacheBytes				int64
+	ResultBytes, ResidentEntities, InflightStorage	int
+	PendingPerEntity, Recoveries, BatchMax		int
+	StorageAttemptTimeout, CommitTimeout		time.Duration
+	IdleTimeout, ReceiptRetention			time.Duration
+}
+type MutationID [24]byte
+type Node struct {
+	cfg	Config
+	st	store.Store
+	drv	*engine.Driver
+	ns	head.ID
+	self	head.Owner
+	dir	string
+	lock	*os.File
+	now	func() time.Time
+
+	mu		sync.Mutex
+	entities	map[string]*entity
+	reserved	int64
+	recoveries	chan struct{}
+	staging		atomic.Int64
+	logged		atomic.Int64
+	closed		bool
+
+	done		chan struct{}
+	counters	counters
+	wg		sync.WaitGroup
+	skipMaintenance	bool
+}
+type Owner struct {
+	NodeID	string
+	Session	[16]byte
+}
+type Ref struct {
+	Key		string
+	Incarnation	[16]byte
+}
+type Request struct {
+	ID	MutationID
+	Hash	[32]byte
+	Schema	uint32
+}
+type Result struct {
+	Value		[]byte
+	Version		Version
+	Replayed	bool
+}
+type Route struct {
+	Ref		Ref
+	Owner		Owner
+	Epoch		uint64
+	Revision	uint64
+}
+type Stats struct {
+	Reads, Mutations, Commits, Replays, Expired, Conflicts		uint64
+	ReadRejections, MutationRejections, UnknownOutcomes		uint64
+	OwnerChanges, Activations, ActivationFailures, Corruptions	uint64
+	CASAttempts, CASConflicts, AmbiguousPuts			uint64
+	Snapshots, Compactions, Collections, CollectedObjects		uint64
+	SnapshotBytes, CompactionInputBytes, CompactionOutputBytes	uint64
+	CollectedBytes, UploadedBytes, DownloadedBytes			uint64
+	ResidentEntities, QueuedRequests, InflightStorage		int64
+	CacheBytes, StagingBytes					int64
+	OldestUnresolved						time.Duration
+	Batches								[maxBatch]uint64
+	Storage								[4]struct {
+		Attempts, Failures		uint64
+		UploadedBytes, DownloadedBytes	uint64
+	}
+}
+type Tx struct{ t *engine.Tx }
+type Version struct {
+	Incarnation	[16]byte
+	Sequence	uint64
+}
+type View struct{ v *engine.View }
