@@ -3,6 +3,7 @@ package garden
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -243,13 +244,21 @@ func TestFollowerRead(t *testing.T) {
 		wg.Go(func() {
 			for i := range writes {
 				started.Add(1)
-				_, err := a.Update(bg, ref, newReq(t, fmt.Sprint(w, "-", i), 1), func(tx *Tx) ([]byte, error) {
-					_, err := tx.Exec(bg, "UPDATE kv SET v = CAST(v AS INTEGER) + 1 WHERE k='n'")
-					if err == nil { // grow and churn pages so compaction and snapshots run
-						_, err = tx.Exec(bg, "INSERT OR REPLACE INTO kv VALUES(?, hex(randomblob(600)))", fmt.Sprint("f", i%40))
+				req := newReq(t, fmt.Sprint(w, "-", i), 1)
+				var err error
+				for deadline := time.Now().Add(time.Minute); ; { // an overloaded machine may time a batch out: retry its ID, as a client does
+					_, err = a.Update(bg, ref, req, func(tx *Tx) ([]byte, error) {
+						_, err := tx.Exec(bg, "UPDATE kv SET v = CAST(v AS INTEGER) + 1 WHERE k='n'")
+						if err == nil { // grow and churn pages so compaction and snapshots run
+							_, err = tx.Exec(bg, "INSERT OR REPLACE INTO kv VALUES(?, hex(randomblob(600)))", fmt.Sprint("f", i%40))
+						}
+						return nil, err
+					})
+					var e *Error
+					if err == nil || !errors.As(err, &e) || e.Code != CodeOutcomeUnknown && e.Code != CodeUnavailable || time.Now().After(deadline) {
+						break
 					}
-					return nil, err
-				})
+				}
 				if err != nil {
 					t.Errorf("update: %v", err)
 					return
