@@ -13,6 +13,7 @@ import (
 // fetch revalidates e's cached head with a GET (If-None-Match: etag, if not
 // empty), parking a local image that is not exactly the new head's: another
 // image, or the same one by other links, whose page counts it does not know.
+// A tombstone is not_found, with the local image and warm file dropped (D25).
 func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) error {
 	issued := time.Now()
 	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
@@ -30,6 +31,9 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	cur, err := n.decodeHead(obj.Body, e.key, inc)
 	if err != nil {
 		return err
+	}
+	if cur.Deleted {
+		return n.deleted(e)
 	}
 	if e.db != nil && (e.db.Published() != imageOf(cur) || !slices.Equal(links(e.h), links(cur))) {
 		n.park(e) // the file of the previous head: a base for catching up later
@@ -102,6 +106,46 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 	_, err = n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next})
 	if err == nil {
 		e.discard()
+	}
+	return err
+}
+
+// deleted answers not_found for e's tombstone (D25) and drops what this
+// node keeps of the deleted incarnation: the local image and the warm file.
+func (n *Node) deleted(e *entity) error {
+	e.discard()
+	n.claimWarm(e.key, "")
+	return newError(CodeNotFound, "the entity was deleted", nil)
+}
+
+// Delete ends ref's incarnation (PROTOCOL §7, D25): the owner replaces the
+// head with a tombstone (no owner, epoch+1, no tail), then collects every
+// object of the incarnation. Every operation on ref is not_found afterwards;
+// Create or Import recreates the key as a new incarnation. Deleting an
+// already deleted incarnation collects it again and returns nil, so a retry
+// after any failure finishes the erasure.
+func (n *Node) Delete(ctx context.Context, ref Ref) error {
+	e, err := n.enter(ctx, ref.Key, nil, nil, false)
+	if err != nil {
+		return err
+	}
+	var tomb *head.Head
+	if err = n.owned(ctx, e, ref, time.Time{}); err == nil { // a zero t0: a write, owner only
+		next := *e.h
+		next.Owner, next.Tail, next.Deleted = nil, nil, true
+		next.Epoch, next.Revision, next.Nonce = next.Epoch+1, next.Revision+1, head.NewID()
+		if _, err = n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next}); err == nil {
+			tomb = &next
+			n.deleted(e)
+		}
+	}
+	n.leave(e)
+	var pe *Error
+	switch {
+	case tomb != nil:
+		return n.reap(ctx, tomb)
+	case errors.As(err, &pe) && pe.Code == CodeNotFound: // deleted already, or never created
+		return n.Collect(ctx, ref)
 	}
 	return err
 }

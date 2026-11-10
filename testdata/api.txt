@@ -19,6 +19,7 @@ func (*Error) Unwrap() error
 func (*Node) Close(context.Context) error
 func (*Node) Collect(context.Context, Ref) error
 func (*Node) Create(context.Context, string, Request, func(*Tx) ([]byte, error)) (Ref, Result, error)
+func (*Node) Delete(context.Context, Ref) error
 func (*Node) Evict(context.Context, Ref) error
 func (*Node) Export(context.Context, Ref, io.Writer) (Version, error)
 func (*Node) Import(context.Context, string, Request, io.Reader) (Ref, Result, error)

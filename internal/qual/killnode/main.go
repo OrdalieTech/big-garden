@@ -30,7 +30,8 @@ import (
 )
 
 // Req is one operation: create, add (insert a log row named by the ID), read,
-// resolve or takeover (of Route if set, else of the freshly resolved one).
+// resolve, takeover (of Route if set, else of the freshly resolved one) or
+// delete.
 // A request with a Tag is served concurrently and its Resp carries the Tag.
 type Req struct {
 	Op, Key, Inc, ID, Input string
@@ -178,6 +179,8 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 			})
 			return []byte(strconv.Itoa(c)), err
 		})
+	case "delete":
+		err = n.Delete(ctx, ref)
 	case "resolve":
 		route, err = n.Resolve(ctx, r.Key)
 		ref = route.Ref

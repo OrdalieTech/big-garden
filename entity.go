@@ -300,6 +300,14 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 	case c.object != nil && slices.ContainsFunc(append([]head.Ref{cur.Snapshot}, cur.Deltas...),
 		func(r head.Ref) bool { return r.Key == c.object.Key }):
 		committed = true
+	case c.next.Deleted: // Delete: done iff the incarnation is gone, by this delete or another (D25)
+		committed = cur.Deleted || cur.Incarnation != c.next.Incarnation
+	case c.op != nil && cur.Deleted: // a tombstone holds no receipt (D25)
+		if c.base == nil || cur.Revision != c.base.Revision+1 { // c may have committed, then been deleted
+			e.discard()
+			e.resolved()
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "the entity was deleted during publication"}
+		}
 	case c.op != nil: // the tail is not an object: an inline mutation always lands here
 		e.discard()
 		if err := n.activate(ctx, e, cur, etag); err != nil {
@@ -315,10 +323,13 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 			e.resolved()
 			return nil, &Error{Code: CodeIDConflict, Operation: opOf(c), Message: "operation ID used with another input"}
 		}
-		if !ok && tsOf(opOf(c)) <= int64(m.FloorMs) { // a newer owner may have pruned our receipt
+		// Absent from another incarnation, c may have committed in a deleted
+		// one, unless that incarnation began at the very revision c proposed.
+		deleted := cur.Incarnation != c.next.Incarnation && (c.base == nil || cur.Revision != c.base.Revision+1)
+		if !ok && (deleted || tsOf(opOf(c)) <= int64(m.FloorMs)) { // or a newer owner pruned our receipt
 			e.discard()
 			e.resolved()
-			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "receipt floor passed during publication"}
+			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "receipt floor passed or entity deleted during publication"}
 		}
 		committed, rec = ok, &r
 	case c.object != nil: // maintenance: committed only if its object is referenced
