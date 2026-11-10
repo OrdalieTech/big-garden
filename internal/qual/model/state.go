@@ -5,7 +5,8 @@
 // reply delivery for every storage request, hedged duplicates and resolve (D3,
 // D12), takeover including D4 (mutations only), strong reads on any node (D24), release, crash/restart with cache loss, receipts
 // with an expiry floor and bounded pruning, compaction at the exact head,
-// collection by base revision, and create including the D5 resume.
+// collection by base revision, create including the D5 resume, and delete
+// (a tombstone head) with recreation as a CAS on the tombstone (D25).
 //
 // The state is a plain value (fixed arrays, no pointers), so a transition is a
 // copy plus an explicit step, and a canonical encoding deduplicates states.
@@ -28,7 +29,8 @@
 // current head) and G8 (referenced objects exist); every client response is
 // checked against the history (G2/G4: a state-dependent answer comes from an
 // image that was the head during the call; acknowledgments are durable and
-// unique; a definite failure of an operation with an ID never commits).
+// unique; a definite failure of an operation with an ID never commits). G1 is
+// scoped to the acknowledged incarnation: Delete ends its effects.
 //
 // Search: Exhaustive expands the complete reachable graph of a bounded case
 // once per canonical state (64-bit fingerprints, omission bound reported);
@@ -51,7 +53,7 @@ const (
 	fanout    = 2 // model compaction fanout (production 8)
 	tailCap   = 2 // sequences an inline tail may span (stands for InlineBytes, D16)
 	maxOps    = 8 // ledger capacity (Kept is a uint8 mask)
-	maxReqs   = 16
+	maxReqs   = 20
 	maxSeen   = 8
 	maxFailed = 8
 	maxDel    = 8
@@ -89,6 +91,8 @@ type Head struct {
 	Cand             ID // ghost: the candidate that produced this head
 	Rev, Epoch       int16
 	Owner            int8 // node index + 1; 0 = released
+	Gen              int8 // incarnation ordinal: 1 for the first, +1 per recreation (what a Ref's incarnation names)
+	Deleted          bool // tombstone (Delete): owner 0, no state; only a recreation may replace it
 	ND               int8
 	Img              Image
 	Snap             Ref
@@ -176,6 +180,7 @@ const (
 	kRelease
 	kCompact
 	kCollect
+	kDelete
 )
 
 // Cand is a publication candidate (PROTOCOL §2). It lives in node memory, not in
@@ -209,7 +214,8 @@ type Proc struct {
 	W                        [2]int8 // waited message slots + 1
 	Hedged, Redo, Applied    bool
 	Acked, Resume, Flag      bool
-	Act                      ID // nonce of the head being activated
+	SawTomb                  bool // ghost: the head was a tombstone of the request's incarnation during the call
+	Act                      ID   // nonce of the head being activated
 	Put, Tk, Loops           int8
 	Seq                      int8 // result sequence of a committed candidate (the leader's, D18)
 	Mb                       int8 // D18 batch member request index + 1 (0 = none)
@@ -244,6 +250,7 @@ type Ghost struct {
 	LostImg        Image
 	NFailed        int8
 	Failed         [maxFailed]ID // candidates reported as definitely not committed
+	Gone           uint32        // requests whose effect was in an incarnation since deleted (G1 is scoped to the live one)
 }
 
 // State is the whole model state.
@@ -256,6 +263,7 @@ type State struct {
 	Mem                             [maxNodes][maxEnts]Mem
 	Used                            [maxReqs]int8 // invocations per request
 	Acked                           [maxReqs]int8 // acknowledged result sequence
+	AckGen                          [maxReqs]int8 // incarnation ordinal of that acknowledgment (0: in a deleted one)
 	Restarts, Jumps, Losses, Hedges int8
 	Fresh                           ID // generator; not part of the canonical state
 }
@@ -270,6 +278,7 @@ type Req struct {
 	ID, Hash, TS      int8
 	Schema, To, Input int8
 	More              int8 // D18: request index + 1 that may be queued behind this Update (batch of 2)
+	Gen               int8 // incarnation ordinal its Ref names (0 = 1); Create has none
 }
 
 // Variant selects the correct protocol or one deliberately broken control.
@@ -290,6 +299,9 @@ const (
 	BatchLeaderReceipt
 	RideUnresolved
 	FollowerStaleRead
+	DeleteAsRelease
+	ReceiptAcrossIncarnation
+	RecreateKeepsData
 	numVariants
 )
 
@@ -298,7 +310,7 @@ var variantNames = [...]string{
 	"premature-ack", "floorless-receipt-pruning", "age-only-gc", "hedge-without-resolve",
 	"d5-resume-without-identity", "compaction-retargeted", "inline-tail-without-object",
 	"batch-ack-on-leader-receipt", "read-rides-unresolved",
-	"follower-stale-read",
+	"follower-stale-read", "delete-done-as-release", "receipt-across-incarnation", "recreation-keeps-data",
 }
 
 func (v Variant) String() string { return variantNames[v] }

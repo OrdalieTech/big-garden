@@ -39,10 +39,11 @@ const all = 0xff
 // cases: C (Create, the D5 resume and an administrative head deletion at any
 // time: finding F1, accepted by D14), C0 (no deletion) and CD (deletion only
 // while no create of the key is in flight, D14's scope), and the group-commit
-// case B (D18), its read-member variant BR (D23) and the follower-read case
-// F (D24).
+// case B (D18), its read-member variant BR (D23), the follower-read case
+// F (D24) and the deletion cases D, DT, DR and DU (D25).
 func Cases() []*Case {
-	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB(), caseBR(), caseF()}
+	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB(), caseBR(), caseF(),
+		caseD(), caseDT(), caseDR(), caseDU()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -218,6 +219,86 @@ func caseF() *Case {
 	return c
 }
 
+// D: delete vs update (D25). Two nodes, one entity with a one-delta root
+// owned by n0; an update (retried once) and a delete (retried once, so the
+// retry finds the tombstone) on either node, a read on either node, a
+// takeover by n1; one crash, one hedge. The delete's Collect runs inline.
+func caseD() *Case {
+	c := &Case{Name: "D", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 48,
+		Restarts: 1, Hedges: 1, Retention: 8, Age: 1}
+	c.Reqs = []Req{
+		genesisReq(1),
+		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, Nodes: 3, Tries: 2, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kDelete, Nodes: 3, Tries: 2},
+		{Kind: kRead, Nodes: 3, Tries: 1, Schema: 1},
+		{Kind: kTakeover, Nodes: 2, Tries: 1},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, []int{1}, 0, true)
+	return c
+}
+
+// DT: delete vs takeover. n0 owns and deletes (retried once) while n1 takes
+// over and updates, and a lookup reads the update's receipt on either node;
+// one hedge, one crash. A lost delete must not be called done.
+func caseDT() *Case {
+	c := &Case{Name: "DT", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 48,
+		Restarts: 1, Hedges: 1, Retention: 8, Age: 1}
+	c.Reqs = []Req{
+		genesisReq(1),
+		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kDelete, Nodes: 1, Tries: 2},
+		{Kind: kTakeover, Nodes: 2, Tries: 1},
+		{Kind: kUpdate, Nodes: 2, Tries: 1, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kLookup, Nodes: 3, Tries: 1, ID: 3, TS: 1},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, []int{1}, 0, true)
+	return c
+}
+
+// DR: two recreations. n0 owns the entity and deletes it; two creates with
+// different IDs race to recreate it on either node (one retried), an update
+// of the new incarnation and one of the old Ref (incarnation_mismatch or
+// not_found) run on either node; one hedge, no crash.
+func caseDR() *Case {
+	c := &Case{Name: "DR", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 48,
+		Hedges: 1, Retention: 8, Age: 1}
+	c.Reqs = []Req{
+		genesisReq(1),
+		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kDelete, Nodes: 1, Tries: 1},
+		{Kind: kCreate, Nodes: 3, Tries: 2, ID: 5, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kCreate, Nodes: 3, Tries: 1, ID: 6, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, Nodes: 3, Tries: 1, ID: 7, Hash: 1, TS: 1, Schema: 1, Gen: 2},
+		{Kind: kUpdate, Nodes: 3, Tries: 1, ID: 3, Hash: 1, TS: 1, Schema: 1},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, []int{1}, 0, true)
+	return c
+}
+
+// DU: an update's outcome across a deletion. n0's update may apply while n0
+// stops waiting for it; n1 takes over, deletes and recreates the entity, and
+// the update's own resolve then reads another incarnation: its receipt cannot
+// be absent there for a reason of its own. No crash, no hedge.
+func caseDU() *Case {
+	c := &Case{Name: "DU", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 40,
+		Retention: 8, Age: 1}
+	c.Reqs = []Req{
+		genesisReq(1),
+		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, Nodes: 1, Tries: 1, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kTakeover, Nodes: 2, Tries: 1},
+		{Kind: kDelete, Nodes: 2, Tries: 1},
+		{Kind: kCreate, Nodes: 2, Tries: 1, ID: 5, Hash: 1, TS: 1, Schema: 1},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, []int{1}, 0, true)
+	return c
+}
+
 // CaseR is the random-trace configuration: entity 0 exists with a two-delta
 // root, entity 1 does not; every operation kind is in the pool.
 func CaseR(nodes, ents, active int) *Case {
@@ -238,6 +319,8 @@ func CaseR(nodes, ents, active int) *Case {
 		{Kind: kRelease, Nodes: all, Tries: 1},
 		{Kind: kCompact, Nodes: all, Tries: 2},
 		{Kind: kCollect, Nodes: all, Tries: 2},
+		{Kind: kDelete, Nodes: all, Tries: 2},
+		{Kind: kCreate, Nodes: all, Tries: 2, ID: 9, Hash: 1, TS: 3, Schema: 1}, // recreation after the delete
 	}
 	if ents > 1 {
 		c.Reqs = append(c.Reqs,
@@ -271,7 +354,7 @@ func (c *Case) existing(s *State, e, cr int, ups []int, owner int, warm bool) {
 	snap := Obj{Att: fresh(), Inc: inc, Min: 1, Max: 1, Snap: true, Present: true, Post: img}
 	en.Objs[0] = snap
 	en.NObj = 1
-	h := Head{Inc: inc, Rev: 1, Nonce: fresh(), Owner: int8(owner + 1), Sess: s.Nodes[owner].Sess,
+	h := Head{Inc: inc, Gen: 1, Rev: 1, Nonce: fresh(), Owner: int8(owner + 1), Sess: s.Nodes[owner].Sess,
 		Epoch: 1, Img: img, Snap: ref(snap)}
 	for _, u := range ups {
 		pre := img

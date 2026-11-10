@@ -1,0 +1,55 @@
+{
+  "case": "DR",
+  "variant": "recreation-keeps-data",
+  "violation": "G6: recreation is not the genesis of its create alone ([r0 r1 r3] schema=1 floor=0): the deleted incarnation's data resurrected",
+  "steps": [
+    {
+      "t": [
+        1,
+        2,
+        0
+      ],
+      "desc": " 1. client invokes r2 delete on n0 (entity 0)"
+    },
+    {
+      "t": [
+        1,
+        3,
+        1
+      ],
+      "desc": " 2. client invokes r3 create on n1 (entity 0, id 5 hash 1 ts 1)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 3. store applies m0 CAS head rev 3 nonce #9 owner none epoch 2 [r0 r1] schema=1 floor=0, If-Match #8 from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        1,
+        0
+      ],
+      "desc": " 4. store applies m1 GET head from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        1,
+        0
+      ],
+      "desc": " 5. store applies m1 PUT object #12 base 3 seq 1..3 from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        1,
+        0
+      ],
+      "desc": " 6. store applies m1 CAS head rev 4 nonce #13 owner n1 epoch 3 [r0 r1 r3] schema=1 floor=0, If-Match #9 from n1 (reply delivered)"
+    }
+  ]
+}

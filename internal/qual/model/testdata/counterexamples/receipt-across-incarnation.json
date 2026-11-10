@@ -1,0 +1,143 @@
+{
+  "case": "DU",
+  "variant": "receipt-across-incarnation",
+  "violation": "definite failure: update r2 at n0 returned not_owner although its candidate #10 committed",
+  "steps": [
+    {
+      "t": [
+        1,
+        2,
+        0
+      ],
+      "desc": " 1. client invokes r2 update on n0 (entity 0, id 3 hash 1 ts 1)"
+    },
+    {
+      "t": [
+        1,
+        3,
+        1
+      ],
+      "desc": " 2. client invokes r3 takeover on n1 (entity 0)"
+    },
+    {
+      "t": [
+        5,
+        0,
+        0
+      ],
+      "desc": " 3. n0 gives up on m0 CAS head rev 3 nonce #9 owner n0 epoch 1 [r0 r1 r2] schema=1 floor=0, If-Match #8 (the request stays in flight)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 4. store applies m0 CAS head rev 3 nonce #9 owner n0 epoch 1 [r0 r1 r2] schema=1 floor=0, If-Match #8 from n0"
+    },
+    {
+      "t": [
+        2,
+        1,
+        0
+      ],
+      "desc": " 5. store applies m1 GET head from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 6. store applies m0 CAS head rev 4 nonce #11 owner n1 epoch 2 [r0 r1 r2] schema=1 floor=0, If-Match #9 from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": " 7. store applies m0 GET objects of head rev 4 from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        1,
+        4,
+        1
+      ],
+      "desc": " 8. client invokes r4 delete on n1 (entity 0)"
+    },
+    {
+      "t": [
+        7,
+        1,
+        0
+      ],
+      "desc": " 9. n1 entity 0 hits CommitTimeout"
+    },
+    {
+      "t": [
+        1,
+        5,
+        1
+      ],
+      "desc": "10. client invokes r5 create on n1 (entity 0, id 5 hash 1 ts 1)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "11. store applies m0 CAS head rev 5 nonce #13 owner none epoch 3 [r0 r1 r2] schema=1 floor=0, If-Match #11 from n1"
+    },
+    {
+      "t": [
+        2,
+        1,
+        0
+      ],
+      "desc": "12. store applies m1 GET head from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "13. store applies m0 GET head from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "14. store applies m0 PUT object #16 base 5 seq 1..1 from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "15. store applies m0 CAS head rev 6 nonce #17 owner n1 epoch 4 [r5] schema=1 floor=0, If-Match #13 from n1 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        2,
+        0
+      ],
+      "desc": "16. store applies m2 GET head from n0 (reply delivered)"
+    },
+    {
+      "t": [
+        2,
+        0,
+        0
+      ],
+      "desc": "17. store applies m0 GET objects of head rev 6 from n0 (reply delivered)"
+    }
+  ]
+}

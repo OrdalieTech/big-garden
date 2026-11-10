@@ -45,7 +45,7 @@ func (w *world) apply(i int) {
 		if !ok {
 			res = rPreFailed
 		} else {
-			w.writeHead(int(m.Ent), m.Head, m.Node, m.Sess)
+			w.writeHead(int(m.Ent), m.Head, m.Node, m.Sess, m.Cond)
 		}
 	case mDel:
 		w.del(int(m.Ent), m.Obj.Att)
@@ -123,7 +123,7 @@ func (w *world) list(m *Msg, p *Proc) {
 		p.NDel = 0
 		for i := int8(0); i < en.NObj; i++ {
 			o := &en.Objs[i]
-			ok := o.Inc == cur.Inc && o.Base < cur.Rev && !refs(cur, o.Att)
+			ok := o.Inc == cur.Inc && o.Base < cur.Rev && (cur.Deleted || !refs(cur, o.Att))
 			if w.v == AgeGC {
 				ok = o.Stamp+w.c.Age <= w.s.Nodes[m.Node].Clock
 			}
@@ -150,7 +150,7 @@ func (w *world) del(e int, att ID) {
 	en := &w.s.Ents[e]
 	o := &en.Objs[i]
 	if en.HasHead {
-		if refs(&en.Head, att) {
+		if refs(&en.Head, att) && !en.Head.Deleted { // a tombstone's refs are not live (D25)
 			w.fail("G8: deleted object #%d (base %d) referenced by the current head (revision %d)", att, o.Base, en.Head.Rev)
 		} else if o.Inc == en.Head.Inc && o.Base >= en.Head.Rev {
 			w.fail("G8: deleted object #%d with base %d >= current revision %d, which a valid next head may reference", att, o.Base, en.Head.Rev)
@@ -160,10 +160,15 @@ func (w *world) del(e int, att ID) {
 }
 
 // writeHead installs a new head after checking the transition (G1, G3, G5-G8).
-func (w *world) writeHead(e int, nh Head, node int8, sess ID) {
+func (w *world) writeHead(e int, nh Head, node int8, sess ID, cond ID) {
 	en, g := &w.s.Ents[e], &w.s.Ghost[e]
-	w.checkWrite(e, nh, node, sess)
+	w.checkWrite(e, nh, node, sess, cond)
 	en.HasHead, en.Head = true, nh
+	if nh.Deleted { // the incarnation's effects end here (G1 scope)
+		for i := int8(0); i < nh.Img.Seq; i++ {
+			g.Gone |= 1 << (nh.Img.Ops[i] - 1)
+		}
+	}
 	g.EverHead = true
 	for _, f := range g.Failed[:g.NFailed] {
 		if f == nh.Cand {
@@ -179,7 +184,9 @@ func (w *world) writeHead(e int, nh Head, node int8, sess ID) {
 			if p.CID == nh.Cand {
 				p.Applied = true
 			}
-			if reportsState(p.Kind) {
+			if nh.Deleted { // a tombstone names no state a read may answer from
+				p.SawTomb = p.SawTomb || nh.Gen == want(w.c.Reqs[p.Req])
+			} else if reportsState(p.Kind) {
 				w.see(p, nh.Img)
 			}
 		}
@@ -208,10 +215,30 @@ func (p *Proc) saw(img Image) bool {
 	return false
 }
 
-func (w *world) checkWrite(e int, nh Head, node int8, sess ID) {
+func (w *world) checkWrite(e int, nh Head, node int8, sess ID, cond ID) {
 	en, g := &w.s.Ents[e], &w.s.Ghost[e]
 	img := &nh.Img
 	w.checkLedger(img)
+	if en.HasHead && cond == 0 {
+		w.fail("G6: a genesis applied by If-None-Match on a key with a head (revision %d)", en.Head.Rev)
+		return
+	}
+	if old := &en.Head; en.HasHead && old.Deleted { // only a recreation replaces a tombstone (D25)
+		fresh := Image{Seq: 1, Schema: w.c.Reqs[img.Ops[0]-1].Schema, Kept: 1}
+		fresh.Ops[0] = img.Ops[0]
+		switch {
+		case nh.Deleted || nh.Inc == old.Inc || nh.Gen != old.Gen+1:
+			w.fail("G6: tombstone (revision %d) replaced by something other than a new incarnation", old.Rev)
+		case nh.Rev != old.Rev+1 || nh.Epoch != old.Epoch+1:
+			w.fail("G7: recreation at revision %d epoch %d over tombstone revision %d epoch %d", nh.Rev, nh.Epoch, old.Rev, old.Epoch)
+		case nh.Owner != node+1 || nh.Sess != sess:
+			w.fail("G3: recreation owned by node %d, written by node %d", nh.Owner-1, node)
+		case w.c.Reqs[img.Ops[0]-1].Kind != kCreate || *img != fresh || nh.ND != 0 || nh.Tail.Max != 0 || nh.Snap.Base != old.Rev:
+			w.fail("G6: recreation is not the genesis of its create alone (%s): the deleted incarnation's data resurrected", imgString(img))
+		}
+		w.checkChain(e, &nh)
+		return
+	}
 	if !en.HasHead {
 		b := en.Birth
 		switch {
@@ -247,7 +274,7 @@ func (w *world) checkWrite(e int, nh Head, node int8, sess ID) {
 	switch {
 	case img.Seq == oi.Seq && *img != *oi:
 		w.fail("G7: data changed without a sequence advance (%s -> %s)", imgString(oi), imgString(img))
-	case img.Seq == oi.Seq && nh.Tail != old.Tail:
+	case img.Seq == oi.Seq && nh.Tail != old.Tail && !nh.Deleted: // a tombstone drops the tail (D25)
 		w.fail("G7: inline tail changed without a sequence advance")
 	case img.Seq < oi.Seq || img.Seq > oi.Seq+maxBatch:
 		w.fail("G1: sequence %d replaced by %d", oi.Seq, img.Seq)
@@ -263,8 +290,12 @@ func (w *world) checkWrite(e int, nh Head, node int8, sess ID) {
 		w.fail("G3: ownership handed to a session other than the writer's")
 	case ownerChanged && nh.Owner == 0 && (old.Owner != node+1 || old.Sess != sess):
 		w.fail("G3: release written by a non-owner")
+	case nh.Deleted && nh.Owner != 0:
+		w.fail("G3: tombstone with an owner")
 	}
-	w.checkChain(e, &nh)
+	if !nh.Deleted { // a tombstone names no state
+		w.checkChain(e, &nh)
+	}
 }
 
 // extends reports whether img's ledger starts with old's.
@@ -338,12 +369,15 @@ func (w *world) checkState() {
 		if !en.HasHead {
 			continue
 		}
+		if en.Head.Deleted {
+			continue
+		}
 		if !w.present(e, &en.Head) {
 			w.fail("G8: the current head (revision %d) references a deleted object", en.Head.Rev)
 		}
 		img := &en.Head.Img
 		for q, seq := range w.s.Acked {
-			if seq != 0 && int(w.c.Reqs[q].Ent) == e && (seq > img.Seq || img.Ops[seq-1] != int8(q+1)) {
+			if seq != 0 && int(w.c.Reqs[q].Ent) == e && w.s.AckGen[q] == en.Head.Gen && (seq > img.Seq || img.Ops[seq-1] != int8(q+1)) {
 				w.fail("G1: acknowledged r%d (sequence %d) is not in the current head %s", q, seq, imgString(img))
 			}
 		}

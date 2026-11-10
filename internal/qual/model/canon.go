@@ -67,6 +67,8 @@ func (k *canon) head(h *Head) {
 	k.i16(h.Rev)
 	k.i16(h.Epoch)
 	k.i8(h.Owner)
+	k.i8(h.Gen)
+	k.bit(h.Deleted)
 	k.i8(h.ND)
 	k.img(&h.Img)
 	k.ref(&h.Snap)
@@ -129,7 +131,7 @@ func (k *canon) proc(p *Proc) {
 			k.i8(k.pos[w-1])
 		}
 	}
-	for _, f := range []bool{p.Hedged, p.Redo, p.Applied, p.Acked, p.Resume, p.Flag} {
+	for _, f := range []bool{p.Hedged, p.Redo, p.Applied, p.Acked, p.Resume, p.Flag, p.SawTomb} {
 		k.bit(f)
 	}
 	k.b = append(k.b, uint8(p.Put), uint8(p.Tk), uint8(p.Loops), uint8(p.Seq), uint8(p.Pend), uint8(p.PendSeq), uint8(p.ObsOwner))
@@ -371,6 +373,8 @@ func (k *canon) encode(c *Case, s *State) {
 		k.bit(g.EverHead)
 		k.bit(g.Lost)
 		k.img(&g.LostImg)
+		k.i16(int16(g.Gone))
+		k.i16(int16(g.Gone >> 16))
 		k.i8(g.NFailed)
 		for _, f := range g.Failed[:g.NFailed] {
 			k.id(f)
@@ -379,6 +383,7 @@ func (k *canon) encode(c *Case, s *State) {
 	for r := range c.Reqs {
 		k.i8(s.Used[r])
 		k.i8(s.Acked[r])
+		k.i8(s.AckGen[r])
 	}
 	k.b = append(k.b, uint8(s.Restarts), uint8(s.Jumps), uint8(s.Losses), uint8(s.Hedges))
 }
