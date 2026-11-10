@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1843,5 +1844,44 @@ func TestSchemaMismatchReportsStored(t *testing.T) {
 	_, _, err = n.Import(bg, "dst", newReq(t, "i", 1), &archive)
 	if e := wantCode(t, err, CodeSchemaMismatch); e.Schema != 3 {
 		t.Fatalf("import: archive schema %d", e.Schema)
+	}
+}
+
+// TestHeadDropsItsCandidate: the cached head must not keep the candidate it
+// came from, whose base is the previous head: that chained every publication
+// since activation, inline tails included (soak of 2026-11-08: 1.1 GB of Go
+// heap for 50 resident entities). Over 1,900 updates of 8 KiB the heap may
+// grow by what the in-memory store journals, plus 4 MiB.
+func TestHeadDropsItsCandidate(t *testing.T) {
+	mem := storetest.NewMem()
+	journaled := func() (b int64) {
+		for _, a := range mem.Journal() {
+			b += int64(cap(a.Body))
+		}
+		return b
+	}
+	n := testNode(t, mem, "a", nil)
+	ref, _, err := n.Create(bg, "k", newReq(t, "c", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := strings.Repeat("x", 8<<10)
+	var before runtime.MemStats
+	var j0 int64
+	for i := range 2000 {
+		if i == 100 {
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			j0 = journaled()
+		}
+		if _, err := n.Update(bg, ref, newReq(t, fmt.Sprint("u", i), 1), put("k", fmt.Sprint(v, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc) - (journaled() - j0); grew > 4<<20 {
+		t.Fatalf("heap grew %d bytes over 1,900 updates: publications are retained", grew)
 	}
 }
