@@ -4,14 +4,19 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"time"
+
+	"github.com/OrdalieTech/big-garden/internal/store"
+	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: qual model|doctor|stall|faults|stress|soak|check|cost|footprint|reproducible|report [flags]")
+		fmt.Fprintln(os.Stderr, "usage: qual model|doctor|stall|faults|stress|soak|check|cost|footprint|reproducible|report|cleanup [flags]")
 		os.Exit(2)
 	}
 	var run func([]string) error
@@ -40,6 +45,16 @@ func main() {
 		run = reproducible
 	case "report":
 		run = report
+	case "cleanup": // delete every object under QUAL_S3_PREFIX (qual-state/ only) or the local fixture's prefix
+		run = func([]string) error {
+			ep, err := storetest.RemoteFromEnv()
+			if err != nil {
+				return err
+			}
+			n, err := cleanup(context.Background(), store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, time.Minute))
+			fmt.Printf("%d objects deleted under %s\n", n, ep.Prefix)
+			return err
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "qual: unknown subcommand %q\n", os.Args[1])
 		os.Exit(2)
