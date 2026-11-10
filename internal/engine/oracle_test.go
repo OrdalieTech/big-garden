@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,9 @@ type oracle struct {
 	maxBytes int64
 	compacts int
 	restores int
+	overlays int    // D21 catch-ups whose first link overlaid the parked image
+	parked   []byte // the image of an earlier full restore, at parkedAt
+	parkedAt Image
 }
 
 func runOracle(t *testing.T, p profile, txs int, rng *rand.Rand) int {
@@ -109,8 +113,8 @@ func runOracle(t *testing.T, p profile, txs int, rng *rand.Rand) int {
 	}
 	o.compare()
 	o.fullRestore()
-	t.Logf("%s: %d transactions (%d committed, %d rolled back) in %d batches, %v; max %d KiB; %d compactions, %d restores",
-		p.name, done, o.commits, o.failed, batches, time.Since(start).Round(time.Millisecond), o.maxBytes>>10, o.compacts, o.restores)
+	t.Logf("%s: %d transactions (%d committed, %d rolled back) in %d batches, %v; max %d KiB; %d compactions, %d restores, %d overlays",
+		p.name, done, o.commits, o.failed, batches, time.Since(start).Round(time.Millisecond), o.maxBytes>>10, o.compacts, o.restores, o.overlays)
 	return done
 }
 
@@ -213,7 +217,7 @@ func (o *oracle) publish(snapshot bool) {
 		if o.img != before {
 			t.Fatalf("replay at %+v, database published %+v", o.img, before)
 		}
-		if o.img, _, err = apply(bg, o.replay, o.img, obj.Ref, bytes.NewReader(f.objs[len(f.objs)-1])); err != nil {
+		if o.img, _, err = apply(bg, o.replay, o.img, obj.Ref, bytes.NewReader(f.objs[len(f.objs)-1]), false); err != nil {
 			t.Fatalf("replaying delta %d..%d: %v", obj.Ref.MinSequence, obj.Ref.MaxSequence, err)
 		}
 	}
@@ -262,11 +266,11 @@ func (o *oracle) resetReplay() {
 	}
 	t.Cleanup(func() { o.replay.Close() })
 	o.img = Image{}
-	if o.img, _, err = apply(bg, o.replay, Image{}, f.head.Snapshot, bytes.NewReader(f.objs[0])); err != nil {
+	if o.img, _, err = apply(bg, o.replay, Image{}, f.head.Snapshot, bytes.NewReader(f.objs[0]), false); err != nil {
 		t.Fatal(err)
 	}
 	for i, d := range f.head.Deltas {
-		if o.img, _, err = apply(bg, o.replay, o.img, d, bytes.NewReader(f.objs[i+1])); err != nil {
+		if o.img, _, err = apply(bg, o.replay, o.img, d, bytes.NewReader(f.objs[i+1]), false); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -309,11 +313,43 @@ func (o *oracle) fullRestore() {
 	if err != nil {
 		t.Fatal(err)
 	}
-	samePages(t, got, serialize(t, o.f.d.path))
+	want := serialize(t, o.f.d.path)
+	samePages(t, got, want)
+	o.catchUp(want)
+	o.parked, o.parkedAt = got, d.Published()
 	if err := d.Discard(); err != nil {
 		t.Fatal(err)
 	}
 	o.restores++
+}
+
+// catchUp (D21) brings the image parked by the previous full restore to the
+// head with only the links after it, the first one overlaid, and compares
+// the result with SQLite's image.
+func (o *oracle) catchUp(want []byte) {
+	t, h := o.t, &o.f.head
+	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
+	i := slices.IndexFunc(refs, func(r head.Ref) bool { return r.MaxSequence > o.parkedAt.Sequence })
+	if o.parked == nil || i <= 0 {
+		return
+	}
+	path := filepath.Join(t.TempDir(), "parked")
+	if err := os.WriteFile(path, o.parked, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, _, err := Restore(bg, plain, path, head.MaxPages, h, readers(o.f.objs[i:]), &o.parkedAt)
+	if err != nil {
+		t.Fatalf("catch-up from %+v with links %d..: %v", o.parkedAt, i, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samePages(t, got, want)
+	if refs[i].MinSequence <= o.parkedAt.Sequence {
+		o.overlays++
+	}
+	d.Discard()
 }
 
 func samePages(t *testing.T, got, want []byte) {

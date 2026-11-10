@@ -516,6 +516,16 @@ func (d *DB) Checkpoint(img Image) error {
 	return nil
 }
 
+// Park checkpoints the published image into the main file, closes the
+// database and moves the file to dst (D21: the warm tier). On error the
+// caller discards.
+func (d *DB) Park(dst string) error {
+	if err := errors.Join(d.Checkpoint(d.pub), d.close()); err != nil {
+		return err
+	}
+	return errors.Join(os.Rename(d.path, dst), removeFiles(d.path))
+}
+
 // Bytes is the size of the database and -wal files (0 for a missing file).
 func (d *DB) Bytes() int64 {
 	var n int64

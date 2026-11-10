@@ -25,30 +25,37 @@ const maxFrame = pageSize + pageSize/255 + 16
 
 // Restore reconstructs the image named by h into a new file at path, which
 // must not exist, then opens and checks it (PROTOCOL §4 steps 3–6). objs
-// holds the snapshot followed by every delta of h, in order. Each object's
+// holds the snapshot followed by every delta of h, in order. With from set
+// (D21), path is an existing file believed to hold the image from, and objs
+// holds only the last len(objs) links of h: the first one overlays from (its
+// range contains from.Sequence) and the gates below are unchanged, so a file
+// that is not what from says fails them. Each object's
 // length, SHA-256, frame sizes, header, sequence range and checksums are
 // verified against h before and while it is applied; the final page count
 // and checksum must equal h's, the metadata row must match h and
 // integrity_check must pass. Every validation failure wraps ErrCorrupt. pages
 // holds the page frames of each restored object (snapshot, deltas, tail):
 // the replay pages of PROTOCOL §6 step 7.
-func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (
+func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt, from *Image) (
 	d *DB, pages []uint32, err error) {
 	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
 	if h.Tail != nil {
 		refs = append(refs, h.Tail.Ref())
 	}
+	flag, img := os.O_CREATE|os.O_EXCL, Image{}
+	if from != nil {
+		flag, img, refs = 0, *from, refs[len(refs)-min(len(objs), len(refs)):]
+	}
 	if len(objs) != len(refs) || h.PageCount > maxPages {
 		return nil, nil, errors.New("engine: objects do not match the head or exceed the page limit")
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|flag|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}
-	img := Image{}
 	pages = make([]uint32, len(refs))
 	for i, ref := range refs {
-		if img, pages[i], err = apply(ctx, f, img, ref, objs[i]); err != nil {
+		if img, pages[i], err = apply(ctx, f, img, ref, objs[i], i == 0 && from != nil); err != nil {
 			break
 		}
 	}
@@ -114,14 +121,21 @@ func (d *DB) check(h *head.Head) error {
 // apply applies one verified object to the image in f: a snapshot onto an
 // empty file, a delta onto img. It updates the rolling checksum from the old
 // contents of the pages it replaces or truncates and returns the new image
-// and the number of page frames the object carried.
-func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.ReaderAt) (Image, uint32, error) {
+// and the number of page frames the object carried. An overlay delta [a..b]
+// applies onto an image at any s in [a-1, b-1]: it carries the final content
+// of every page written in [a..b] and every page it grows by, so the result
+// is the image at b (D21).
+func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.ReaderAt, overlay bool) (Image, uint32, error) {
 	dec, err := openObject(r, ref)
 	if err != nil {
 		return img, 0, err
 	}
 	snapshot, hd := ref.MinSequence == 1, dec.Header()
-	if snapshot != (img == Image{}) || (!snapshot && (ref.MinSequence != img.Sequence+1 || ref.PreChecksum != img.Checksum)) {
+	follows := ref.MinSequence == img.Sequence+1 && ref.PreChecksum == img.Checksum
+	if overlay {
+		follows = ref.MinSequence <= img.Sequence+1 && img.Sequence < ref.MaxSequence
+	}
+	if snapshot != (img == Image{}) || (!snapshot && !follows) {
 		return img, 0, fmt.Errorf("%w: object %d..%d does not follow image at %d", ErrCorrupt, ref.MinSequence, ref.MaxSequence, img.Sequence)
 	}
 	sum, count := ltx.Checksum(img.Checksum), img.PageCount

@@ -127,7 +127,7 @@ func readers(objs [][]byte) []io.ReaderAt {
 // restore rebuilds the fixture's published head into a new file.
 func (f *fixture) restore(t testing.TB) *DB {
 	t.Helper()
-	d, _, err := Restore(bg, plain, filepath.Join(t.TempDir(), "restored"), head.MaxPages, &f.head, readers(f.objs))
+	d, _, err := Restore(bg, plain, filepath.Join(t.TempDir(), "restored"), head.MaxPages, &f.head, readers(f.objs), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestCreateSettings(t *testing.T) {
 	if _, err := Create(bg, plain, f.d.path, 1000, head.ID{}, "k", head.ID{}); !errors.Is(err, os.ErrExist) {
 		t.Fatalf("Create over an existing file: %v", err)
 	}
-	if _, _, err := Restore(bg, plain, f.d.path, 1000, &f.head, []io.ReaderAt{bytes.NewReader(nil)}); !errors.Is(err, os.ErrExist) {
+	if _, _, err := Restore(bg, plain, f.d.path, 1000, &f.head, []io.ReaderAt{bytes.NewReader(nil)}, nil); !errors.Is(err, os.ErrExist) {
 		t.Fatal("Restore over an existing file")
 	}
 	missing := filepath.Join(f.dir, "missing")

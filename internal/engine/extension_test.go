@@ -422,7 +422,7 @@ func TestForeignKeyToReserved(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.publish(t, false)
-	if _, _, err := Restore(bg, plain, filepath.Join(t.TempDir(), "r"), head.MaxPages, &f.head, readers(f.objs)); !errors.Is(err, ErrCorrupt) {
+	if _, _, err := Restore(bg, plain, filepath.Join(t.TempDir(), "r"), head.MaxPages, &f.head, readers(f.objs), nil); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("restore with a key to a reserved table: %v", err)
 	}
 }
@@ -494,7 +494,7 @@ func TestActivationRunsNoModuleCode(t *testing.T) {
 	f.mutate(t, "CREATE TABLE app(a); CREATE VIRTUAL TABLE b USING broken(3)")
 	f.publish(t, true)
 	connects = 0
-	r, _, err := Restore(bg, ext, filepath.Join(t.TempDir(), "r"), head.MaxPages, &f.head, readers(f.objs))
+	r, _, err := Restore(bg, ext, filepath.Join(t.TempDir(), "r"), head.MaxPages, &f.head, readers(f.objs), nil)
 	if err != nil {
 		t.Fatalf("activation with a failing module: %v", err)
 	}
