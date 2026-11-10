@@ -285,7 +285,9 @@ type soakRun struct {
 	lastReportAt  time.Time
 	halt          func() // ends the measured phase early
 	hosts         []string
-	placed        int // nodes started, for round-robin placement on hosts
+	placed        int           // nodes started, for round-robin placement on hosts
+	extra         []string      // more soak-node flags (qual stress profiles)
+	routeTimeout  time.Duration // client timeout before suspecting a node (0: sRouteTimeout)
 }
 
 type seriesPoint struct {
@@ -352,6 +354,7 @@ func (s *soakRun) start(name string, member bool) error { // member: add to the 
 	cache := filepath.Join(s.out, "cache", name)
 	nodeArgs := []string{"soak-node", "-url", s.ep.URL, "-region", s.ep.Region, "-bucket", s.ep.Bucket,
 		"-prefix", s.ep.Prefix, "-cache", cache, "-node", name, "-ring", strconv.Itoa(s.ring)}
+	nodeArgs = append(nodeArgs, s.extra...)
 	var cmd *exec.Cmd
 	host := ""
 	if s.hosts[0] != "" { // the remote shell prints its pid, then becomes the node
@@ -557,10 +560,14 @@ func (c *sclient) attempt(name string, r sReq) (sResp, bool) {
 	if ch == nil {
 		return sResp{}, false
 	}
+	timeout := sRouteTimeout
+	if c.s.routeTimeout > 0 {
+		timeout = c.s.routeTimeout
+	}
 	select {
 	case resp, ok := <-ch:
 		return resp, ok
-	case <-time.After(sRouteTimeout):
+	case <-time.After(timeout):
 		if r.Op == "write" { // a late acknowledgment is still an acknowledgment
 			go func() {
 				if resp, ok := <-ch; ok && resp.OK {
