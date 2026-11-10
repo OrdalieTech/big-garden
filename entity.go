@@ -195,9 +195,21 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 		e.resolved()
 		return nil, storeError(err)
 	}
+	refused := store.OutcomeOf(err) != store.Unknown // every request was answered 412 or Failed: none applied
 	rec, err = n.resolve(ctx, e, c)
 	var pe *Error
-	if e.unresolved != nil && errors.As(err, &pe) && pe.Code != CodeOutcomeUnknown && pe.Code != CodeStateMissing {
+	switch {
+	case e.unresolved == nil || !errors.As(err, &pe) || pe.Code == CodeStateMissing:
+	case refused && len(c.nonces) == 1 && c.op == nil:
+		// the only proposal was refused and carries no operation another
+		// node may have committed: definitely not committed, the reread
+		// alone failed (PLAN §8.2, PROTOCOL §2 step 5)
+		e.discard()
+		e.resolved()
+		if pe.Code == CodeOutcomeUnknown {
+			err = newError(CodeUnavailable, "head unreadable after a refused publication", pe)
+		}
+	case pe.Code != CodeOutcomeUnknown:
 		// still possibly committed: nothing but outcome_unknown may describe it (§2 rule 5)
 		err = &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown: " + pe.Message, cause: pe}
 	}

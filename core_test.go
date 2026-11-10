@@ -823,6 +823,47 @@ func TestResolveBranches(t *testing.T) {
 		}
 		l.verify(t, mem, "a")
 	})
+	t.Run("refused takeover, head unreadable", func(t *testing.T) {
+		// a 412 to the only proposal of a takeover proves it never applied:
+		// a reread that cannot finish is unavailable, not outcome_unknown
+		mem := newStore(t)
+		a := testNode(t, mem, "a", nil)
+		b := testNode(t, mem, "b", nil)
+		l := newLedger()
+		ref := mustCreate(t, a, "k", l)
+		mustPut(t, a, ref, "a", "1", l)
+		route, err := b.Resolve(bg, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var refused atomic.Bool
+		mem.SetPlan(func(at storetest.Attempt) storetest.MemFault {
+			switch {
+			case at.Key != head.HeadKey("k"):
+			case at.Op == "cas" && refused.CompareAndSwap(false, true):
+				return storetest.MemFault{Reject: store.PreconditionFailed}
+			case at.Op == "get" && refused.Load():
+				return storetest.MemFault{Reject: store.Unknown}
+			}
+			return storetest.MemFault{}
+		})
+		_, err = b.Takeover(bg, route)
+		wantCode(t, err, CodeUnavailable)
+		e, _ := b.entity("k")
+		e.mu.Lock()
+		if e.unresolved != nil {
+			t.Fatal("refused takeover still unresolved")
+		}
+		e.mu.Unlock()
+		mem.SetPlan(nil)
+		if got, err := b.Takeover(bg, route); err != nil || got.Epoch != route.Epoch+1 {
+			t.Fatalf("takeover after recovery %+v %v", got, err)
+		}
+		_, err = a.Update(bg, ref, newReq(t, "stale", 1), put("b", "2"))
+		wantCode(t, err, CodeNotOwner)
+		mustPut(t, b, ref, "c", "3", l)
+		l.verify(t, mem, "b")
+	})
 	t.Run("ambiguous then definite stays unknown", func(t *testing.T) {
 		mem := newStore(t)
 		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 400 * time.Millisecond })
