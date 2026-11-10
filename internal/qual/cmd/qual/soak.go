@@ -35,7 +35,8 @@ import (
 // lookups) and 30% writes (inline and upload-size), clients that follow
 // Routes and take over from nodes they believe dead, and a fault every
 // -fault: SIGKILL+restart, SIGSTOP/SIGCONT of an owner while clients take
-// over elsewhere, node replacement. Node n0 is never killed, so its memory
+// over elsewhere, node replacement; -churn more entities are deleted and
+// recreated in a loop beside the ledger (D25). Node n0 is never killed, so its memory
 // series spans the run (§18.3). Every -report it writes a rolling report
 // with a ledger check; porcupine checks sampled windows of one entity at a
 // time continuously. At the end every node is killed, caches are deleted,
@@ -54,6 +55,7 @@ func soak(args []string) error {
 	sampleEvery := fs.Duration("sample", 30*time.Second, "resource sample period")
 	faultEvery := fs.Duration("fault", 3*time.Minute, "fault period (0: none)")
 	window := fs.Duration("window", time.Minute, "porcupine window per sampled entity")
+	churn := fs.Int("churn", 1, "entities deleted and recreated in a loop (D25), outside the ledger")
 	collectEvery := fs.Duration("collect", time.Second, "one Collect call (round-robin over entities) per period")
 	ring := fs.Int("ring", 1024, "ledger ring rows per entity")
 	upload := fs.Int("upload", 40<<10, "payload bytes of upload-size writes")
@@ -169,6 +171,11 @@ func soak(args []string) error {
 			}
 		})
 	}
+	for i := range *churn {
+		cw.Go(func() {
+			s.churn(&sclient{id: *clients + i, s: s, owner: map[string]string{}, suspect: map[string]time.Time{}}, fmt.Sprintf("churn%d", i), done)
+		})
+	}
 	bg.Go(func() { s.sampler(stop, keys, *window) })
 	bg.Go(func() { s.collector(stop, keys, *collectEvery) })
 	bg.Go(func() { s.metrics(stop, *sampleEvery) })
@@ -278,6 +285,7 @@ type soakRun struct {
 	series        []seriesPoint
 	reports       int
 	collects      int64
+	churns        int64
 	collectErrs   int64
 	gates         map[string]*sync.RWMutex
 	windows       map[string]*swindow
@@ -748,6 +756,56 @@ func (c *sclient) one(key string, inline, upload int) {
 	}
 	s.smu.Unlock()
 	s.record(o)
+}
+
+// churn creates key, writes it, deletes it and starts again, under the
+// soak's faults: each incarnation is new, reads 0 when created and exactly
+// its acknowledged writes (when none is unknown), and is not_found once its
+// Delete is acknowledged. Its operations stay out of the history.
+func (s *soakRun) churn(c *sclient, key string, done func() bool) {
+	seen := map[string]bool{}
+	read := func(inc string) shop { return c.run(sReq{Op: "read", Inc: inc}, key) }
+	for !done() {
+		o := c.run(sReq{Op: "create", ID: newID()}, key)
+		if o.Class != "ack" { // a fault, or a live incarnation an unknown Delete left: delete what is there
+			if r := c.run(sReq{Op: "resolve"}, key); r.Class == "ack" {
+				c.run(sReq{Op: "delete", Inc: r.Inc}, key)
+			}
+			continue
+		}
+		inc := o.Inc
+		if seen[inc] {
+			s.fail("churn %s: incarnation %s created twice", key, inc)
+		}
+		seen[inc] = true
+		if r := read(inc); r.Class == "ack" && r.Value != "0" {
+			s.fail("churn %s: new incarnation %s reads %s, not 0", key, inc, r.Value)
+		}
+		acked, unknown := 0, false
+		for range 1 + rand.N(5) {
+			switch c.run(sReq{Op: "write", Inc: inc, ID: newID(), Size: 64}, key).Class {
+			case "ack":
+				acked++
+			case "unknown":
+				unknown = true
+			}
+		}
+		if r := read(inc); r.Class == "ack" && !unknown && r.Value != strconv.Itoa(acked) {
+			s.fail("churn %s: incarnation %s reads %s after %d acknowledged writes", key, inc, r.Value, acked)
+		}
+		deleted := false
+		for !done() && !deleted {
+			if deleted = c.run(sReq{Op: "delete", Inc: inc}, key).Class == "ack"; !deleted {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+		if r := read(inc); deleted && (r.Class == "ack" || r.Code == "corrupt" || r.Code == "state_missing") {
+			s.fail("churn %s: deleted incarnation %s reads %s %s", key, inc, r.Class, r.Code)
+		}
+		s.smu.Lock()
+		s.churns++
+		s.smu.Unlock()
+	}
 }
 
 func (s *soakRun) record(o shop) {
@@ -1257,6 +1315,7 @@ type soakSummary struct {
 	WindowsFailed    int
 	WindowsSkipped   int
 	WindowOps        int64
+	Churns           int64
 	Collects         int64
 	CollectErrors    int64
 	Growth           map[string]any
@@ -1280,7 +1339,7 @@ func (s *soakRun) summary() soakSummary {
 	defer s.smu.Unlock()
 	sum := soakSummary{Elapsed: time.Since(s.t0).Round(time.Second).String(), Ops: s.ops, ByOp: s.counts, Codes: s.codes, Faults: s.faultsBy,
 		FaultLog: s.faultLog, LedgerChecked: s.checkedAcks, LookupsVerified: s.lookups, WindowsOK: s.windowsOK,
-		WindowsFailed: s.windowsBad, WindowsSkipped: s.windowsSkip, WindowOps: s.windowOps, Collects: s.collects, CollectErrors: s.collectErrs}
+		WindowsFailed: s.windowsBad, WindowsSkipped: s.windowsSkip, WindowOps: s.windowOps, Churns: s.churns, Collects: s.collects, CollectErrors: s.collectErrs}
 	fails := slices.Clone(s.failures)
 	for _, p := range s.series {
 		sum.MaxGoroutines = max(sum.MaxGoroutines, p.Proc.Goroutines)

@@ -235,6 +235,8 @@ func soakServe(ctx context.Context, n *garden.Node, r sReq, ring int, cache stri
 		res, err = n.Lookup(ctx, ref, id)
 	case "collect":
 		err = n.Collect(ctx, ref)
+	case "delete":
+		err = n.Delete(ctx, ref)
 	case "resolve":
 		route, err = n.Resolve(ctx, r.Key)
 		ref = route.Ref
