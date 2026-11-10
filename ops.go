@@ -154,6 +154,9 @@ func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) erro
 	if e.h.Incarnation != ref.Incarnation {
 		return &Error{Code: CodeIncarnationMismatch, Route: routeOf(e.h), Message: "the key has another incarnation"}
 	}
+	if e.h.Deleted { // a cached tombstone (D25)
+		return n.deleted(e)
+	}
 	if write && !n.mine(e.h) {
 		if e.h.Owner == nil || e.h.Owner.Node != n.cfg.NodeID {
 			return notOwner(e.h)
@@ -258,11 +261,15 @@ func (n *Node) Resolve(ctx context.Context, key string) (Route, error) {
 	if err != nil {
 		return Route{}, err
 	}
+	if h.Deleted {
+		return Route{}, newError(CodeNotFound, "the entity was deleted", nil)
+	}
 	return *routeOf(h), nil
 }
 
 // current decodes key's head (of incarnation inc unless zero) from a plain
-// GET, with no entity or cache: Resolve and Collect.
+// GET, with no entity or cache: Resolve and Collect. A tombstone is returned
+// as such.
 func (n *Node) current(ctx context.Context, key string, inc head.ID) (*head.Head, error) {
 	if err := head.ValidKey(key); err != nil {
 		return nil, invalid(err.Error())
@@ -387,19 +394,31 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 		return Ref{}, Result{}, err
 	}
 	defer n.leave(e)
+	t0 := time.Now()
 	obj, err := n.st.Get(ctx, head.HeadKey(key), "", head.MaxHeadBytes)
+	var tomb *head.Head // recreation (D25): genesis of a new incarnation by a CAS on the tombstone
 	switch store.OutcomeOf(err) {
 	case store.OK:
-		return n.createExists(ctx, e, req, bound, obj.Body)
+		if tomb, err = n.decodeHead(obj.Body, key, head.ID{}); err != nil || !tomb.Deleted {
+			return n.createExists(ctx, e, req, bound, tomb, err, t0)
+		}
+		if err := n.reap(ctx, tomb); err != nil { // the deleted incarnation's objects, if its Delete was cut
+			return Ref{}, Result{}, err
+		}
 	case store.NotFound:
 	default:
 		return Ref{}, Result{}, storeError(err)
 	}
 	e.discard()
 	for {
-		birth, err := n.birth(ctx, key)
+		var birth *head.Birth
 		var inc head.ID
+		if tomb == nil {
+			birth, err = n.birth(ctx, key)
+		}
 		switch {
+		case tomb != nil: // birth.json is the first incarnation's and stays; no birth-without-head window (D5)
+			inc = head.NewID()
 		case err != nil:
 			return Ref{}, Result{}, err
 		case birth != nil && birth.OperationID == head.OpID(req.ID) && birth.InputHash == bound:
@@ -450,12 +469,12 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 		// invites a retry under another ID (§5 step 5).
 		unknown := func(err error) (Ref, Result, error) {
 			var pe *Error
-			if errors.As(err, &pe) && (pe.Code == CodeUnavailable || pe.Code == CodeCorrupt || pe.Code == CodeCapacity) {
+			if tomb == nil && errors.As(err, &pe) && (pe.Code == CodeUnavailable || pe.Code == CodeCorrupt || pe.Code == CodeCapacity) {
 				err = &Error{Code: CodeOutcomeUnknown, Operation: req.ID, Message: "create outcome unknown: " + pe.Message, cause: pe}
 			}
 			return Ref{}, Result{}, withOp(err, req.ID)
 		}
-		if birth == nil {
+		if birth == nil && tomb == nil {
 			attempt := head.NewID()
 			body, err := head.Birth{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, OperationID: op,
 				InputHash: bound, Schema: req.Schema, Attempt: attempt}.Encode()
@@ -484,45 +503,54 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			}
 		}
 		ref := snap.Ref
-		ref.Key = head.ObjectKey(key, inc, 0, head.NewID(), ref.SHA256)
+		c := candidate{next: head.Head{Revision: 1, Epoch: 1}, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}}
+		if tomb != nil { // revision and epoch continue across incarnations; the snapshot is produced against the tombstone
+			c.base, c.baseETag, ref.BaseRevision = tomb, obj.ETag, tomb.Revision
+			c.next.Revision, c.next.Epoch = tomb.Revision+1, tomb.Epoch+1
+		}
+		ref.Key = head.ObjectKey(key, inc, ref.BaseRevision, head.NewID(), ref.SHA256)
 		if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
 			e.discard()
 			return unknown(err)
 		}
 		self := n.self
-		next := head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: 1, Nonce: head.NewID(),
-			Owner: &self, Epoch: 1, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
+		c.next = head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: c.next.Revision, Nonce: head.NewID(),
+			Owner: &self, Epoch: c.next.Epoch, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
 			PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
-		rec, err := n.publish(e, &candidate{next: next, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}})
+		rec, err := n.publish(e, &c)
 		if err != nil {
 			return unknown(err)
 		}
 		if rec != nil { // another genesis carrying our receipt
 			return Ref{key, e.h.Incarnation}, Result{Value: rec.Result, Version: Version{e.h.Incarnation, rec.Sequence}}, nil
 		}
-		return Ref{key, inc}, Result{Value: result, Version: Version{inc, next.Sequence}}, nil
+		return Ref{key, inc}, Result{Value: result, Version: Version{inc, c.next.Sequence}}, nil
 	}
 }
 
-// createExists answers a Create whose key already has a head (§5 step 2).
-func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound head.Digest, body []byte) (Ref, Result, error) {
-	h, err := n.decodeHead(body, e.key, head.ID{})
+// createExists answers a Create (invoked at t0) whose key has a live head
+// h, decoded with err (§5 step 2): the receipt of its ID in the current
+// state, a replay or id_conflict by bound, else "key exists". The receipt,
+// not birth.json, decides: a recreation's create is not in birth.json (D25).
+func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound head.Digest, h *head.Head, err error, t0 time.Time) (Ref, Result, error) {
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
-	birth, err := n.birth(ctx, e.key)
-	if err != nil {
+	ref := Ref{e.key, h.Incarnation}
+	if err := n.owned(ctx, e, ref, t0); err != nil {
 		return Ref{}, Result{}, err
 	}
+	r, ok, err := e.db.Receipt(head.OpID(req.ID))
 	switch {
-	case birth != nil && birth.OperationID == head.OpID(req.ID) && birth.InputHash == bound:
-		ref := Ref{e.key, birth.Incarnation}
-		res, err := n.lookup(ctx, e, ref, req.ID, time.Now())
-		return ref, res, err
-	case birth != nil && birth.OperationID == head.OpID(req.ID):
+	case err != nil:
+		e.discard()
+		return Ref{}, Result{}, engineError(err)
+	case ok && r.InputHash == bound:
+		return ref, Result{Value: r.Result, Version: Version{h.Incarnation, r.Sequence}, Replayed: true}, nil
+	case ok:
 		return Ref{}, Result{}, &Error{Code: CodeIDConflict, Operation: req.ID, Message: "operation ID used with another input"}
 	}
-	return Ref{}, Result{}, &Error{Code: CodeInvalidArgument, Route: routeOf(h), Message: "key exists"}
+	return Ref{}, Result{}, &Error{Code: CodeInvalidArgument, Route: routeOf(e.h), Message: "key exists"}
 }
 
 // birth reads birth.json; nil if absent.

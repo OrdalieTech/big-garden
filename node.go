@@ -639,7 +639,7 @@ func (l limited) Delete(ctx context.Context, key string) error {
 	return l.do(ctx, "delete", key, func() error { return l.Store.Delete(ctx, key) })
 }
 
-// Scan yields the Route of every entity of the namespace whose key hashes
+// Scan yields the Route of every live entity (a tombstone is skipped, D25) of the namespace whose key hashes
 // after afterKey's ("" from the start), in key-hash order, so a scan resumes
 // from the last Route's key. Each Route is a point observation, as from
 // Resolve; an unreadable head is yielded as an error and the scan goes on.
@@ -680,6 +680,8 @@ func (n *Node) Scan(ctx context.Context, afterKey string) iter.Seq2[Route, error
 						errs[i] = newError(CodeCorrupt, k+": "+err.Error(), nil)
 					case h.Namespace != n.ns || head.EntityDir(h.Key)+"/head.json" != k:
 						errs[i] = newError(CodeCorrupt, k+" names another namespace or key", nil)
+					case h.Deleted: // a tombstone: no entity (D25)
+						gone[i] = true
 					default:
 						routes[i] = *routeOf(&h)
 					}

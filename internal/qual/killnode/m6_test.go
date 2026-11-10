@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -203,4 +204,93 @@ func warmKillRun(t *testing.T, ep storetest.Endpoint, fp string) (killed bool) {
 		t.Fatalf("%s: read %d rows %v, committed %d %v", fp, len(resp.IDs), resp.IDs, len(ids), ids)
 	}
 	return killed
+}
+
+// TestDeleteKill (D25): node b takes over and deletes the entity and is
+// SIGKILLed right after the tombstone CAS (cas.after) or inside the Collect
+// that follows (before its second object deletion, collect.del). The
+// tombstone is committed either way; the retry, from b restarted on the same
+// cache, collects the rest and returns nil, as does a second retry; then
+// only birth.json and head.json remain, every read is not_found, and a
+// Create recreates an empty incarnation.
+func TestDeleteKill(t *testing.T) {
+	base := storetest.Local(t)
+	runs := 10
+	if s := os.Getenv("GARDEN_KILL_RUNS"); s != "" {
+		runs, _ = strconv.Atoi(s)
+	}
+	for _, fp := range []string{"cas.after:2", "collect.del:2"} {
+		t.Run(fp, func(t *testing.T) {
+			for i := range runs {
+				ep := base.Sub(fmt.Sprintf("delete-%s-%d", fp[:strings.IndexByte(fp, ':')], i))
+				deleteKillRun(t, ep, fp)
+				clean(t, ep)
+				if t.Failed() {
+					return
+				}
+			}
+			t.Logf("%s: %d runs, all killed inside the delete", fp, runs)
+		})
+	}
+}
+
+func deleteKillRun(t *testing.T, ep storetest.Endpoint, fp string) {
+	must := func(p *proc, r Req) Resp {
+		t.Helper()
+		resp, alive := p.call(t, r)
+		if !alive || !resp.OK {
+			t.Fatalf("%s: %+v: %+v", fp, r, resp)
+		}
+		return resp
+	}
+	a := start(t, ep, t.TempDir(), "", "-node", "a")
+	inc := must(a, Req{Op: "create", Key: "k", ID: newID()}).Inc
+	for i := range 6 { // four objects, then an inline tail
+		must(a, Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: strconv.Itoa(i), Big: i < 4})
+	}
+	a.stop()
+	st := store.NewS3(ep.Client(nil), ep.Bucket, ep.Prefix, 5*time.Second)
+	keys := func() (n int, tomb bool) {
+		page, _, err := st.List(context.Background(), head.EntityDir("k")+"/", "", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o, err := st.Get(context.Background(), head.HeadKey("k"), "", 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := head.Decode(o.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(page), h.Deleted
+	}
+	before, _ := keys()
+	cache := t.TempDir()
+	b := start(t, ep, cache, fp, "-node", "b") // its takeover is the first CAS, the tombstone the second
+	must(b, Req{Op: "takeover", Key: "k"})
+	if resp, alive := b.call(t, Req{Op: "delete", Key: "k", Inc: inc}); alive {
+		t.Fatalf("%s: delete answered %+v", fp, resp)
+	}
+	if !b.stop() {
+		t.Fatalf("%s: b was not killed", fp)
+	}
+	n, tomb := keys()
+	if !tomb || n >= before && fp != "cas.after:2" || n != before && fp == "cas.after:2" {
+		t.Fatalf("%s: after the kill: tombstone %v, %d keys (%d before)", fp, tomb, n, before)
+	}
+	b = start(t, ep, cache, "", "-node", "b")
+	defer b.stop()
+	must(b, Req{Op: "delete", Key: "k", Inc: inc})
+	must(b, Req{Op: "delete", Key: "k", Inc: inc})
+	if n, tomb := keys(); n != 2 || !tomb {
+		t.Fatalf("%s: after the retry: tombstone %v, %d keys", fp, tomb, n)
+	}
+	if resp, _ := b.call(t, Req{Op: "read", Key: "k", Inc: inc}); resp.Code != "not_found" {
+		t.Fatalf("%s: read after delete: %+v", fp, resp)
+	}
+	inc2 := must(b, Req{Op: "create", Key: "k", ID: newID()}).Inc
+	if ids := must(b, Req{Op: "read", Key: "k", Inc: inc2}).IDs; inc2 == inc || len(ids) != 0 {
+		t.Fatalf("%s: recreated incarnation %s reads %v", fp, inc2, ids)
+	}
 }

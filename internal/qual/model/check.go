@@ -54,6 +54,9 @@ func (x *px) report(o out) {
 		if isMutation(r.Kind) {
 			x.ack(int(p.Req), o.seq)
 		}
+		if h := &x.s.Ents[x.e].Head; r.Kind == kDelete && x.s.Ents[x.e].HasHead && !(h.Deleted && h.Gen == want(r)) && h.Gen <= want(r) {
+			x.fail("%s acknowledged, but incarnation %d is live (head revision %d)", x.name(), want(r), h.Rev)
+		}
 		if r.Kind == kRead && o.seq != o.img.Seq {
 			x.fail("G2: read returned version %d for an image at sequence %d", o.seq, o.img.Seq)
 		}
@@ -77,6 +80,10 @@ func (x *px) report(o out) {
 	case cIDExpired:
 		if o.hasImg && r.TS > o.img.Floor {
 			x.fail("G5: id_expired above the floor")
+		}
+	case cNotFound:
+		if !p.SawTomb {
+			x.fail("%s answered not_found, but its incarnation was never a tombstone during the call", x.name())
 		}
 	case cIDConflict:
 		if o.hasImg {
@@ -172,7 +179,12 @@ func (x *px) ack(q int, seq int8) {
 		return // an administrator deleted the head: outside the durability contract
 	}
 	img := &en.Head.Img
-	if !en.HasHead || seq < 1 || seq > img.Seq || img.Ops[seq-1] != int8(q+1) {
+	has := en.HasHead && seq >= 1 && seq <= img.Seq && img.Ops[seq-1] == int8(q+1)
+	gen := en.Head.Gen
+	if !has || en.Head.Deleted { // committed, then its incarnation deleted: outside G1's scope (D25)
+		gen = 0
+	}
+	if gen == 0 && x.s.Ghost[x.e].Gone&(1<<q) == 0 {
 		x.fail("G1: %s acknowledged at sequence %d but the current head %s does not contain it", x.name(), seq, imgString(img))
 		return
 	}
@@ -184,7 +196,7 @@ func (x *px) ack(q int, seq int8) {
 			x.fail("G5: two inputs acknowledged for operation ID %d", x.c.Reqs[q].ID)
 		}
 	}
-	x.s.Acked[q] = seq
+	x.s.Acked[q], x.s.AckGen[q] = seq, gen
 }
 
 func (x *px) name() string {

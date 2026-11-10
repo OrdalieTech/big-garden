@@ -80,6 +80,18 @@
 // route_changed. A misrouted mutation costs a takeover and an activation
 // (about 5x a routed one); reads need no routing.
 //
+// # Deletion
+//
+// Delete, on the owner, ends a Ref's incarnation: its head becomes a
+// tombstone, and every object of the incarnation is deleted before Delete
+// returns nil. Every operation on the Ref is then CodeNotFound, on every
+// Node; Delete again only finishes the erasure, so retry it after any error.
+// Create or Import on the key starts a new incarnation with nothing of the
+// old one, and the old Ref gets CodeIncarnationMismatch. Receipts end with
+// their incarnation: a Create retried after the Delete creates the key
+// again, so a caller that may redeliver a Create uses a fresh key or checks
+// first. The tombstone (at most 64 KiB) stays: keys are not reclaimed.
+//
 // # Callbacks
 //
 // A callback runs while the entity's gate is held: it must not call the

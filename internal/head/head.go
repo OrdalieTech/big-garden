@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -132,6 +133,9 @@ type Head struct {
 	Snapshot         Ref      `json:"snapshot"`
 	Deltas           []Ref    `json:"deltas"`
 	Tail             *Tail    `json:"tail"`
+	// Deleted marks a tombstone (Delete): no owner, no tail, refs and data
+	// fields as they were; only a recreation may replace it (DECISIONS D25).
+	Deleted bool `json:"deleted"`
 }
 
 // Owner identifies the session allowed to publish; nil in a Head means
@@ -301,6 +305,9 @@ func (h *Head) Validate() error {
 	if err := ValidKey(h.Key); err != nil {
 		return err
 	}
+	if h.Deleted && (h.Owner != nil || h.Tail != nil) {
+		return errors.New("tombstone with an owner or a tail")
+	}
 	if h.Owner != nil {
 		if err := ValidNode(h.Owner.Node); err != nil {
 			return err
@@ -341,7 +348,7 @@ func (h *Head) Validate() error {
 		}
 		next, chk = r.MaxSequence+1, r.PostChecksum
 	}
-	if next-1 != h.Sequence || chk != h.DatabaseChecksum {
+	if !h.Deleted && (next-1 != h.Sequence || chk != h.DatabaseChecksum) { // a tombstone dropped its tail
 		return errors.New("chain does not end at the head's sequence and checksum")
 	}
 	return nil
@@ -380,7 +387,11 @@ func (r Ref) span(maxBytes uint64) error {
 // owner changes, data changes only by the unchanged owner, the tail carried
 // byte-identical unless the data changes or a snapshot (no deltas) empties it,
 // and the no-resurrection rule: every ref is carried over unchanged from prev
-// or was produced under base revision prev.Revision.
+// or was produced under base revision prev.Revision. A tombstone (D25) is
+// release-shaped with its refs unchanged and no tail; only a recreation
+// replaces it: a new incarnation's genesis (Create or Import: one snapshot,
+// no deltas, no tail) at revision and epoch +1, with its snapshot produced
+// under the tombstone's revision.
 func Successor(prev, next *Head) error {
 	if prev == nil { // genesis (Create or Import): revision 1, epoch 1, an owner, no deltas or tail, snapshot at base 0
 		if next.Revision != 1 || next.Epoch != 1 || next.Owner == nil || len(next.Deltas) != 0 || next.Tail != nil ||
@@ -388,6 +399,17 @@ func Successor(prev, next *Head) error {
 			return errors.New("not a genesis head")
 		}
 		return nil
+	}
+	if prev.Deleted {
+		if next.Deleted || next.Namespace != prev.Namespace || next.Key != prev.Key || next.Incarnation == prev.Incarnation ||
+			next.Revision != prev.Revision+1 || next.Epoch != prev.Epoch+1 || next.Owner == nil ||
+			len(next.Deltas) != 0 || next.Tail != nil || next.Snapshot.BaseRevision != prev.Revision {
+			return errors.New("a tombstone is replaced only by a recreation")
+		}
+		return nil
+	}
+	if next.Deleted && (prev.Owner == nil || next.Snapshot != prev.Snapshot || !slices.Equal(next.Deltas, prev.Deltas)) {
+		return errors.New("a tombstone replaces an owned head and keeps its refs")
 	}
 	sameOwner := (prev.Owner == nil && next.Owner == nil) ||
 		(prev.Owner != nil && next.Owner != nil && *prev.Owner == *next.Owner)
@@ -405,7 +427,7 @@ func Successor(prev, next *Head) error {
 	case next.Sequence == prev.Sequence && (next.Schema != prev.Schema ||
 		next.DatabaseChecksum != prev.DatabaseChecksum || next.PageCount != prev.PageCount):
 		return errors.New("data changed without a new sequence")
-	case next.Sequence == prev.Sequence && !sameTail && !(next.Tail == nil && len(next.Deltas) == 0):
+	case next.Sequence == prev.Sequence && !sameTail && !(next.Tail == nil && (len(next.Deltas) == 0 || next.Deleted)):
 		return errors.New("tail changed without a new sequence or a snapshot")
 	case next.Sequence > prev.Sequence && (!sameOwner || next.Owner == nil):
 		return errors.New("data changed by a non-owner")

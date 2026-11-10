@@ -13,7 +13,7 @@ type world struct {
 }
 
 // coverage counts client outcomes by operation kind and code (random traces).
-type coverage [kCollect + 1][cSkip + 1]uint64
+type coverage [kDelete + 1][cSkip + 1]uint64
 
 // Model bounds. Messages in flight is a case parameter (PLAN §14); the others
 // are capacities of the model's fixed arrays.
@@ -81,15 +81,17 @@ const (
 	cStateMissing
 	cInvalid
 	cCallback
+	cNotFound
+	cIncMismatch
 	cSkip
 )
 
 var codeNames = [...]string{"", "ok", "replayed", "not_owner", "route_changed", "schema_mismatch",
 	"id_conflict", "id_expired", "absent_at_version", "outcome_unknown", "unavailable",
-	"state_missing", "invalid_argument", "callback_error", "skipped"}
+	"state_missing", "invalid_argument", "callback_error", "not_found", "incarnation_mismatch", "skipped"}
 
 var kindNames = [...]string{"", "create", "update", "migrate", "read", "lookup", "takeover",
-	"release", "compact", "collect"}
+	"release", "compact", "collect", "delete"}
 
 // Program counters. Each operation is a straight sequence of storage requests;
 // a PC names the reply a process is waiting for.
@@ -127,7 +129,6 @@ const (
 	pcColDel
 	pcCrBegin
 	pcCrHead
-	pcCrBirthX
 	pcCrReplay
 	pcCrBirth
 	pcCrList
@@ -135,6 +136,7 @@ const (
 	pcCrBirthCheck
 	pcCrPutObj
 	pcCrDone
+	pcDelDone
 )
 
 // out is what an operation returns to its client, with the image it was
@@ -291,10 +293,9 @@ func (x *px) run(ev, res uint8) {
 			x.resolved()
 			x.subret(sConflict)
 		case x.c.Reqs[c.Req-1].TS <= cur.Img.Floor: // the receipt may have been pruned: unknown for good
-			x.discard()
-			x.resolved()
-			x.p.Cur, x.p.Code = cur, cUnknown
-			x.subret(sDead)
+			x.unknownForGood(cur)
+		case cur.Gen != c.Next.Gen && (c.Genesis || cur.Rev != c.Base.Rev+1) && x.v != ReceiptAcrossIncarnation:
+			x.unknownForGood(cur) // another incarnation: ours may have committed, then been deleted
 		default:
 			x.dead(cur)
 		}
@@ -329,7 +330,7 @@ func (x *px) run(ev, res uint8) {
 		if !x.settled() {
 			return
 		}
-		if x.owned() {
+		if x.owned() && x.m.H.Gen == want(x.r) {
 			x.admit()
 			return
 		}
@@ -340,6 +341,13 @@ func (x *px) run(ev, res uint8) {
 			return
 		}
 		cur := p.Cur
+		if p.Kind == kDelete && cur.Deleted && cur.Gen == want(x.r) { // already deleted: collect again (idempotent)
+			x.wait(pcColList, Msg{Kind: mList, List: listCollect, Head: cur})
+			return
+		}
+		if x.gone(cur) {
+			return
+		}
 		x.dropStale(cur)
 		switch {
 		case x.mine(cur):
@@ -403,6 +411,9 @@ func (x *px) run(ev, res uint8) {
 			return
 		}
 		cur := p.Cur
+		if x.gone(cur) {
+			return
+		}
 		if x.v == FollowerStaleRead && x.m.HasImg && !x.mine(cur) { // control: a follower reads its file unchecked
 			x.readExec()
 			return
@@ -424,6 +435,9 @@ func (x *px) run(ev, res uint8) {
 			return
 		}
 		cur := p.Cur
+		if x.gone(cur) {
+			return
+		}
 		if !p.Flag { // the first fresh GET is the observed Route
 			p.Flag, p.ObsOwner, p.ObsSess, p.ObsEpoch = true, cur.Owner, cur.Sess, cur.Epoch
 		}
@@ -467,6 +481,9 @@ func (x *px) run(ev, res uint8) {
 	case pcRelGot:
 		if res == rNotFound {
 			x.finish(out{code: cStateMissing})
+			return
+		}
+		if x.gone(p.Cur) {
 			return
 		}
 		if !x.mine(p.Cur) {
@@ -543,22 +560,24 @@ func (x *px) run(ev, res uint8) {
 			x.getHead(pcCrHead)
 		}
 	case pcCrHead:
-		if res == rOK {
-			x.wait(pcCrBirthX, Msg{Kind: mGetBirth})
-			return
-		}
-		x.wait(pcCrBirth, Msg{Kind: mGetBirth})
-	case pcCrBirthX:
-		b := p.RBirth
 		switch {
-		case res != rOK:
-			x.finish(out{code: cStateMissing})
-		case b.Req == p.Req+1:
+		case res == rOK && p.Cur.Deleted: // recreation: a new incarnation by a CAS on the tombstone (D25)
+			p.Resume, p.Inc = false, x.fresh()
+			img := Image{Seq: 1, Schema: x.r.Schema, Kept: 1}
+			img.Ops[0] = p.Req + 1
+			if x.v == RecreateKeepsData { // control: the new incarnation continues the deleted one's image
+				img = p.Cur.Img
+				img.Ops[img.Seq] = p.Req + 1
+				img.Kept |= 1 << img.Seq
+				img.Seq++
+			}
+			x.discard()
+			x.m.HasImg, x.m.Img = true, img
+			x.crUpload()
+		case res == rOK: // the key exists: the receipt in its current state decides (§5 step 2)
 			x.wait(pcCrReplay, Msg{Kind: mGetObjs, Head: p.Cur})
-		case x.c.Reqs[b.Req-1].ID == x.r.ID:
-			x.finish(out{code: cIDConflict, def: true})
 		default:
-			x.finish(out{code: cInvalid, def: true})
+			x.wait(pcCrBirth, Msg{Kind: mGetBirth})
 		}
 	case pcCrReplay:
 		if res != rOK {
@@ -574,8 +593,8 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cIDConflict, img: img, hasImg: true, def: true})
 		case x.r.TS <= img.Floor:
 			x.finish(out{code: cIDExpired, img: img, hasImg: true, def: true})
-		default:
-			x.finish(out{code: cAbsent, img: img, hasImg: true, def: true})
+		default: // "key exists"
+			x.finish(out{code: cInvalid, def: true})
 		}
 	case pcCrBirth:
 		x.crBirth(res == rOK, p.RBirth)
@@ -634,9 +653,28 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cUnknown}) // after the birth, as above
 			return
 		}
-		next := Head{Inc: p.Inc, Rev: 1, Nonce: x.fresh(), Owner: int8(x.n + 1), Sess: x.self(),
+		next := Head{Inc: p.Inc, Gen: 1, Rev: 1, Nonce: x.fresh(), Owner: int8(x.n + 1), Sess: x.self(),
 			Epoch: 1, Img: x.m.Img, Snap: ref(p.O)}
+		if t := p.Cur; t.Deleted { // recreation: revision and epoch continue the tombstone's
+			next.Gen, next.Rev, next.Epoch = t.Gen+1, t.Rev+1, t.Epoch+1
+			x.publish(Cand{Kind: kCreate, Req: p.Req + 1, Att: p.O.Att, Base: t, Next: next}, pcCrDone)
+			return
+		}
 		x.publish(Cand{Kind: kCreate, Genesis: true, Req: p.Req + 1, Att: p.O.Att, Next: next}, pcCrDone)
+	case pcDelDone:
+		switch p.Res {
+		case sCommitted: // then Collect the tombstone, synchronously: nothing of its incarnation is live
+			x.discard()
+			if !p.Cur.Deleted { // another incarnation replaced it already
+				x.finish(out{code: cOK})
+				return
+			}
+			x.wait(pcColList, Msg{Kind: mList, List: listCollect, Head: p.Cur})
+		case sDead:
+			x.finish(out{code: p.Code, def: true})
+		default:
+			x.subFail()
+		}
 	default:
 		panic(fmt.Sprintf("model: bad pc %d", p.PC))
 	}
@@ -657,6 +695,8 @@ func (x *px) start() {
 		x.settle(pcTkBegin)
 	case kRelease:
 		x.settle(pcRelBegin)
+	case kDelete:
+		x.settle(pcUpdBegin)
 	case kCompact: // maintenance: owner, under the gate, nothing unresolved
 		i := -1
 		if !x.m.Unres && x.owned() {
@@ -801,6 +841,24 @@ func (x *px) resolveGot(res uint8) {
 	switch { // every proposal is dead
 	case c.Att != 0 && refs(&cur, c.Att):
 		x.commit(cur, opSeq(c))
+	case c.Kind == kDelete && x.v == DeleteAsRelease: // control: a lost delete judged like a release
+		if !x.mine(cur) {
+			x.commit(cur, 0)
+		} else {
+			x.dead(cur)
+		}
+	case c.Kind == kDelete: // done iff the incarnation is gone, by this delete or another
+		if cur.Deleted || cur.Gen != c.Next.Gen {
+			x.commit(cur, 0)
+		} else {
+			x.dead(cur)
+		}
+	case c.Req != 0 && cur.Deleted: // no receipt to read in a tombstone
+		if !c.Genesis && cur.Rev == c.Base.Rev+1 { // the tombstone took the candidate's revision
+			x.dead(cur)
+		} else {
+			x.unknownForGood(cur)
+		}
 	case c.Req != 0:
 		x.wait(pcResHyd, Msg{Kind: mGetObjs, Head: cur})
 	case c.Kind == kTakeover && x.mine(cur):
@@ -845,12 +903,49 @@ func (x *px) repropose() {
 func (x *px) commit(cur Head, seq int8) {
 	x.resolved()
 	x.p.Cur, x.p.Seq = cur, seq
-	if x.m.HasImg && x.m.Img == cur.Img {
+	if x.m.HasImg && x.m.Img == cur.Img && !cur.Deleted {
 		x.m.HasH, x.m.H = true, cur
 	} else {
 		x.discard()
 	}
 	x.subret(sCommitted)
+}
+
+// unknownForGood settles a candidate whose outcome no stored state can tell:
+// outcome_unknown, nothing unresolved left (every proposal is dead).
+func (x *px) unknownForGood(cur Head) {
+	x.discard()
+	x.resolved()
+	x.p.Cur, x.p.Code = cur, cUnknown
+	x.subret(sDead)
+}
+
+// want is the incarnation ordinal a request's Ref names.
+func want(r Req) int8 { return max(r.Gen, 1) }
+
+// gone finishes an operation whose fresh head is not its Ref's live
+// incarnation: incarnation_mismatch, or not_found on its tombstone (D25).
+func (x *px) gone(cur Head) bool {
+	switch {
+	case cur.Gen != want(x.r):
+		x.finish(out{code: cIncMismatch, def: true})
+	case cur.Deleted:
+		x.finish(out{code: cNotFound, def: true})
+	default:
+		return false
+	}
+	return true
+}
+
+// tombstone is Delete's candidate: release-shaped, with no tail (D25).
+func (x *px) tombstone() {
+	h := x.m.H
+	next := h
+	next.Owner, next.Sess, next.Deleted, next.Tail = 0, 0, true, Tail{}
+	next.Epoch++
+	next.Rev++
+	next.Nonce = x.fresh()
+	x.publish(Cand{Kind: kDelete, Base: h, Next: next}, pcDelDone)
 }
 
 func (x *px) dead(cur Head) {
@@ -926,6 +1021,10 @@ func (x *px) local(ni *Image, r Req, req int8) {
 // member (if one is queued) admitted against the leader's unpublished commit.
 func (x *px) admit() {
 	p, r := x.p, x.r
+	if r.Kind == kDelete {
+		x.tombstone()
+		return
+	}
 	img := x.m.Img
 	if code, seq := x.verdict(&img, r, p.Req); code != 0 { // state-dependent answer: barrier first
 		p.Pend, p.PendSeq = code, seq
@@ -1113,7 +1212,10 @@ func (x *px) birthMsg() Msg {
 
 func (x *px) crUpload() {
 	p := x.p
-	p.O = Obj{Att: x.fresh(), Inc: p.Inc, Min: 1, Max: 1, Snap: true, Present: true, Post: x.m.Img, Stamp: x.clock()}
+	p.O = Obj{Att: x.fresh(), Inc: p.Inc, Min: 1, Max: x.m.Img.Seq, Snap: true, Present: true, Post: x.m.Img, Stamp: x.clock()}
+	if p.Cur.Deleted { // a recreation's snapshot is produced against the tombstone
+		p.O.Base = p.Cur.Rev
+	}
 	p.Put = 0
 	x.wait(pcCrPutObj, Msg{Kind: mPutObj, Obj: p.O})
 }

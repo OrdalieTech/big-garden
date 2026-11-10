@@ -36,7 +36,7 @@ func deadlinePC(pc uint8) bool {
 // reportsState: the operation can return an answer computed from entity state,
 // so it keeps the ghost set of images that were the head during the call.
 func reportsState(k uint8) bool {
-	return k != kTakeover && k != kRelease && k != kCompact && k != kCollect
+	return k != kTakeover && k != kRelease && k != kCompact && k != kCollect && k != kDelete
 }
 
 func lane(k uint8) int {
@@ -146,8 +146,10 @@ func step(c *Case, v Variant, s *State, t Tr, cov *coverage) (bound uint8, viol 
 			p.Mb = q.More
 			s.Used[q.More-1]++
 		}
-		if s.Ents[e].HasHead && reportsState(q.Kind) {
-			p.Seen[0], p.NSeen = s.Ents[e].Head.Img, 1
+		if h := &s.Ents[e].Head; s.Ents[e].HasHead && h.Deleted {
+			p.SawTomb = h.Gen == want(q)
+		} else if s.Ents[e].HasHead && reportsState(q.Kind) {
+			p.Seen[0], p.NSeen = h.Img, 1
 		}
 		x := w.px(n, e, l)
 		x.run(evStart, 0)

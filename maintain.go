@@ -138,11 +138,17 @@ func (n *Node) Collect(ctx context.Context, ref Ref) error {
 	if err != nil {
 		return err
 	}
-	live := map[string]bool{h.Snapshot.Key: true}
-	for _, d := range h.Deltas {
-		live[d.Key] = true
+	return n.reap(ctx, h)
+}
+
+// reap is Collect against h. Nothing of a tombstone is live: one pass erases
+// its incarnation (D25).
+func (n *Node) reap(ctx context.Context, h *head.Head) error {
+	live := map[string]bool{}
+	for _, r := range append([]head.Ref{h.Snapshot}, h.Deltas...) {
+		live[r.Key] = !h.Deleted
 	}
-	prefix := head.ObjectPrefix(ref.Key, h.Incarnation)
+	prefix := head.ObjectPrefix(h.Key, h.Incarnation)
 	for after := ""; ; {
 		page, more, err := n.st.List(ctx, prefix, after, 1000)
 		if err != nil {
@@ -151,6 +157,7 @@ func (n *Node) Collect(ctx context.Context, ref Ref) error {
 		for _, o := range page {
 			after = o.Key
 			if base, _, _, err := head.ParseObjectKey(prefix, o.Key); err == nil && base < h.Revision && !live[o.Key] {
+				failpoint("collect.del")
 				switch err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) {
 				case store.OK:
 					n.counters.collected.Add(1)

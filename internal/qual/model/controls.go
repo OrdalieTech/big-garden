@@ -18,6 +18,12 @@ func controlCase(v Variant) *Case {
 		return caseBR()
 	case FollowerStaleRead:
 		return caseF()
+	case DeleteAsRelease:
+		return caseDT()
+	case ReceiptAcrossIncarnation:
+		return caseDU()
+	case RecreateKeepsData:
+		return caseDR()
 	}
 	return caseP()
 }

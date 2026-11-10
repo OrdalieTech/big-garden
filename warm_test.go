@@ -20,7 +20,7 @@ import (
 
 // warmNode opens a node on mem with its cache in dir, so a later node can
 // find the warm tier an earlier one left there (D21).
-func warmNode(t *testing.T, mem *storetest.Mem, id, dir string, mod func(*Limits)) *Node {
+func warmNode(t *testing.T, mem store.Store, id, dir string, mod func(*Limits)) *Node {
 	t.Helper()
 	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: id, CacheDir: dir,
 		Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}

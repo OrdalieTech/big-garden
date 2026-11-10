@@ -8,7 +8,7 @@ The exact steps every operation implements. PLAN.md is the contract and DECISION
 - `GET`, `PUT_IMM`, `CAS`, `LIST`, `DEL` are the `internal/store` methods; outcomes are `store.Outcome`. Keys below are namespace-relative; the S3 adapter prefixes `<Config.Prefix>/`.
 - Reads and `PUT_IMM` retry `Unknown` with full jitter until the operation deadline (the S3 adapter does this inside `Get` and `PutImmutable`). `CAS` makes one SDK attempt; an identical hedge (same bytes, same condition) is sent once the first has been outstanding for `StorageAttemptTimeout/2` (D3). Anything but `OK` from `CAS` goes to `resolve` (§2).
 - "Strict decode" = `head.Decode` / `DecodeBirth` / `DecodeNamespace`, then identity checks: `namespace` equals the Node's, `key` equals the requested key, `incarnation` equals `Ref.Incarnation` (else `incarnation_mismatch`).
-- Head missing: if `birth.json` exists, `state_missing`; else `not_found`.
+- Head missing: if `birth.json` exists, `state_missing`; else `not_found`. A tombstone (`deleted`, D25) of the Ref's incarnation is `not_found` too, after the incarnation check; on seeing one, a node discards its local image and deletes its warm file.
 - "Discard" (D10) = close the connection, delete the entity's db, `-wal`, `-shm` files, drop the cached head. The next access rehydrates (§4).
 - "Proven after `t0`" (D23): `e.valid`, the issue time of the request that last proved `e.H` current (a GET or 304 of it, the CAS that published it, the resolve GET that found it; cleared with `e.H`), is after `t0`, and the local image is exactly `e.H` (`Published() = imageOf(H)`). An operation invoked at `t0` that finds `e.H` proven after `t0` skips the GET of §3 step 2 and of a barrier: the proving request was answered (or applied) inside the call.
 - "Barrier" = §3 steps 2–3 (fresh conditional head GET, unless `e.H` is proven after the operation's start). Required before returning any state-dependent answer that is not a successful CAS (replays, `id_conflict`, `schema_mismatch`, `id_expired` by floor, callback errors). If the head changed, redo the operation from its activation step once, then return `route_changed`.
@@ -55,6 +55,8 @@ Head field transitions (`=` unchanged; refs `=` includes the tail byte-identical
 | migrate | = self | = | +1 | `to` | as update |
 | takeover | self | +1 | = | = | = |
 | release | null | +1 | = | = | = |
+| delete (tombstone, `deleted` true) | null | +1 | = | = | refs =, tail null |
+| recreation (on a tombstone) | self | +1 | 1 / exported+1 | Request.Schema | new incarnation: snapshot at base `revision`, no deltas, no tail |
 | compaction | = self | = | = | = | run of 8 deltas replaced by one delta (level+1) at base `revision`; tail = |
 | snapshot | = self | = | = | = | new snapshot at base `revision`, no deltas, tail null |
 
@@ -76,7 +78,8 @@ A candidate is `{base *Head (nil for genesis), baseETag, next Head, nonces []ID,
 3. If `base == nil` or `cur.revision > base.revision`, every proposal is dead (their condition can never hold again). Then:
    - `c.object` is referenced by `cur`: committed (only our transition could introduce it). The tail is not an object and never proves anything here. A maintenance candidate (object, no op) whose object is not referenced is not committed.
    - else `c.op != nil` (always the case for an inline-tail mutation): hydrate `cur` (§4) and look up the receipt: same `bound` → committed (return the stored result); other `bound` → `id_conflict`; absent with `ts(op) ≤ meta.expiry_floor_ms` of `cur`'s image → a newer owner may have pruned the receipt (or a snapshot or compaction dropped our object), so the outcome is unknown for good: discard; `unresolved = nil` (every proposal is dead); return `outcome_unknown` (a retry then gets `id_expired`); absent otherwise → not committed.
-   - else takeover: committed iff `cur.owner == self`; release: done iff `cur.owner != self`.
+   - else delete: done iff `cur` is a tombstone or of another incarnation (by this delete or another, D25); takeover: committed iff `cur.owner == self`; release: done iff `cur.owner != self`.
+   - The receipt check never reads a tombstone, and an absent receipt in another incarnation proves nothing (D25): if `cur` is a tombstone, or of another incarnation with the receipt absent, `c` is not committed only if `cur.revision = base.revision + 1` (the new head took `c`'s revision); otherwise its incarnation may have committed it and been deleted since: discard; `unresolved = nil`; `outcome_unknown`.
    - Not committed: discard; `unresolved = nil`; return `not_owner` with `cur`'s Route if `cur.owner != self`, else `route_changed`.
 4. `cur` is still the base (same nonce, or still absent): if this call of `resolve` has sent fewer than two re-proposals (so a publication sends at most three proposals, and each later `resolve` at most two more), set `next.nonce = NewID()`, append it, `CAS(encode(next), baseETag)`; `OK` → committed. Back off, loop.
 5. Deadline: return `outcome_unknown`; `e.unresolved` stays set. Exception: if the only proposal `c` sent was answered by every request (412 or `Failed`, none `Unknown`) and `c.op == nil` (takeover, release, fence, maintenance), `c` is definitely not committed and no other node can hold its effect, so only the reread failed: discard; `unresolved = nil`; return `unavailable` (PLAN §8.2 "first and only head CAS returned a definite precondition rejection"). A candidate with an operation stays unknown: another node may have committed the same operation ID. Any other failure while `e.unresolved` stays set (a head that fails strict decode, hydration for the receipt check failing with `unavailable`, `capacity` or `corrupt`) is also returned as `outcome_unknown`, never as a code that means "not committed"; only rule 1's `state_missing` keeps its own code. Every later operation on the entity runs `resolve(e.unresolved)` first; while it stays unresolved, the same operation ID gets `outcome_unknown`, others `unavailable`.
@@ -95,7 +98,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 
 `Lookup(ref, id)` and `Export` (§11) use the same steps on any node. `Lookup(ref, id)`: steps 1–4, then read `_state_receipts` for `id`. Found: `Result{result, Version{inc, receipt.sequence}, Replayed: true}`. Absent: `ts(id) ≤ meta.expiry_floor_ms` → `id_expired`, else `absent_at_version` with `At = Version{inc, H.sequence}`.
 
-`Resolve(key)`: `GET head` (fresh), strict decode, return `Route{Ref{key, inc}, owner or zero, epoch, revision}`.
+`Resolve(key)`: `GET head` (fresh), strict decode, a tombstone is `not_found` (D25), return `Route{Ref{key, inc}, owner or zero, epoch, revision}`.
 
 ## 4. Activation (cold restore of exactly head `H`, PLAN §9.3)
 
@@ -111,7 +114,7 @@ After committed: if the local image is the candidate's, `PRAGMA wal_checkpoint(T
 ## 5. Create(key, req, fn) (PLAN §6.3, D5, D11)
 
 1. Validate key and request (nonzero ID and hash, schema > 0, `ts(ID) ≤ now+5 min`, `ts(ID) > now − ReceiptRetention`). `bound` with kind 1.
-2. `GET head`. Exists: strict decode, `GET birth`. Birth has `operation_id = ID` and `input_hash = bound`: barrier, read the receipt (§3 Lookup) and return it `Replayed`. Same ID, other hash: `id_conflict`. Else `invalid_argument` ("key exists") with the Route.
+2. `GET head`. Exists and not a tombstone: strict decode; the current state (§3 steps 2–4, any node) decides: a receipt of `ID` with `bound` is returned `Replayed`, with another bound `id_conflict`; else `invalid_argument` ("key exists") with the Route. (Not `birth.json`: a recreation's create is not in it.) A tombstone `T` (D25): Collect it (§10, against `T`), `inc = NewID()`, then steps 4, 6–8 with no birth PUT (`birth.json` stays the first incarnation's; with a head present there is no birth-without-head window, so step 5's `outcome_unknown` rule does not apply), the snapshot at base `T.revision`, and `next` at revision `T.revision+1`, epoch `T.epoch+1`, published with `base = T` (`If-Match`), not `If-None-Match: *`.
 3. `GET birth`.
    - Exists with the same ID and bound (D5 resume): `LIST entities/<h>/objects/`; any key that does not parse under `ObjectPrefix(key, birth.incarnation)` or has base revision > 0 → `state_missing`. (Complete with D16: a head with data beyond genesis always references an object at base ≥ 1, since a tail requires one.) `inc = birth.incarnation`.
    - Exists otherwise: `id_conflict` if same ID, else `state_missing`.
@@ -158,6 +161,8 @@ Implicit takeover (D4) is steps 5–7 from inside Update/Migrate (never a read, 
 
 `Release(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); use `H` if owned, else `GET head`; `owner ≠ self` → return nil. `next = H` with owner null, epoch+1 (tail preserved); `publish`; then discard. Dead with `cur.owner ≠ self` → nil.
 
+`Delete(ref)` (D25): lock; settle `unresolved` (still unknown → `outcome_unknown`); a mutation's ownership (§6 step 2, D4 included; a tombstone is `not_found`); `next = H` with `deleted`, owner null, tail null, epoch+1 (refs, sequence, schema, checksum unchanged); `publish`; discard and delete the warm file; unlock; Collect against `next` (§10: nothing is live, one pass erases the incarnation). `not_found` from the ownership step: Collect (§10) and return its result, so a retry after any failure finishes the erasure and a Delete of a deleted incarnation returns nil.
+
 `Evict(ref)`: lock; settle `unresolved` (still unknown → `outcome_unknown`); discard (D10) and delete its warm file (D21); forget the entity. Ownership is unchanged: this session may activate it again.
 
 Entity lifetime (PLAN §11.2): every operation (and each maintenance step) holds a reference to the entity struct, counted under the node mutex. A local image of a head this session does not own stays resident like an owned one (D24: a follower's reads revalidate it); it counts in `ResidentEntities` and `CacheBytes` and is parked by the cache policy. When the last reference goes, or the sweeper finds it unreferenced, an entity that is neither resident nor unresolved leaves the node's map; the next operation on the key starts from a new struct. Since a struct leaves only while no operation holds it, one mutex still serializes every operation on the key.
@@ -187,7 +192,7 @@ After a committed step, once the gate is released, the owner runs Collect (§10)
 
 ## 10. Collect(ref) (PLAN §9.2), any node, no SQLite
 
-1. `GET head` fresh, strict decode; `R = revision`; `live` = snapshot and delta keys (the tail is not an object).
+1. `GET head` fresh, strict decode; `R = revision`; `live` = snapshot and delta keys (the tail is not an object), none for a tombstone (D25). Delete and recreation run steps 2–4 against the tombstone they published or found.
 2. `LIST ObjectPrefix(key, inc)` in pages, at most 1000 objects per call.
 3. Eligible iff `ParseObjectKey` succeeds, `base < R` and key ∉ `live`. Unparseable keys and other incarnations are never deleted, nor are namespace, birth or head.
 4. `DEL` each eligible object; `Unknown` is left for a later pass.

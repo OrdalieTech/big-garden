@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -72,7 +73,7 @@ func TestRoundTrip(t *testing.T) {
 	if b2 := mustEncode(t, got); !bytes.Equal(b, b2) {
 		t.Fatalf("re-encode differs:\n%s\n%s", b, b2)
 	}
-	if !bytes.HasSuffix(b, []byte(`],"tail":null}`)) {
+	if !bytes.HasSuffix(b, []byte(`],"tail":null,"deleted":false}`)) {
 		t.Fatalf("absent tail not encoded as null: %s", b)
 	}
 	tb := mustEncode(t, tailFixture())
@@ -105,14 +106,14 @@ func TestGolden(t *testing.T) {
 		`"codec":"ltx-v3","page_size":4096,"page_count":128,"database_checksum":"8000000000000011",` +
 		`"snapshot":{"key":"` + h.Snapshot.Key + `","sha256":"` + h.Snapshot.SHA256.String() + `","bytes":4097,` +
 		`"base_revision":0,"min_sequence":1,"max_sequence":10,"pre_checksum":"0000000000000000",` +
-		`"post_checksum":"8000000000000011","level":0},"deltas":[],"tail":null}`
+		`"post_checksum":"8000000000000011","level":0},"deltas":[],"tail":null,"deleted":false}`
 	if got := string(mustEncode(t, h)); got != want {
 		t.Fatalf("canonical encoding changed:\n got %s\nwant %s", got, want)
 	}
 	tf := tailFixture()
 	tf.Tail = tail(14, 15, ChecksumFlag|0x33, ChecksumFlag|0x55, 4)
 	want = `,"tail":{"sha256":"` + tf.Tail.SHA256.String() + `","bytes":4,"min_sequence":14,"max_sequence":15,` +
-		`"pre_checksum":"8000000000000033","post_checksum":"8000000000000055","data":"DhUcIw=="}}`
+		`"pre_checksum":"8000000000000033","post_checksum":"8000000000000055","data":"DhUcIw=="},"deleted":false}`
 	if got := string(mustEncode(t, tf)); !strings.HasSuffix(got, want) {
 		t.Fatalf("canonical tail encoding changed:\n got %s\nwant suffix %s", got, want)
 	}
@@ -183,13 +184,14 @@ func TestDecodeRejectsNonCanonicalTail(t *testing.T) {
 	}
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 	for name, b := range map[string]string{
-		"missing tail":   strings.Replace(plain, `,"tail":null`, ``, 1),
-		"empty tail":     strings.Replace(plain, `"tail":null`, `"tail":{}`, 1),
-		"tail unknown":   strings.Replace(good, `"data":`, `"level":0,"data":`, 1),
-		"tail duplicate": strings.Replace(good, `"bytes":100,`, `"bytes":100,"bytes":100,`, 1),
-		"data null":      func() string { i, j := data(good); return good[:i-1] + "null" + good[j+1:] }(),
-		"data unpadded":  strings.Replace(good, `=="}}`, `"}}`, 1),
-		"data newline":   func() string { i, _ := data(good); return good[:i+4] + `\n` + good[i+4:] }(),
+		"missing tail":    strings.Replace(plain, `,"tail":null`, ``, 1),
+		"empty tail":      strings.Replace(plain, `"tail":null`, `"tail":{}`, 1),
+		"tail unknown":    strings.Replace(good, `"data":`, `"level":0,"data":`, 1),
+		"tail duplicate":  strings.Replace(good, `"bytes":100,`, `"bytes":100,"bytes":100,`, 1),
+		"data null":       func() string { i, j := data(good); return good[:i-1] + "null" + good[j+1:] }(),
+		"data unpadded":   strings.Replace(good, `=="}`, `"}`, 1),
+		"missing deleted": strings.Replace(plain, `,"deleted":false`, ``, 1),
+		"data newline":    func() string { i, _ := data(good); return good[:i+4] + `\n` + good[i+4:] }(),
 		"data url-safe": func() string {
 			i, j := data(good)
 			return good[:i] + strings.NewReplacer("+", "-", "/", "_").Replace(good[i:j]) + good[j:]
@@ -606,6 +608,85 @@ func TestSuccessor(t *testing.T) {
 	}
 }
 
+// TestTombstone: a tombstone (D25) is release-shaped with its refs unchanged
+// and no tail; only a recreation, a new incarnation's genesis at revision and
+// epoch +1 with its snapshot produced under the tombstone's revision, may
+// replace it.
+func TestTombstone(t *testing.T) {
+	prev, tprev := fixture(), tailFixture()
+	del := func(p Head) Head {
+		n := p
+		n.Revision, n.Nonce, n.Epoch, n.Owner, n.Tail, n.Deleted = 6, id(5), 3, nil, nil, true
+		return n
+	}
+	for name, p := range map[string]Head{"plain": prev, "with tail": tprev} {
+		n := del(p)
+		if err := n.Validate(); err != nil {
+			t.Fatalf("%s tombstone invalid: %v", name, err)
+		}
+		if err := Successor(&p, &n); err != nil {
+			t.Errorf("%s tombstone rejected: %v", name, err)
+		}
+		if b, err := Decode(mustEncode(t, n)); err != nil || !b.Deleted {
+			t.Errorf("%s tombstone round trip: %v", name, err)
+		}
+	}
+	tomb := del(prev)
+	if n := tomb; true {
+		n.Owner = prev.Owner
+		if n.Validate() == nil {
+			t.Error("tombstone with an owner valid")
+		}
+		n = del(tprev)
+		n.Tail = tprev.Tail
+		if n.Validate() == nil {
+			t.Error("tombstone with a tail valid")
+		}
+	}
+	rec := func() Head {
+		n := fixture()
+		inc := id(7)
+		n.Incarnation, n.Revision, n.Nonce, n.Epoch, n.Sequence, n.Schema = inc, 7, id(8), 4, 1, 1
+		n.Snapshot = ref(n.Key, inc, 6, 1, 1, 0, ChecksumFlag|0x77, 0)
+		n.Deltas, n.DatabaseChecksum, n.Owner = nil, ChecksumFlag|0x77, &Owner{Node: "node-c", Session: id(9)}
+		return n
+	}
+	if n := rec(); n.Validate() != nil || Successor(&tomb, &n) != nil {
+		t.Errorf("recreation rejected: %v %v", n.Validate(), Successor(&tomb, &n))
+	}
+	bad := map[string]struct {
+		prev Head
+		next func() Head
+	}{
+		"tombstone of a released head": {func() Head { p := prev; p.Owner = nil; return p }(), func() Head { return del(prev) }},
+		"tombstone adds a ref": {prev, func() Head {
+			n := del(prev)
+			n.Deltas = append(slices.Clone(n.Deltas), ref(n.Key, n.Incarnation, 5, 14, 14, n.DatabaseChecksum, ChecksumFlag|0x44, 0))
+			n.Sequence, n.DatabaseChecksum = 14, ChecksumFlag|0x44
+			return n
+		}},
+		"tombstone without epoch":  {prev, func() Head { n := del(prev); n.Epoch = 2; return n }},
+		"tombstone of a tombstone": {tomb, func() Head { n := del(tomb); n.Revision, n.Nonce, n.Epoch = 7, id(8), 4; return n }},
+		"mutation of a tombstone": {tomb, func() Head {
+			n := tomb
+			n.Revision, n.Nonce, n.Epoch, n.Owner, n.Deleted = 7, id(8), 4, &Owner{Node: "node-c", Session: id(9)}, false
+			return n
+		}},
+		"recreation in place":       {tomb, func() Head { n := rec(); n.Incarnation = tomb.Incarnation; return n }},
+		"recreation with a tail":    {tomb, func() Head { n := rec(); n.Tail = tail(2, 2, n.DatabaseChecksum, n.DatabaseChecksum, 1); return n }},
+		"recreation at base 0":      {tomb, func() Head { n := rec(); n.Snapshot.BaseRevision = 0; return n }},
+		"recreation without epoch":  {tomb, func() Head { n := rec(); n.Epoch = 3; return n }},
+		"recreation skips revision": {tomb, func() Head { n := rec(); n.Revision = 8; return n }},
+		"recreation with deltas":    {tomb, func() Head { n := rec(); n.Deltas = prev.Deltas; return n }},
+	}
+	for name, b := range bad {
+		n := b.next()
+		if err := Successor(&b.prev, &n); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
 func FuzzHeadDecode(f *testing.F) {
 	h := fixture()
 	b, _ := h.Encode()
@@ -618,6 +699,10 @@ func FuzzHeadDecode(f *testing.F) {
 	f.Add(b)
 	h = tailFixture()
 	h.Tail = tail(14, 15, h.Tail.PreChecksum, h.DatabaseChecksum, 1)
+	b, _ = h.Encode()
+	f.Add(b)
+	h = fixture()
+	h.Owner, h.Epoch, h.Deleted = nil, 3, true
 	b, _ = h.Encode()
 	f.Add(b)
 	f.Add([]byte(`{"format":1}`))
