@@ -125,3 +125,27 @@ The B=16 p95 tail (~300 ms remote) is the publications that also take the
 upload path or run maintenance under the gate. Reproduce with
 `qual stress --local --hot-only --hot 1,8,32 --ops 400 --batch {1,16}
 [--delay 25ms]` and `--remote ... --ops 200`.
+
+## From inside fr-par (2026-11-10, DEV1-S in fr-par-1, deleted afterwards)
+
+`qual doctor --remote --latency-samples=300` and `qual stress --remote --ops 400 --workers 8 --cold 10` on the instance, against bucket `monogram` under `qual-state/` (TCP connect to the endpoint 1.8 ms; artifacts/frpar). The provider's own latency dominates: a 4 KiB PUT is ~32 ms at p50 from inside the region.
+
+| Direct request | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| GET 4 KiB | 7.1 ms | 33.6 ms | 239 ms |
+| GET 32 KiB | 10.7 ms | 30 ms | 52 ms |
+| PUT 4 KiB | 31.9 ms | 62 ms | 256 ms |
+| conditional PUT (CAS) 4 KiB | 33.6 ms | 77.9 ms | 267 ms |
+
+| Library phase | in fr-par p50 / p95 / p99 | from the laptop p50 (2026-11-08) |
+|---|---|---|
+| inline update, sequential | 35.6 / 105 / 299 ms, 21.3/s | 38.3 ms |
+| inline update, 8 clients on 8 entities | 40.2 / 301 / 674 ms, 92/s | 40.0 ms |
+| upload update (48 KiB), sequential | 71.6 / 294 / 477 ms | 75.6 ms |
+| strong read, sequential | 4.0 / 10.3 / 284 ms | 7.6 ms |
+| strong read, 8 clients | 4.4 / 15.8 / 223 ms, 773/s | 7.4 ms |
+| cold activation, 1 MiB | 37.8 / 199 ms | 71 ms |
+| cold activation, 16 MiB | 158 / 223 ms | 581 ms |
+
+So in-region a mutation costs one conditional PUT (~34 ms) and a strong read one head GET (~4 ms); cold activation is bandwidth-bound and 3.7x faster than from outside the region. Every §18.2 remote target is met on this run. The p99 tails (~250-300 ms) are the provider's, as the direct requests show.
+
