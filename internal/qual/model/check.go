@@ -118,6 +118,16 @@ func (x *px) member(o out) {
 	r := x.c.Reqs[mb]
 	var m out
 	switch {
+	case r.Kind == kRead: // C11: a read queued behind the batch rides its publication
+		switch {
+		case o.code == cOK && x.m.HasH && x.m.HasImg && x.m.Img == x.m.H.Img: // proven by the CAS or resolve GET
+			m = readOut(x.m.Img, r)
+		case o.code == cUnknown && x.v == RideUnresolved: // control: the read trusts the unresolved candidate
+			m = readOut(x.m.C.Next.Img, r)
+		default: // nothing proven: the read runs on its own path later
+			x.s.Used[mb]--
+			return
+		}
 	case p.MbCode != 0: // held verdict
 		switch {
 		case o.code == cOK && !p.Proof:
@@ -146,7 +156,7 @@ func (x *px) member(o out) {
 	default:
 		m = out{code: o.code, def: o.def}
 	}
-	if m.code == cOK && !p.Proof && !p.Applied && !p.Acked {
+	if m.code == cOK && r.Kind == kUpdate && !p.Proof && !p.Applied && !p.Acked {
 		x.fail("D18: batch member r%d acknowledged although its publication #%d never committed", mb, p.CID)
 	}
 	q, lr := p.Req, x.r

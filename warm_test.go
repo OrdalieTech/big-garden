@@ -259,7 +259,7 @@ func TestWarmActivationCost(t *testing.T) {
 			}
 		}
 		park := func(n *Node) {
-			e, err := n.enter(bg, key, nil, nil)
+			e, err := n.enter(bg, key, nil, nil, false)
 			if err != nil {
 				t.Fatal(err)
 			}

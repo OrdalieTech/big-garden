@@ -42,9 +42,10 @@
 // # Ownership
 //
 // Update, Migrate, Read, Lookup and Export run only on the entity's owner
-// session. Reads too: they run on the owner's cache, validated by a head GET
-// issued after the call began, which makes them strong (linearizable) with
-// no read lease. A Node that does not own the entity, including an unowned
+// session. Reads too: they run on the owner's cache, validated by a head
+// request issued after the call began, which makes them strong
+// (linearizable) with no read lease. Concurrent reads share one such GET,
+// and reads queued behind a publication share its CAS. A Node that does not own the entity, including an unowned
 // one (after Release), gets CodeNotOwner with Error.Route set;
 // Takeover(*Error.Route) claims it, then retry the identical Request.
 // CodeRouteChanged means another session moved the entity first; its

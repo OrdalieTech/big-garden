@@ -67,8 +67,9 @@ func binding(kind byte, from, to uint32, hash [32]byte) head.Digest {
 // candidate settled first (PROTOCOL §2 rule 5), both within ctx. If it stays
 // unresolved, the same operation ID (or every caller, for a nil id) gets
 // outcome_unknown and others unavailable; a mutation whose ctx ends while
-// queued gets outcome_unknown, since the candidate may be its own.
-func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter) (*entity, error) {
+// queued gets outcome_unknown, since the candidate may be its own. A read
+// waits in readers too, so that it does not stop a batch (D23).
+func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter, read bool) (*entity, error) {
 	if err := head.ValidKey(key); err != nil {
 		return nil, invalid(err.Error())
 	}
@@ -81,6 +82,9 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter)
 		n.drop(e)
 		return nil, newError(CodeCapacity, "too many operations queued on the entity", nil)
 	}
+	if read {
+		e.readers.Add(1)
+	}
 	served, err := n.wait(ctx, e, m)
 	if served { // the leader that took m counted it out of waiting
 		n.drop(e)
@@ -90,6 +94,9 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter)
 		default: // a batch runs m: it may commit
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: *id, Message: "deadline while in a batch", cause: err}
 		}
+	}
+	if read {
+		e.readers.Add(-1)
 	}
 	e.waiting.Add(-1)
 	if err != nil {
@@ -133,10 +140,11 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter)
 }
 
 // owned makes e's cached head current enough, owned by this session and
-// activated (PROTOCOL §3 steps 2–4, §6 step 2). fresh forces the conditional
-// GET; otherwise a cached head owned by this session is used as is.
-func (n *Node) owned(ctx context.Context, e *entity, ref Ref, fresh bool) error {
-	if fresh || e.h == nil || !n.mine(e.h) || e.db == nil {
+// activated (PROTOCOL §3 steps 2–4, §6 step 2). A read invoked at t0 needs a
+// head proven current after t0 (D23), else the conditional GET; a mutation
+// (t0 zero) uses a cached head owned by this session as is.
+func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) error {
+	if e.h == nil || !n.mine(e.h) || e.db == nil || !t0.IsZero() && !e.current(t0) {
 		if err := n.fetch(ctx, e, ref.Incarnation, e.etag); err != nil {
 			return err
 		}
@@ -173,12 +181,18 @@ func (n *Node) claim(e *entity) error {
 	return err
 }
 
-// barrier revalidates the cached head (PROTOCOL §0). changed means the
-// caller redoes its operation from activation once.
-func (n *Node) barrier(ctx context.Context, e *entity) (changed bool, err error) {
+// barrier revalidates the cached head (PROTOCOL §0) for an operation
+// invoked at t0, with no GET if a later request proved it (D23). changed
+// means the caller redoes its operation from activation once.
+func (n *Node) barrier(ctx context.Context, e *entity, t0 time.Time) (changed bool, err error) {
+	if e.current(t0) {
+		return false, nil
+	}
+	issued := time.Now()
 	_, err = n.st.Get(ctx, head.HeadKey(e.key), e.etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
+		e.valid = issued
 		return false, nil
 	case store.OK:
 		e.discard()
@@ -270,12 +284,13 @@ func (n *Node) current(ctx context.Context, key string, inc head.ID) (*head.Head
 // (CodeNotOwner otherwise; see Ownership in the package doc).
 func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) ([]byte, error)) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
-	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil)
+	t0 := time.Now()
+	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil, true)
 	if err != nil {
 		return Result{}, err
 	}
 	defer n.leave(e)
-	if err := n.owned(ctx, e, ref, true); err != nil {
+	if err := n.owned(ctx, e, ref, t0); err != nil {
 		return Result{}, err
 	}
 	if e.h.Schema != schema {
@@ -294,16 +309,18 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 // requires ownership, like Read.
 func (n *Node) Lookup(ctx context.Context, ref Ref, id MutationID) (res Result, err error) {
 	defer func() { n.observe(ref.Key, true, res, err) }()
-	e, err := n.enter(ctx, ref.Key, &id, nil)
+	t0 := time.Now()
+	e, err := n.enter(ctx, ref.Key, &id, nil, false)
 	if err != nil {
 		return Result{}, err
 	}
 	defer n.leave(e)
-	return n.lookup(ctx, e, ref, id)
+	return n.lookup(ctx, e, ref, id, t0)
 }
 
-func (n *Node) lookup(ctx context.Context, e *entity, ref Ref, id MutationID) (Result, error) {
-	if err := n.owned(ctx, e, ref, true); err != nil {
+// lookup is Lookup invoked at t0.
+func (n *Node) lookup(ctx context.Context, e *entity, ref Ref, id MutationID, t0 time.Time) (Result, error) {
+	if err := n.owned(ctx, e, ref, t0); err != nil {
 		return Result{}, err
 	}
 	r, ok, err := e.db.Receipt(head.OpID(id))
@@ -364,7 +381,7 @@ type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
 // create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
 func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (ref Ref, res Result, err error) {
 	defer func() { n.observe(key, false, res, err) }()
-	e, err := n.enter(ctx, key, &req.ID, nil)
+	e, err := n.enter(ctx, key, &req.ID, nil, false)
 	if err != nil {
 		return Ref{}, Result{}, err
 	}
@@ -499,7 +516,7 @@ func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound h
 	switch {
 	case birth != nil && birth.OperationID == head.OpID(req.ID) && birth.InputHash == bound:
 		ref := Ref{e.key, birth.Incarnation}
-		res, err := n.lookup(ctx, e, ref, req.ID)
+		res, err := n.lookup(ctx, e, ref, req.ID, time.Now())
 		return ref, res, err
 	case birth != nil && birth.OperationID == head.OpID(req.ID):
 		return Ref{}, Result{}, &Error{Code: CodeIDConflict, Operation: req.ID, Message: "operation ID used with another input"}
@@ -570,12 +587,12 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 	if err := checkRequest(ref.Key, req); err != nil {
 		return Result{}, err
 	}
-	bound := binding(kind, req.Schema, to, req.Hash)
+	bound, t0 := binding(kind, req.Schema, to, req.Hash), time.Now()
 	var m *waiter
 	if kind == 2 && n.cfg.Limits.BatchMax > 1 {
 		m = &waiter{ctx: ctx, req: req, bound: bound, fn: fn, done: make(chan struct{})}
 	}
-	e, err := n.enter(ctx, ref.Key, &req.ID, m)
+	e, err := n.enter(ctx, ref.Key, &req.ID, m, false)
 	if err == errServed {
 		if m.panic != nil {
 			panic(m.panic)
@@ -587,7 +604,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 	}
 	defer n.leave(e)
 	for redo := 0; redo < 2; redo++ {
-		if err := n.owned(ctx, e, ref, redo > 0); err != nil {
+		if err := n.owned(ctx, e, ref, time.Time{}); err != nil { // a redo follows a discard: it GETs
 			return Result{}, withOp(err, req.ID)
 		}
 		if err := n.checkClock(ctx, req); err != nil { // admission starts with the clock (§6 step 3)
@@ -609,7 +626,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 			verdict = err
 		}
 		if verdict != nil || res != nil { // a state-dependent answer: barrier first
-			changed, err := n.barrier(ctx, e)
+			changed, err := n.barrier(ctx, e, t0)
 			if err != nil {
 				return Result{}, withOp(err, req.ID)
 			}
@@ -792,14 +809,15 @@ func (n *Node) wait(ctx context.Context, e *entity, m *waiter) (served bool, err
 
 // collect runs, after the leader's own transaction, the transactions of the
 // Updates queued on e in FIFO order, up to BatchMax members in all and only
-// while no other operation waits (PLAN §6.5: never pass a queued read,
-// migration or release). Each member keeps its outcome until the
-// publication resolves; an error means a library failure: discard all.
+// while every other waiting operation is a Read (PLAN §6.5: never pass a
+// queued migration or release; a queued read rides the batch's CAS, D23).
+// Each member keeps its outcome until the publication resolves; an error
+// means a library failure: discard all.
 func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 	for len(batch)+1 < n.cfg.Limits.BatchMax {
 		var m *waiter
 		e.qmu.Lock()
-		if len(e.queue) > 0 && e.waiting.Load() <= int64(len(e.queue)) {
+		if len(e.queue) > 0 && e.waiting.Load() <= int64(len(e.queue))+e.readers.Load() {
 			m, e.queue = e.queue[0], e.queue[1:]
 			e.waiting.Add(-1)
 		}

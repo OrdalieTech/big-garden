@@ -39,9 +39,9 @@ const all = 0xff
 // cases: C (Create, the D5 resume and an administrative head deletion at any
 // time: finding F1, accepted by D14), C0 (no deletion) and CD (deletion only
 // while no create of the key is in flight, D14's scope), and the group-commit
-// case B (D18).
+// case B (D18) and its read-member variant BR (C11).
 func Cases() []*Case {
-	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB()}
+	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB(), caseBR()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -181,6 +181,17 @@ func caseB() *Case {
 	}
 	c.Init = c.newState()
 	c.existing(&c.Init, 0, 0, nil, 0, true)
+	return c
+}
+
+// BR: reads ride a batch's publication (C11). B with the queued member a
+// read: r1 may run alone or with the read r2 queued behind it, which then
+// answers from the state r1's committed publication proved; r2 may also run
+// alone on either node; one takeover by n1, one crash, one hedge.
+func caseBR() *Case {
+	c := caseB()
+	c.Name = "BR"
+	c.Reqs[2] = Req{Kind: kRead, Nodes: 3, Tries: 2, Schema: 1}
 	return c
 }
 

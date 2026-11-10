@@ -288,6 +288,7 @@ const (
 	RetargetCompaction
 	TailWithoutObject
 	BatchLeaderReceipt
+	RideUnresolved
 	numVariants
 )
 
@@ -295,7 +296,7 @@ var variantNames = [...]string{
 	"correct", "unconditional-head-write", "owner-check-then-publish", "cached-strong-read",
 	"premature-ack", "floorless-receipt-pruning", "age-only-gc", "hedge-without-resolve",
 	"d5-resume-without-identity", "compaction-retargeted", "inline-tail-without-object",
-	"batch-ack-on-leader-receipt",
+	"batch-ack-on-leader-receipt", "read-rides-unresolved",
 }
 
 func (v Variant) String() string { return variantNames[v] }

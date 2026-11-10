@@ -294,33 +294,33 @@ func TestBatchCancellation(t *testing.T) {
 	}
 }
 
-// TestBatchNeverPassesRead: a read queued among Updates stops the batch, and
-// sees the leader's publication.
+// TestBatchNeverPassesRead: a read queued behind an Update member is not
+// passed and does not stop the batch (D23): it answers from the batch's
+// committed state, which the batch CAS proved, with no head GET of its own.
 func TestBatchNeverPassesRead(t *testing.T) {
-	mem := newStore(t)
-	n := batchNode(t, mem, nil)
+	st := newStore(t)
+	n := batchNode(t, st, nil)
 	ref := mustCreate(t, n, "k", nil)
 	release := make(chan struct{})
 	leader := hold(t, n, ref, newReq(t, "leader", 1), release)
 	o1 := enqueue(t, n, bg, ref, newReq(t, "f1", 1), put("a", "1"))
-	read := make(chan map[string]string, 1)
-	before := n.Stats().QueuedRequests
-	go func() { read <- readAll(t, n, ref) }()
-	for n.Stats().QueuedRequests != before+1 {
-		time.Sleep(time.Millisecond)
-	}
+	from := len(st.Journal())
+	read := queueReads(t, n, ref, 1)
 	close(release)
 	if o := <-leader; o.err != nil {
 		t.Fatal(o.err)
 	}
-	if b := n.Stats().Batches; b[0] < 1 || b[1] != 0 {
-		t.Fatalf("batch distribution %v: the leader passed a queued read", b)
+	if b := n.Stats().Batches; b[1] != 1 {
+		t.Fatalf("batch distribution %v: the queued read stopped the batch", b)
 	}
 	if o := <-o1; o.err != nil {
 		t.Fatal(o.err)
 	}
-	if rows := <-read; rows["l"] != "0" {
-		t.Fatalf("read %v misses the leader", rows)
+	if rows := <-read; rows["l"] != "0" || rows["a"] != "1" {
+		t.Fatalf("read %v misses the batch it waited behind", rows)
+	}
+	if g := headGets(st, "k", from); g != 0 {
+		t.Fatalf("the read made %d head GETs after the batch CAS proved the head", g)
 	}
 }
 

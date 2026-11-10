@@ -37,8 +37,10 @@ type entity struct {
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
 	building   bool         // under Node.mu: between room and unreserve, counted as resident
 	tried      time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
+	valid      time.Time    // issue time of the request that last proved h current: a GET, 304 or CAS (D23)
 	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
+	readers    atomic.Int64 // the Reads among them: they do not stop a batch (D23)
 	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
 	since      atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)
 }
@@ -90,8 +92,15 @@ func (e *entity) discard() {
 
 // clear drops the local image (closed) and the cached head.
 func (e *entity) clear() {
-	e.db, e.h, e.etag, e.pages = nil, nil, "", nil
+	e.db, e.h, e.etag, e.pages, e.valid = nil, nil, "", nil, time.Time{}
 	e.bytes.Store(0)
+}
+
+// current reports whether a request issued after t0 proved e.h current and
+// the local image is exactly e.h (D23): a strong read or a barrier invoked
+// at t0 then needs no GET of its own.
+func (e *entity) current(t0 time.Time) bool {
+	return e.valid.After(t0) && e.db != nil && e.db.Published() == imageOf(e.h)
 }
 
 // links are h's snapshot, deltas and tail, in order.
@@ -186,10 +195,11 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	ctx, cancel := n.commitContext()
 	defer cancel()
 	e.unresolved, c.nonces = c, []head.ID{c.next.Nonce}
-	e.since.Store(time.Now().UnixNano())
+	issued := time.Now()
+	e.since.Store(issued.UnixNano())
 	etag, unsure, err := n.cas(ctx, e, c)
 	if err == nil {
-		n.settle(e, c, &c.next, etag)
+		n.settle(e, c, &c.next, etag, issued)
 		return nil, nil
 	}
 	if !unsure { // definitely not committed (§2 step 5)
@@ -208,8 +218,8 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 
 // settle records a committed candidate (PROTOCOL §2, after committed): the
 // local image is checkpointed if it is the candidate's, and discarded if it
-// is not cur's.
-func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
+// is not cur's. issued is when the request that returned cur was sent.
+func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string, issued time.Time) {
 	e.resolved()
 	n.countCommit(c)
 	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
@@ -222,7 +232,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 		e.discard()
 	}
 	h := *cur              // a copy: cur may be &c.next, and c.base chains every earlier head
-	e.h, e.etag = &h, etag // kept even without a local image: the next access activates or revalidates it
+	e.h, e.etag, e.valid = &h, etag, issued // kept even without a local image: the next access activates or revalidates it
 	if e.db != nil {
 		e.bytes.Store(e.db.Bytes())
 	}
@@ -235,6 +245,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		if i > 0 && pause(ctx, rand.N(10*time.Millisecond<<min(i, 7))) != nil { // full jitter, 10 ms doubling to 1 s
 			return nil, &Error{Code: CodeOutcomeUnknown, Operation: opOf(c), Message: "publication outcome unknown", cause: ctx.Err()}
 		}
+		issued := time.Now()
 		obj, err := n.st.Get(ctx, head.HeadKey(e.key), "", head.MaxHeadBytes)
 		switch store.OutcomeOf(err) {
 		case store.OK:
@@ -243,10 +254,10 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 			case err != nil:
 				return nil, err
 			case slices.Contains(c.nonces, cur.Nonce):
-				n.settle(e, c, cur, obj.ETag)
+				n.settle(e, c, cur, obj.ETag, issued)
 				return nil, nil
 			case c.base == nil || cur.Revision > c.base.Revision:
-				return n.dead(ctx, e, c, cur, obj.ETag)
+				return n.dead(ctx, e, c, cur, obj.ETag, issued)
 			case cur.Nonce != c.base.Nonce:
 				return nil, newError(CodeCorrupt, "head revision went backwards", nil)
 			}
@@ -259,9 +270,9 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 		}
 		if len(c.nonces) < limit { // D12: re-propose with a fresh nonce under the same condition
 			c.next.Nonce = head.NewID()
-			c.nonces = append(c.nonces, c.next.Nonce)
+			c.nonces, issued = append(c.nonces, c.next.Nonce), time.Now()
 			if etag, _, err := n.cas(ctx, e, c); err == nil {
-				n.settle(e, c, &c.next, etag)
+				n.settle(e, c, &c.next, etag, issued)
 				return nil, nil
 			}
 		}
@@ -270,7 +281,7 @@ func (n *Node) resolve(ctx context.Context, e *entity, c *candidate) (*engine.Re
 
 // dead settles a candidate whose every proposal can no longer apply
 // (PROTOCOL §2 resolve step 3).
-func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head, etag string) (*engine.Receipt, error) {
+func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head, etag string, issued time.Time) (*engine.Receipt, error) {
 	committed := false
 	var rec *engine.Receipt
 	switch {
@@ -303,7 +314,7 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 		committed = n.mine(cur) == (c.next.Owner != nil)
 	}
 	if committed {
-		n.settle(e, c, cur, etag)
+		n.settle(e, c, cur, etag, issued)
 		return rec, nil
 	}
 	e.discard()
@@ -349,7 +360,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 				if h, gerr = n.decodeHead(obj.Body, e.key, h.Incarnation); gerr != nil {
 					return gerr
 				}
-				etag = obj.ETag
+				etag, e.valid = obj.ETag, time.Time{} // h is no longer the head e.valid proved
 				continue
 			case store.NotModified:
 				if errors.Is(err, engine.ErrCorrupt) {
