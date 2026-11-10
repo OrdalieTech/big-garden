@@ -97,7 +97,9 @@ func TestBatchKill(t *testing.T) {
 // killed process.
 func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, reuse bool, partial map[string]int) (tl tally, batches []uint64) {
 	t.Helper()
-	cache := t.TempDir()
+	var dirs []string
+	defer removeAll(&dirs)
+	cache := runDir(t, &dirs)
 	failpoint := fmt.Sprintf("%s:%d", mode, armAt)
 	var px *storetest.Proxy
 	hold := make(chan struct{})
@@ -275,7 +277,7 @@ func batchKillRun(t *testing.T, ep storetest.Endpoint, mode string, armAt int, r
 		}
 	}
 	if !reuse {
-		cache = t.TempDir()
+		cache = runDir(t, &dirs)
 	}
 	p = start(t, ep, cache, "")
 	defer p.stop()
