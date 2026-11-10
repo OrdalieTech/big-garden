@@ -129,6 +129,17 @@ Measured on local RustFS with Scaleway-like delays (GET +9 ms, PUT +35 ms),
   replays.
 - **`id_expired`.** The caller retried after `ReceiptRetention`; raise it if
   callers legitimately retry later.
+- **Deleting an entity.** `Delete(ref)` on the owner (`not_owner`: follow
+  the `Route`). It returns nil once the head is a tombstone and every object
+  of the incarnation is deleted; on any error, call it again with the same
+  `Ref` (anywhere a deleted entity's `Delete` or `Collect` only collects).
+  Afterwards the entity directory holds only `birth.json` and `head.json`,
+  which stay. Other nodes drop their local copy when they next touch the key;
+  a node that never does keeps its warm file until `CacheBytes` evicts it, so
+  for erasure delete the `CacheDir` of such nodes or `Evict` there too. With
+  bucket versioning on, noncurrent versions must expire (as for `Snapshot`).
+  A deleted key is recreated by `Create` or `Import`: a new incarnation with
+  its own receipts; a retried `Create` after the `Delete` recreates it.
 - **Storage growth.** `Collect` an entity to delete superseded objects; the
   owner already does after each compaction or snapshot.
 - **Credential rotation.** Swap the `*s3.Client` credentials provider; the

@@ -483,6 +483,9 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cStateMissing})
 			return
 		}
+		if x.gone(p.Cur) {
+			return
+		}
 		if !x.mine(p.Cur) {
 			x.finish(out{code: cOK})
 			return

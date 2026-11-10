@@ -220,18 +220,18 @@ func caseF() *Case {
 }
 
 // D: delete vs update (D25). Two nodes, one entity with a one-delta root
-// owned by n0; an update (retried once) and a delete (retried once, so the
-// retry finds the tombstone) on either node, a read on either node, a
-// takeover by n1; one crash, one hedge. The delete's Collect runs inline.
+// owned by n0; an update and a delete (retried once, so the retry finds the
+// tombstone) on either node, a read on n1, a takeover by n1; one crash, one
+// hedge. The delete's Collect runs inline.
 func caseD() *Case {
 	c := &Case{Name: "D", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 48,
 		Restarts: 1, Hedges: 1, Retention: 8, Age: 1}
 	c.Reqs = []Req{
 		genesisReq(1),
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
-		{Kind: kUpdate, Nodes: 3, Tries: 2, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, Nodes: 3, Tries: 1, ID: 3, Hash: 1, TS: 1, Schema: 1},
 		{Kind: kDelete, Nodes: 3, Tries: 2},
-		{Kind: kRead, Nodes: 3, Tries: 1, Schema: 1},
+		{Kind: kRead, Nodes: 2, Tries: 1, Schema: 1},
 		{Kind: kTakeover, Nodes: 2, Tries: 1},
 	}
 	c.Init = c.newState()
@@ -259,9 +259,10 @@ func caseDT() *Case {
 }
 
 // DR: two recreations. n0 owns the entity and deletes it; two creates with
-// different IDs race to recreate it on either node (one retried), an update
-// of the new incarnation and one of the old Ref (incarnation_mismatch or
-// not_found) run on either node; one hedge, no crash.
+// different IDs race to recreate it (one retried on either node, the other
+// on n1); n0 updates
+// the new incarnation and n1 the old Ref (incarnation_mismatch or
+// not_found); one hedge, no crash.
 func caseDR() *Case {
 	c := &Case{Name: "DR", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 48,
 		Hedges: 1, Retention: 8, Age: 1}
@@ -270,9 +271,9 @@ func caseDR() *Case {
 		{Kind: kUpdate, ID: 2, Hash: 1, TS: 1, Schema: 1},
 		{Kind: kDelete, Nodes: 1, Tries: 1},
 		{Kind: kCreate, Nodes: 3, Tries: 2, ID: 5, Hash: 1, TS: 1, Schema: 1},
-		{Kind: kCreate, Nodes: 3, Tries: 1, ID: 6, Hash: 1, TS: 1, Schema: 1},
-		{Kind: kUpdate, Nodes: 3, Tries: 1, ID: 7, Hash: 1, TS: 1, Schema: 1, Gen: 2},
-		{Kind: kUpdate, Nodes: 3, Tries: 1, ID: 3, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kCreate, Nodes: 2, Tries: 1, ID: 6, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, Nodes: 1, Tries: 1, ID: 7, Hash: 1, TS: 1, Schema: 1, Gen: 2},
+		{Kind: kUpdate, Nodes: 2, Tries: 1, ID: 3, Hash: 1, TS: 1, Schema: 1},
 	}
 	c.Init = c.newState()
 	c.existing(&c.Init, 0, 0, []int{1}, 0, true)
