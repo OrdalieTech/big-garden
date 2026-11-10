@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	garden "github.com/OrdalieTech/big-garden"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
@@ -41,13 +45,18 @@ func soakNode(args []string) error {
 	fs.StringVar(&cache, "cache", "", "cache directory")
 	fs.StringVar(&node, "node", "node", "node ID")
 	ring := fs.Int("ring", 1024, "ledger ring size")
+	entityBytes := fs.Int64("entity-bytes", 8<<20, "Limits.EntityBytes")
+	cacheBytes := fs.Int64("cache-bytes", 512<<20, "Limits.CacheBytes")
+	batch := fs.Int("batch", 0, "Limits.BatchMax (0: default)")
+	delay := fs.Duration("delay", 0, "hold every S3 reply this long (injected latency)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	ep.AccessKey, ep.SecretKey = os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 	ctx := context.Background()
-	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(nil), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: node,
-		CacheDir: cache, Limits: garden.Limits{EntityBytes: 8 << 20, CacheBytes: 512 << 20}})
+	w := &wire{base: http.DefaultTransport.(*http.Transport).Clone(), inflight: map[string]int{}, delay: *delay}
+	n, err := garden.Open(ctx, garden.Config{S3: ep.Client(&http.Client{Transport: w}), Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: node,
+		CacheDir: cache, Limits: garden.Limits{EntityBytes: *entityBytes, CacheBytes: *cacheBytes, BatchMax: *batch}})
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
@@ -61,6 +70,13 @@ func soakNode(args []string) error {
 		if err := json.Unmarshal(in.Bytes(), &r); err != nil {
 			return fmt.Errorf("request: %w", err)
 		}
+		if r.Op == "outage" { // every storage request fails for the next Size ms (qual stress Q7)
+			w.down.Store(time.Now().Add(time.Duration(r.Size) * time.Millisecond).UnixNano())
+			mu.Lock()
+			out.Encode(sResp{OK: true, Tag: r.Tag})
+			mu.Unlock()
+			continue
+		}
 		wg.Go(func() {
 			resp := soakServe(ctx, n, r, *ring, cache)
 			resp.Tag = r.Tag
@@ -73,10 +89,12 @@ func soakNode(args []string) error {
 	return n.Close(ctx)
 }
 
-// sReq is one soak request; Size is the payload of a write.
+// sReq is one soak request; Size is the payload of a write or fill,
+// incompressible unless Compressible.
 type sReq struct {
 	Op, Key, Inc, ID, Tag string
 	Size                  int
+	Compressible          bool `json:",omitempty"`
 	Route                 *sRt
 }
 
@@ -120,6 +138,7 @@ type procStats struct {
 	RSS, HeapAlloc, HeapInuse, HeapSys int64
 	Goroutines, FDs                    int
 	CacheDirBytes                      int64
+	CPUSeconds                         float64 // user + system since the process started
 	Stats                              garden.Stats
 }
 
@@ -147,8 +166,7 @@ func soakServe(ctx context.Context, n *garden.Node, r sReq, ring int, cache stri
 			return []byte("0"), nil
 		})
 	case "write":
-		pad := make([]byte, r.Size)
-		rand.Read(pad) // incompressible
+		pad := payload(r.Size, r.Compressible)
 		res, err = n.Update(ctx, ref, req, func(tx *garden.Tx) ([]byte, error) {
 			var c int64
 			if err := tx.Query(ctx, "SELECT c FROM meta", nil, func(rows *sql.Rows) error {
@@ -194,6 +212,25 @@ func soakServe(ctx context.Context, n *garden.Node, r sReq, ring int, cache stri
 				return rows.Err()
 			})
 		})
+	case "fill": // Size more bytes in 512 KiB rows of kv after the 16 write slots (values are limited to 1 MiB), one transaction
+		res, err = n.Update(ctx, ref, req, func(tx *garden.Tx) ([]byte, error) {
+			var k int64
+			if err := tx.Query(ctx, "SELECT coalesce(max(k), 15) FROM kv", nil, func(rows *sql.Rows) error {
+				rows.Next()
+				return rows.Scan(&k)
+			}); err != nil {
+				return nil, err
+			}
+			for left := r.Size; left > 0; left -= 512 << 10 {
+				k++
+				if _, err := tx.Exec(ctx, "INSERT INTO kv VALUES (?, ?)", k, payload(min(left, 512<<10), r.Compressible)); err != nil {
+					return nil, err
+				}
+			}
+			return []byte("0"), nil
+		})
+	case "evict":
+		err = n.Evict(ctx, ref)
 	case "lookup":
 		res, err = n.Lookup(ctx, ref, id)
 	case "collect":
@@ -250,6 +287,10 @@ func sample(n *garden.Node, cache string) *procStats {
 	runtime.ReadMemStats(&m)
 	p := &procStats{RSS: rssOf(os.Getpid()), HeapAlloc: int64(m.HeapAlloc), HeapInuse: int64(m.HeapInuse), HeapSys: int64(m.HeapSys),
 		Goroutines: runtime.NumGoroutine(), Stats: n.Stats()}
+	var ru syscall.Rusage
+	if syscall.Getrusage(syscall.RUSAGE_SELF, &ru) == nil {
+		p.CPUSeconds = time.Duration(ru.Utime.Nano() + ru.Stime.Nano()).Seconds()
+	}
 	if fds, err := os.ReadDir("/proc/self/fd"); err == nil {
 		p.FDs = len(fds)
 	}
@@ -262,6 +303,17 @@ func sample(n *garden.Node, cache string) *procStats {
 		return nil
 	})
 	return p
+}
+
+// payload is n random bytes, or n bytes of a repeated sentence when
+// compressible.
+func payload(n int, compressible bool) []byte {
+	if compressible {
+		return bytes.Repeat([]byte("the same compressible sentence, again. "), n/39+1)[:n]
+	}
+	b := make([]byte, n)
+	rand.Read(b)
+	return b
 }
 
 // rssOf reads VmRSS of a process in bytes (0 if unreadable).

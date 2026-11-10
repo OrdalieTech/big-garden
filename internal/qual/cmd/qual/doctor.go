@@ -479,12 +479,20 @@ func cleanup(ctx context.Context, s *store.S3) (int, error) {
 		if len(page) == 0 {
 			return deleted, nil
 		}
-		for _, e := range page {
-			if err := s.Delete(ctx, e.Key); err != nil {
-				return deleted, err
-			}
-			deleted++
+		errs := make([]error, len(page))
+		var wg sync.WaitGroup
+		for w := range 32 { // a large qualification namespace takes hours to delete one key at a time
+			wg.Go(func() {
+				for i := w; i < len(page); i += 32 {
+					errs[i] = s.Delete(ctx, page[i].Key)
+				}
+			})
 		}
+		wg.Wait()
+		if err := errors.Join(errs...); err != nil {
+			return deleted, err
+		}
+		deleted += len(page)
 	}
 }
 
