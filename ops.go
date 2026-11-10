@@ -443,6 +443,9 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 				return Ref{}, Result{}, storeError(err)
 			}
 			if len(page) > 0 {
+				if b, err := n.birth(ctx, key); err == nil && b != nil {
+					continue // a concurrent create wrote it after our GET: decide again on it
+				}
 				return Ref{}, Result{}, newError(CodeStateMissing, "entity artifacts exist without birth.json", nil)
 			}
 			inc = head.NewID()
