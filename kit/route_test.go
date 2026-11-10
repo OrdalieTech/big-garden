@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	garden "github.com/OrdalieTech/big-garden"
@@ -21,10 +20,13 @@ type cluster struct {
 	members []string
 	routers map[string]*Router
 	down    map[string]bool // the transport cannot reach these
-	hops    atomic.Int64
 }
 
-func (c *cluster) Members() []string { c.mu.Lock(); defer c.mu.Unlock(); return slices.Clone(c.members) }
+func (c *cluster) Members() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.members)
+}
 
 func (c *cluster) Forward(ctx context.Context, node string, call Call) (Reply, error) {
 	c.mu.Lock()
@@ -33,7 +35,6 @@ func (c *cluster) Forward(ctx context.Context, node string, call Call) (Reply, e
 	if down || r == nil {
 		return Reply{}, errors.New("unreachable")
 	}
-	c.hops.Add(1)
 	return r.Serve(ctx, call), nil
 }
 
