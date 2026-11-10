@@ -194,7 +194,8 @@ Existing `Stats` counters:
   input/output bytes, Collections/CollectedObjects/CollectedBytes.
 - **Storage requests:** CASAttempts/CASConflicts/AmbiguousPuts, and
   Storage[GET, PUT, LIST, DELETE] attempts, failures, uploaded and
-  downloaded bytes.
+  downloaded bytes, and Time spent in those calls (retries included):
+  the time cost of S3, as a mean latency per class over any interval.
 - **Gauges:** CacheBytes, StagingBytes, ResidentEntities, InflightStorage, WarmEntities, WarmBytes.
 
 From these you get PUT and GET counts (the AWS bill) and total downloaded
@@ -215,8 +216,6 @@ Still missing to watch cost in production:
 - **Stored bytes.** A gauge of live referenced bytes and of superseded,
   not-yet-collected bytes. These drive the Scaleway bill, and Collect
   cadence is the knob. Today only bytes collected are counted.
-- **S3 request latency.** A distribution per class: time is the main
-  Scaleway cost, and `InflightStorage` is only an instantaneous gauge.
 - **Creations.** Birth + genesis + head cost 3 PUT + 2 GET + 1 LIST,
   counted today among Mutations.
 - **Egress.** Which bytes are billable depends on placement and cannot be
