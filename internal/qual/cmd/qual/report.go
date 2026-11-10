@@ -39,6 +39,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -68,6 +69,7 @@ type reportRow struct {
 type verdictRow struct {
 	Row     json.RawMessage `json:"row"`
 	Verdict string          `json:"verdict"`
+	Status  string          `json:"status"` // qual faults rows say status`
 	Reps    int             `json:"reps"`
 	File    string          `json:"-"`
 }
@@ -198,7 +200,7 @@ func (r *reportRun) classify() {
 			} else if _, ok := probe["WindowsOK"]; ok {
 				r.soaks[scopeOf(rel)] = append(r.soaks[scopeOf(rel)], rel)
 			}
-		case in(func(s string) bool { return strings.Contains(s, "faults") }):
+		case in(func(s string) bool { return strings.Contains(s, "faults") }) && filepath.Base(rel) == "faults.json": // not its lanes' own artifacts
 			r.faults[scopeOf(rel)] = append(r.faults[scopeOf(rel)], r.verdicts(rel)...)
 		case in(func(s string) bool { return s == "check" }) || filepath.Base(rel) == "checks.json":
 			r.checks = append(r.checks, r.verdicts(rel)...)
@@ -229,7 +231,7 @@ func (r *reportRun) verdicts(rel string) []verdictRow {
 		return []verdictRow{{Row: json.RawMessage(`"unreadable"`), Verdict: "fail: " + err.Error(), File: rel}}
 	}
 	for i := range list {
-		list[i].File = rel
+		list[i].File, list[i].Verdict = rel, cmp.Or(list[i].Verdict, list[i].Status)
 		if len(list[i].Row) == 0 {
 			list[i].Row, _ = json.Marshal(fmt.Sprintf("%s#%d", filepath.Base(rel), i))
 		}
