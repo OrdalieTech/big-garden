@@ -12,7 +12,7 @@ file summarizes it at commit `ccd9576` plus this file.
 A pure-Go library that stores each entity as one SQLite database in S3: a
 mutation is a local transaction, an immutable LTX object and one conditional PUT
 of the head. Guarantees and non-guarantees: doc.go. Protocol: docs/PROTOCOL.md.
-Every amendment to the plan: docs/DECISIONS.md D1-D25. Operating it:
+Every amendment to the plan: docs/DECISIONS.md D1-D26. Operating it:
 docs/OPERATIONS.md. Measurements: docs/PERFORMANCE.md, docs/COST.md.
 
 ## Evidence
@@ -50,9 +50,8 @@ docs/OPERATIONS.md. Measurements: docs/PERFORMANCE.md, docs/COST.md.
 
 ## Open
 
-- **kit package** (durable timers, directory, reference router): designed
-  (.work/FABLE_KIT_DESIGN.md, about 670 lines on the public API, nothing needed
-  from the core), not built.
+- **kit directory** (uniqueness claims): designed (.work/FABLE_KIT_DESIGN.md),
+  not built until a consumer needs it; backup, router and wakes are built (D26).
 - **Campaigns** that `qual report` requires and that have not run on the
   release commit: `qual faults --remote` (20 repetitions), Q0-Q7 ×3 on an idle
   machine, a 24 h local and a 24 h remote soak, the race campaign artifact.
