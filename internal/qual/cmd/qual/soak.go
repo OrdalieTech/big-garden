@@ -59,6 +59,7 @@ func soak(args []string) error {
 	upload := fs.Int("upload", 40<<10, "payload bytes of upload-size writes")
 	inline := fs.Int("inline", 256, "payload bytes of inline writes")
 	out := fs.String("out", "", "output directory (required)")
+	hosts := fs.String("hosts", "", "comma-separated ssh destinations running the nodes (PLAN §20.4); each has ~/qual and ~/qual.env (AWS_* and nothing else)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -85,7 +86,7 @@ func soak(args []string) error {
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		return err
 	}
-	s := &soakRun{ep: ep, out: *out, ring: *ring, t0: time.Now(), nodes: map[string]*snode{},
+	s := &soakRun{ep: ep, out: *out, ring: *ring, t0: time.Now(), nodes: map[string]*snode{}, hosts: strings.Split(*hosts, ","),
 		lat: map[string][]time.Duration{}, counts: map[string]map[string]int64{}, codes: map[string]int64{},
 		pending: map[string][]ack{}, recent: map[string][]ack{}, unknown: map[string][]unk{}, gates: map[string]*sync.RWMutex{}, windows: map[string]*swindow{}}
 	s.self, _ = os.Executable()
@@ -99,7 +100,10 @@ func soak(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, _ := json.Marshal(map[string]any{"endpoint": ep.URL, "bucket": ep.Bucket, "prefix": ep.Prefix, "args": args, "started": s.t0.UTC()})
+	if *hosts != "" && len(slices.Compact(slices.Sorted(slices.Values(s.hosts)))) < 3 {
+		return errors.New("-hosts needs three distinct hosts: a multi-host soak on fewer is not one")
+	}
+	cfg, _ := json.Marshal(map[string]any{"endpoint": ep.URL, "bucket": ep.Bucket, "prefix": ep.Prefix, "args": args, "started": s.t0.UTC(), "hosts": *hosts})
 	os.WriteFile(filepath.Join(*out, "config.json"), cfg, 0o644)
 	s.logx("config %s", cfg)
 	defer func() {
@@ -196,6 +200,11 @@ func soak(args []string) error {
 	// node rebuilds every entity from S3.
 	s.killAll()
 	os.RemoveAll(filepath.Join(*out, "cache"))
+	for _, h := range s.hosts {
+		if h != "" {
+			exec.Command("ssh", h, "--", "rm -rf $HOME/soak-cache").Run()
+		}
+	}
 	s.mu.Lock()
 	s.members = nil
 	s.mu.Unlock()
@@ -275,6 +284,8 @@ type soakRun struct {
 	lastReportOps int64
 	lastReportAt  time.Time
 	halt          func() // ends the measured phase early
+	hosts         []string
+	placed        int // nodes started, for round-robin placement on hosts
 }
 
 type seriesPoint struct {
@@ -326,6 +337,7 @@ func newID() string {
 // snode is one node process.
 type snode struct {
 	name, cache string
+	host, pid   string // a remote node: its ssh destination and remote pid
 	cmd         *exec.Cmd
 	in          io.WriteCloser
 	mu          sync.Mutex
@@ -338,12 +350,24 @@ type snode struct {
 
 func (s *soakRun) start(name string, member bool) error { // member: add to the believed membership
 	cache := filepath.Join(s.out, "cache", name)
-	if err := os.MkdirAll(cache, 0o755); err != nil {
-		return err
+	nodeArgs := []string{"soak-node", "-url", s.ep.URL, "-region", s.ep.Region, "-bucket", s.ep.Bucket,
+		"-prefix", s.ep.Prefix, "-cache", cache, "-node", name, "-ring", strconv.Itoa(s.ring)}
+	var cmd *exec.Cmd
+	host := ""
+	if s.hosts[0] != "" { // the remote shell prints its pid, then becomes the node
+		s.mu.Lock()
+		host, s.placed = s.hosts[s.placed%len(s.hosts)], s.placed+1
+		s.mu.Unlock()
+		cache = "$HOME/soak-cache/" + name // expanded by the remote shell
+		nodeArgs[10] = cache
+		cmd = exec.Command("ssh", host, "--", "set -a; . ~/qual.env; echo $$; exec ~/qual "+strings.Join(nodeArgs, " "))
+	} else {
+		if err := os.MkdirAll(cache, 0o755); err != nil {
+			return err
+		}
+		cmd = exec.Command(s.self, nodeArgs...)
+		cmd.Env = append(os.Environ(), "AWS_ACCESS_KEY_ID="+s.ep.AccessKey, "AWS_SECRET_ACCESS_KEY="+s.ep.SecretKey)
 	}
-	cmd := exec.Command(s.self, "soak-node", "-url", s.ep.URL, "-region", s.ep.Region, "-bucket", s.ep.Bucket,
-		"-prefix", s.ep.Prefix, "-cache", cache, "-node", name, "-ring", strconv.Itoa(s.ring))
-	cmd.Env = append(os.Environ(), "AWS_ACCESS_KEY_ID="+s.ep.AccessKey, "AWS_SECRET_ACCESS_KEY="+s.ep.SecretKey)
 	ef, err := os.OpenFile(filepath.Join(s.out, "node-"+name+".stderr"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -360,10 +384,13 @@ func (s *soakRun) start(name string, member bool) error { // member: add to the 
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	m := &snode{name: name, cache: cache, cmd: cmd, in: in, wait: map[string]chan sResp{}, exited: make(chan struct{})}
+	m := &snode{name: name, cache: cache, host: host, cmd: cmd, in: in, wait: map[string]chan sResp{}, exited: make(chan struct{})}
+	sc := bufio.NewScanner(outp)
+	sc.Buffer(make([]byte, 4<<20), 4<<20)
+	if host != "" && sc.Scan() {
+		m.pid = strings.TrimSpace(sc.Text())
+	}
 	go func() {
-		sc := bufio.NewScanner(outp)
-		sc.Buffer(make([]byte, 4<<20), 4<<20)
 		for sc.Scan() {
 			var r sResp
 			if json.Unmarshal(sc.Bytes(), &r) != nil {
@@ -397,8 +424,26 @@ func (s *soakRun) start(name string, member bool) error { // member: add to the 
 		s.members = append(s.members, name)
 	}
 	s.mu.Unlock()
-	s.logx("started %s pid %d", name, cmd.Process.Pid)
+	s.logx("started %s pid %d %s %s", name, cmd.Process.Pid, host, m.pid)
 	return nil
+}
+
+// signal sends sig to the node process, through ssh for a remote node.
+func (m *snode) signal(sig syscall.Signal) {
+	if m.host == "" {
+		m.cmd.Process.Signal(sig)
+		return
+	}
+	exec.Command("ssh", m.host, "--", fmt.Sprintf("kill -%d %s", sig, m.pid)).Run()
+}
+
+// wipe deletes the node's cache directory.
+func (m *snode) wipe() {
+	if m.host == "" {
+		os.RemoveAll(m.cache)
+		return
+	}
+	exec.Command("ssh", m.host, "--", "rm -rf "+m.cache).Run()
 }
 
 func (m *snode) send(r sReq) chan sResp {
@@ -435,8 +480,8 @@ func (m *snode) do(r sReq, timeout time.Duration) (sResp, bool) {
 // kill SIGKILLs the process and waits for it (SIGCONT first: a stopped
 // process must not hold its pipes).
 func (m *snode) kill() {
-	m.cmd.Process.Signal(syscall.SIGCONT)
-	m.cmd.Process.Kill()
+	m.signal(syscall.SIGCONT)
+	m.signal(syscall.SIGKILL)
 	<-m.exited
 }
 
@@ -755,7 +800,7 @@ func (s *soakRun) metrics(stop chan struct{}, every time.Duration) {
 				s.mu.Lock()
 				m.last = resp.Proc
 				s.mu.Unlock()
-			} else {
+			} else if m.host == "" {
 				p.Proc.RSS = rssOf(m.cmd.Process.Pid)
 			}
 			s.smu.Lock()
@@ -787,7 +832,7 @@ func (s *soakRun) faults(stop chan struct{}, keys []string, every time.Duration)
 			m.kill()
 			wipe := round%2 == 0
 			if wipe {
-				os.RemoveAll(m.cache)
+				m.wipe()
 			}
 			s.fault("kill", "SIGKILL %s (cache wiped: %v), restart", v, wipe)
 			time.Sleep(time.Second)
@@ -808,10 +853,10 @@ func (s *soakRun) faults(stop chan struct{}, keys []string, every time.Duration)
 			if m == nil {
 				continue
 			}
-			m.cmd.Process.Signal(syscall.SIGSTOP)
+			m.signal(syscall.SIGSTOP)
 			s.fault("stop", "SIGSTOP %s (owner of %s) for 6s", rr.Route.Node, k)
 			time.Sleep(6 * time.Second)
-			m.cmd.Process.Signal(syscall.SIGCONT)
+			m.signal(syscall.SIGCONT)
 		case 2:
 			v := victims[rand.N(len(victims))]
 			s.mu.Lock()
@@ -827,7 +872,7 @@ func (s *soakRun) faults(stop chan struct{}, keys []string, every time.Duration)
 			s.members = slices.DeleteFunc(s.members, func(n string) bool { return n == v })
 			s.mu.Unlock()
 			m.kill()
-			os.RemoveAll(m.cache)
+			m.wipe()
 			s.mu.Lock()
 			if m.last != nil {
 				s.retired = append(s.retired, *m.last)
