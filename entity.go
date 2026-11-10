@@ -204,7 +204,8 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string) {
 	if e.db != nil && e.db.Published() != imageOf(cur) {
 		e.discard()
 	}
-	e.h, e.etag = cur, etag // kept even without a local image: the next access activates or revalidates it
+	h := *cur              // a copy: cur may be &c.next, and c.base chains every earlier head
+	e.h, e.etag = &h, etag // kept even without a local image: the next access activates or revalidates it
 	if e.db != nil {
 		e.bytes.Store(e.db.Bytes())
 	}
