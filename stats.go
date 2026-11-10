@@ -25,6 +25,7 @@ type Stats struct {
 	ResidentEntities, QueuedRequests, InflightStorage          int64
 	CacheBytes, StagingBytes                                   int64
 	WarmHits, CatchUps, ActivationBytes, WarmEvictions         uint64 // D21: activations from a warm file as is or caught up; bytes GET by activations
+	StaleHeads                                                 uint64 // heads older than one already seen: the store broke its contract (refused)
 	WarmEntities, WarmBytes                                    int64  // the warm tier (also in CacheBytes)
 	OldestUnresolved                                           time.Duration
 	Batches                                                    [maxBatch]uint64 // [16]: committed publications by member count - 1
@@ -42,7 +43,7 @@ type counters struct {
 	snapshots, compactions, collections, collected                                             atomic.Uint64
 	snapshotBytes, compactionIn, compactionOut, collectedBytes                                 atomic.Uint64
 	batches                                                                                    [maxBatch]atomic.Uint64
-	warmHits, catchUps, activationBytes, warmEvictions                                         atomic.Uint64
+	warmHits, catchUps, activationBytes, warmEvictions, staleHeads                             atomic.Uint64
 }
 
 // observe counts the outcome of one public operation on key, and logs one
@@ -72,12 +73,14 @@ func (n *Node) observe(key string, read bool, res Result, err error) {
 			}
 		}
 	}
-	if e == nil || (e.Code != CodeOutcomeUnknown && e.Code != CodeCorrupt) || n.cfg.Logger == nil {
+	if e == nil || (e.Code != CodeOutcomeUnknown && e.Code != CodeCorrupt && e.Code != CodeStateMissing) || n.cfg.Logger == nil {
 		return
 	}
-	if last, now := n.logged.Load(), time.Now().UnixNano(); now-last >= int64(time.Second) && n.logged.CompareAndSwap(last, now) {
-		sum := sha256.Sum256([]byte(key))
-		attrs := []any{"code", string(e.Code), "entity", hex.EncodeToString(sum[:8]), "operation", hex.EncodeToString(e.Operation[:])}
+	// corrupt and state_missing are rare and need an operator: always logged;
+	// outcome_unknown comes in bursts during an outage: at most once a second.
+	if last, now := n.logged.Load(), time.Now().UnixNano(); e.Code != CodeOutcomeUnknown || now-last >= int64(time.Second) && n.logged.CompareAndSwap(last, now) {
+		sum := sha256.Sum256([]byte(key)) // the entity's directory name under entities/, never the key itself
+		attrs := []any{"code", string(e.Code), "entity", hex.EncodeToString(sum[:]), "operation", hex.EncodeToString(e.Operation[:])}
 		if e.Route != nil {
 			attrs = append(attrs, "owner_session", hex.EncodeToString(e.Route.Owner.Session[:]), "epoch", e.Route.Epoch)
 		}
@@ -120,7 +123,8 @@ func (n *Node) Stats() Stats {
 		Collections: c.collections.Load(), CollectedObjects: c.collected.Load(), SnapshotBytes: c.snapshotBytes.Load(),
 		CompactionInputBytes: c.compactionIn.Load(), CompactionOutputBytes: c.compactionOut.Load(),
 		CollectedBytes: c.collectedBytes.Load(), StagingBytes: n.staging.Load(), WarmHits: c.warmHits.Load(),
-		CatchUps: c.catchUps.Load(), ActivationBytes: c.activationBytes.Load(), WarmEvictions: c.warmEvictions.Load()}
+		CatchUps: c.catchUps.Load(), ActivationBytes: c.activationBytes.Load(), WarmEvictions: c.warmEvictions.Load(),
+		StaleHeads: c.staleHeads.Load()}
 	for i := range s.Batches {
 		s.Batches[i] = c.batches[i].Load()
 	}

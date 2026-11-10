@@ -2109,3 +2109,24 @@ func TestNewerHeadFormatRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestStaleHeadRefused: a head older than one a node already saw means the
+// store broke read-after-write; the node refuses it as unavailable, counts it
+// and keeps serving nothing from it.
+func TestStaleHeadRefused(t *testing.T) {
+	mem := storetest.NewMem()
+	a, b := testNode(t, mem, "a", nil), testNode(t, mem, "b", nil)
+	ref := mustCreate(t, a, "k", newLedger())
+	old, _ := mem.Peek(head.HeadKey("k"))
+	mustPut(t, a, ref, "x", "1", newLedger())
+	readAll(t, b, ref) // b has seen the newer head
+	cur, _ := mem.Peek(head.HeadKey("k"))
+	if _, err := mem.PutCAS(bg, head.HeadKey("k"), old.Body, cur.ETag); err != nil { // the store serves the past
+		t.Fatal(err)
+	}
+	_, err := b.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil })
+	wantCode(t, err, CodeUnavailable)
+	if s := b.Stats(); s.StaleHeads != 1 {
+		t.Fatalf("StaleHeads %d, want 1", s.StaleHeads)
+	}
+}

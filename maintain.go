@@ -3,8 +3,8 @@ package garden
 import (
 	"bytes"
 	"context"
-	"io"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/engine"
@@ -73,13 +73,9 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 			return false
 		}
 		run := h.Deltas[i : i+fanout]
-		objs := make([]io.ReaderAt, fanout)
-		for j, r := range run {
-			obj, err := n.st.Get(ctx, r.Key, "", int64(r.Bytes))
-			if err != nil {
-				return false
-			}
-			objs[j] = bytes.NewReader(obj.Body)
+		objs, err := n.objects(ctx, run, h, new(atomic.Uint64)) // four at a time: the gate is held
+		if err != nil {
+			return false
 		}
 		out, err := engine.Compact(ctx, &buf, run, objs) // checks lengths, SHA-256, the chain and the span
 		if err != nil {

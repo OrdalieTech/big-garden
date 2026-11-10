@@ -32,6 +32,10 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	if err != nil {
 		return err
 	}
+	if e.h != nil && cur.Revision < e.h.Revision { // revisions never go back: the store served a stale head (PLAN §3.1)
+		n.counters.staleHeads.Add(1)
+		return newError(CodeUnavailable, "the store returned an older head than one already seen", nil)
+	}
 	if cur.Deleted {
 		return n.deleted(e)
 	}

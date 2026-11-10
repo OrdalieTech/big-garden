@@ -374,7 +374,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 		return nil
 	}
 	for {
-		objs, err := n.objects(ctx, links(h), h)
+		objs, err := n.objects(ctx, links(h), h, &n.counters.activationBytes)
 		if err != nil && !miss(err) {
 			return storeError(err)
 		}
@@ -416,7 +416,7 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 // objects GETs the links refs of h, four at a time, checking each one's
 // length and SHA-256; h's tail, if refs ends with it, is read from h. err is
 // the first failure, a store error before NotFound or corruption.
-func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head) ([]io.ReaderAt, error) {
+func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head, downloaded *atomic.Uint64) ([]io.ReaderAt, error) {
 	tail := h.Tail != nil && len(refs) > 0 && refs[len(refs)-1] == h.Tail.Ref()
 	if tail {
 		refs = refs[:len(refs)-1]
@@ -433,7 +433,7 @@ func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head) ([]io
 				err = engine.ErrCorrupt
 			}
 			objs[i], errs[i] = bytes.NewReader(obj.Body), err
-			n.counters.activationBytes.Add(uint64(len(obj.Body)))
+			downloaded.Add(uint64(len(obj.Body)))
 		})
 	}
 	wg.Wait()
@@ -473,7 +473,7 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 	}
 	failpoint("warm.claim")
 	if ok && i > 0 && w.Image.Sequence <= h.Sequence {
-		objs, err := n.objects(ctx, refs[i:], h)
+		objs, err := n.objects(ctx, refs[i:], h, &n.counters.activationBytes)
 		failpoint("warm.apply.mid")   // the kill lands inside Restore's overlay
 		if err != nil && !miss(err) { // the store, not the file: keep it for the next attempt
 			n.unclaimWarm(e.key, path, w)

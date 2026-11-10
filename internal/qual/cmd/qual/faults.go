@@ -309,6 +309,7 @@ var lanes = map[string]lane{
 	"stalemaint": {Pkg: kn, Run: "^TestStaleMaintenance$", Kill: true, Remote: true},
 	"warmkill":   {Pkg: kn, Run: "^TestWarmKill$", Kill: true, Remote: true},
 	"diskfull":   {Pkg: kn, Run: "^TestDiskFull$", Kill: true, Remote: true},
+	"deletekill": {Pkg: kn, Run: "^TestDeleteKill$", Kill: true, Remote: true},
 	// fault-scripted core tests: S3 adapter through a fault proxy on the fixture (Mem for the Mem-only ones)
 	"publication": {Pkg: ".", Run: "^Test(ResolveBranches|ResolvePrunedReceipt|ResolveObjectBranch|ResolveHydrationFailureIsUnknown|RestartRecoversEverything|ReproposeAfterRecovery|DeadlineEndsWaiting)$", Count: 20, Remote: true},
 	"create":      {Pkg: ".", Run: "^Test(ConcurrentCreates|ConcurrentSameCreate|CreateIdempotentAndConflicts|CreateResumeD5|CreateAfterBirthIsUnknown|IDExpiredByFloor)$", Count: 20, Remote: true},
@@ -321,6 +322,11 @@ var lanes = map[string]lane{
 	"import":      {Pkg: ".", Run: "^Test(Import|ImportWhileOldWritersWrite)$", Count: 20, Remote: true},
 	"bounds":      {Pkg: ".", Run: "^Test(PendingPerEntity|InflightStorageBound|RecoveriesBound|CacheBytes|EntityMapBounded)$", Count: 20, Remote: true},
 	"extend":      {Pkg: ".", Run: "^TestExtendBoundary$", Count: 20},
+	"delete":      {Pkg: ".", Run: "^TestDelete(|Follower|ReviewCases)$", Count: 20, Remote: true},
+	"reads":       {Pkg: ".", Run: "^Test(SharedValidation|ReadRidesCAS|FollowerRead|ExportFollower|HundredReaders)$", Count: 20, Remote: true},
+	"warm":        {Pkg: ".", Run: "^TestWarm(Tier|Budget|KeepsFileOnStoreError)$", Count: 20},
+	"outage":      {Pkg: ".", Run: "^Test(OutageFailsFast|ClockGuard|StaleHeadRefused|ResidentBoundUnderConcurrentCreates)$", Count: 20},
+	"format1":     {Pkg: ".", Run: "^TestFormat1Frozen$", Count: 5},
 	// storage adapter against an HTTP front-end over Mem and the fixture
 	"store": {Pkg: "./internal/store", Run: "^TestS3(Classification|TransportFaults|Hedge|RetryStopsAtDeadline)$", Count: 20, Remote: true},
 	// no store: SQLite capture, restore and the SQL boundary
@@ -329,7 +335,8 @@ var lanes = map[string]lane{
 	"wal":        {Pkg: "./internal/qual/m0", Run: "^Test(DBPageCapture|CloseCheckpointsWAL|LTXRejects|LTXDeclaredSizeAllocation)$", Count: 20},
 	"authorizer": {Pkg: "./internal/engine", Run: "^Test(AuthorizerBypass|ScopeRace|RenameIntoReserved|ForeignKeyToReserved)$", Count: 20},
 	"authconn":   {Pkg: "./internal/qual/m0", Run: "^TestAuthorizerPerConnection$", Count: 20},
-	"head":       {Pkg: "./internal/head", Run: "^Test(ValidateRejects|DecodeRejectsNonCanonical|DecodeRejectsNonCanonicalTail|NamespaceAndBirth)$", Count: 20},
+	"head":       {Pkg: "./internal/head", Run: "^Test(ValidateRejects|DecodeRejectsNonCanonical|DecodeRejectsNonCanonicalTail|NamespaceAndBirth|Tombstone)$", Count: 20},
+	"layout":     {Pkg: "./internal/engine", Run: "^Test(OldReceiptsLayoutRejected|SecureDelete|ReceiptCost)$", Count: 5},
 	// the storage probe: PLAN §16's 1,000 contested rounds with 32 contenders, and its negative controls
 	"doctor":    {Qual: []string{"doctor", "--cas-rounds=1000", "--contenders=32"}, Remote: true},
 	"doctorneg": {Pkg: "./internal/qual/cmd/qual", Run: "^(TestDoctorRejectsStoreIgnoringConditions|TestDoctorPassesLinearizableStore)$", Count: 5},
@@ -338,7 +345,8 @@ var lanes = map[string]lane{
 // laneOrder runs the cheap lanes first.
 var laneOrder = []string{"head", "authorizer", "authconn", "restore", "capture", "wal", "store", "doctorneg", "doctor",
 	"firstopen", "corrupt", "extend", "missing", "create", "publication", "batch", "ownership", "maintenance", "import", "bounds",
-	"kill", "batchkill", "staleowner", "takeover", "takeover1", "sameid", "warmkill", "diskfull", "routed", "stalemaint"}
+	"layout", "format1", "warm", "outage", "reads", "delete",
+	"kill", "batchkill", "staleowner", "takeover", "takeover1", "sameid", "warmkill", "diskfull", "deletekill", "routed", "stalemaint"}
 
 type faultRow struct {
 	Row             int
@@ -352,31 +360,31 @@ type faultRow struct {
 var matrix = []faultRow{
 	{1, "Kill before/inside SQL transaction, after local COMMIT, during LTX capture", "covered", []string{"kill", "batchkill", "warmkill"}, ""},
 	{2, "Kill before PUT, mid-body, after object application but before response", "covered", []string{"kill", "batchkill", "store"}, "put.mid kills 0-3 ms after the PUT starts, not provably mid-body"},
-	{3, "Kill before head CAS, after CAS application, after response but before acknowledgment", "covered", []string{"kill", "batchkill"}, ""},
-	{4, "Kill after observed success and delete every node/cache disk", "covered", []string{"kill", "routed", "publication"}, ""},
+	{3, "Kill before head CAS, after CAS application, after response but before acknowledgment", "covered", []string{"kill", "batchkill", "deletekill"}, ""},
+	{4, "Kill after observed success and delete every node/cache disk", "covered", []string{"kill", "routed", "publication", "warm"}, ""},
 	{5, "Store applies a request after its client deadline or disconnect", "covered", []string{"publication", "store", "kill"}, "net.late (kill lane) is local only"},
 	{6, "CAS succeeds, reply lost, SDK would retry and receive 412", "covered", []string{"store", "publication", "kill"}, ""},
 	{7, "Two/32 simultaneous create or takeover candidates", "partial", []string{"takeover", "takeover1", "create", "firstopen", "doctor", "doctorneg"}, "entity-level create races 8 contenders on 2 nodes; 32-way create is the storage probe (qual doctor --cas-rounds=1000 --contenders=32)"},
 	{8, "SIGSTOP owner, take over elsewhere, commit, SIGCONT old owner", "covered", []string{"staleowner", "takeover", "takeover1", "sameid", "routed"}, ""},
 	{9, "Old commit wins immediately before takeover", "partial", []string{"staleowner", "takeover", "takeover1"}, "a commit landing between the takeover's GET and its claim is reached by random timing, not forced"},
 	{10, "Same operation ID on several nodes with same/different hashes", "covered", []string{"sameid", "kill", "create", "batch"}, ""},
-	{11, "Receipt pruning races delayed retries; clocks jump ±1 hour", "partial", []string{"publication", "create"}, "IDs ±1-2 h from the node clock; no jump of the owner's own clock"},
-	{12, "Read begins after a completed write on another owner", "covered", []string{"routed", "staleowner", "ownership"}, ""},
-	{13, "Read/error follows an unpublished earlier batch member", "covered", []string{"batch"}, ""},
+	{11, "Receipt pruning races delayed retries; clocks jump ±1 hour", "partial", []string{"publication", "create", "outage"}, "IDs ±1-2 h from the node clock; no jump of the owner's own clock"},
+	{12, "Read begins after a completed write on another owner", "covered", []string{"routed", "staleowner", "ownership", "reads", "delete"}, ""},
+	{13, "Read/error follows an unpublished earlier batch member", "covered", []string{"batch", "reads"}, ""},
 	{14, "Context canceled mid-batch; one callback errors; another succeeds", "covered", []string{"batch", "batchkill"}, ""},
 	{15, "Compactor paused before/after upload or CAS across takeover", "covered", []string{"maintenance", "stalemaint"}, ""},
-	{16, "Collector pauses after reading head, ownership changes, new objects publish", "covered", []string{"maintenance"}, ""},
+	{16, "Collector pauses after reading head, ownership changes, new objects publish", "covered", []string{"maintenance", "delete", "deletekill"}, ""},
 	{17, "Stale writer uploads after its orphan was deleted", "covered", []string{"maintenance"}, ""},
-	{18, "Restore/export races collection of an older root", "partial", []string{"maintenance"}, "activation racing Collect only; Export racing Collect is not scheduled"},
-	{19, "Header/length/digest/checksum corrupted; LTX duplicated/reordered; referenced object missing", "covered", []string{"corrupt", "restore", "head", "store", "import"}, ""},
+	{18, "Restore/export races collection of an older root", "partial", []string{"maintenance", "delete"}, "activation racing Collect and Delete; Export racing Collect is not scheduled"},
+	{19, "Header/length/digest/checksum corrupted; LTX duplicated/reordered; referenced object missing", "covered", []string{"corrupt", "restore", "head", "store", "import", "warm"}, ""},
 	{20, "Compressed object expands beyond configured limits", "partial", []string{"restore", "wal", "corrupt"}, "declared-size and frame-size rejections; allocation during decompression is not measured"},
 	{21, "WAL partial header/frame, wrong salt/checksum, uncommitted tail, duplicate pages, shrink/regrow", "partial", []string{"capture", "wal", "restore"}, "no WAL parser (DECISIONS D2): capture reads committed pages through SQLite; rollback, shrink/regrow covered, torn WAL injection not applicable"},
 	{22, "SQL caller attempts COMMIT, ATTACH, storage PRAGMA, reserved-table write, escaping cursor", "covered", []string{"authorizer", "authconn", "extend"}, ""},
 	{23, "ENOSPC/EIO during WAL, staging, checkpoint, replay, rename or export", "partial", []string{"diskfull"}, "real EFBIG write errors under RLIMIT_FSIZE on node processes (WAL, staging, checkpoint, replay); EIO and export to a failing writer are not injected"},
 	{24, "Head missing beside birth/data; namespace descriptor missing beside existing data", "covered", []string{"missing", "create", "corrupt"}, ""},
-	{25, "Wrong incarnation/namespace/key, unknown codec/schema, downgraded binary", "partial", []string{"ownership", "head", "restore", "import"}, "a newer-format head is refused by every path before any write (TestNewerHeadFormatRefused); no older-binary process run"},
+	{25, "Wrong incarnation/namespace/key, unknown codec/schema, downgraded binary", "partial", []string{"ownership", "head", "restore", "import", "format1", "layout"}, "a newer-format head is refused by every path before any write (TestNewerHeadFormatRefused); no older-binary process run"},
 	{26, "Import old backup while old nodes still run", "covered", []string{"import"}, ""},
-	{27, "Store ignores conditions or serves provably stale overwritten heads", "partial", []string{"missing", "doctor", "doctorneg"}, "condition-ignoring store rejected (doctor negative control, Open probe); no stale-read negative control"},
-	{28, "S3 unavailable for 60 seconds; all queues reach limits", "partial", []string{"bounds", "publication", "batch"}, "short outages with bounded queues; the 60 s outage runs in qual soak only"},
+	{27, "Store ignores conditions or serves provably stale overwritten heads", "partial", []string{"missing", "doctor", "doctorneg", "outage"}, "condition-ignoring store rejected (doctor negative control, Open probe); no stale-read negative control"},
+	{28, "S3 unavailable for 60 seconds; all queues reach limits", "partial", []string{"bounds", "publication", "batch", "outage"}, "short outages with bounded queues; the 60 s outage runs in qual soak only"},
 	{29, "Repeated failovers and node replacement under load", "partial", []string{"routed"}, "light load in the test; sustained failover under load is qual soak"},
 }
