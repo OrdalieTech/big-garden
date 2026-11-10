@@ -226,8 +226,12 @@ func TestWarmActivationCost(t *testing.T) {
 		t.Skip("GARDEN_MEASURE is not set")
 	}
 	mem := newStore(t)
-	a := testNode(t, mem, "a", func(l *Limits) { l.EntityBytes, l.StorageAttemptTimeout, l.CommitTimeout = 64<<20, 10*time.Second, 30*time.Second })
-	b := testNode(t, mem, "b", func(l *Limits) { l.EntityBytes, l.StorageAttemptTimeout, l.CommitTimeout = 64<<20, 10*time.Second, 30*time.Second })
+	a := testNode(t, mem, "a", func(l *Limits) {
+		l.EntityBytes, l.StorageAttemptTimeout, l.CommitTimeout = 64<<20, 10*time.Second, 30*time.Second
+	})
+	b := testNode(t, mem, "b", func(l *Limits) {
+		l.EntityBytes, l.StorageAttemptTimeout, l.CommitTimeout = 64<<20, 10*time.Second, 30*time.Second
+	})
 	for _, size := range []int{1 << 20, 16 << 20} {
 		key := fmt.Sprint("m", size>>20)
 		ref, _, err := a.Create(bg, key, newReq(t, key, 1), createKV)
