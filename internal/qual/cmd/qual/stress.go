@@ -410,7 +410,9 @@ func (w *wire) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	if k != "" {
 		w.mu.Lock()
-		w.inflight[k]--
+		if w.inflight[k]--; w.inflight[k] == 0 {
+			delete(w.inflight, k) // every CAS has its own If-Match: keep only those in flight
+		}
 		w.mu.Unlock()
 	}
 	return resp, err
