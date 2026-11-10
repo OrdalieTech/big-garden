@@ -371,6 +371,7 @@ func TestBatchHotLedger(t *testing.T) {
 						return
 					}
 					retried.Add(1)
+					time.Sleep(time.Duration(try) * time.Millisecond) // unavailable now answers at once (D22 fail fast)
 				}
 			}
 		})

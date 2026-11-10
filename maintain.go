@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"slices"
+	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/engine"
 	"github.com/OrdalieTech/big-garden/internal/head"
@@ -111,11 +112,11 @@ func placed(h *head.Head, r head.Ref) head.Ref {
 // a page older than the image, and with secure_delete the image holds no
 // deleted bytes (D22). It requires ownership; it uploads the whole database.
 func (n *Node) Snapshot(ctx context.Context, ref Ref) (Version, error) {
-	e, err := n.enter(ctx, ref.Key, nil, nil)
+	e, err := n.enter(ctx, ref.Key, nil, nil, false)
 	if err != nil {
 		return Version{}, err
 	}
-	if err := n.owned(ctx, e, ref, true); err != nil {
+	if err := n.owned(ctx, e, ref, time.Time{}); err != nil { // a zero t0: a write, owner only
 		n.leave(e)
 		return Version{}, err
 	}

@@ -72,5 +72,19 @@
 //	}
 //
 // A real loop bounds its attempts: two Nodes taking over from each other
-// otherwise trade the entity indefinitely.
+// otherwise trade the entity indefinitely. Routing, which the caller owns
+// (the library cannot forward a request), follows three rules: send an
+// entity's mutations to its owner (Resolve, or the Route of an error);
+// take over only on the Node that Preferred names for the key, or when
+// membership says the owner is gone; back off before retrying a
+// route_changed. A misrouted mutation costs a takeover and an activation
+// (about 5x a routed one); reads need no routing.
+//
+// # Callbacks
+//
+// A callback runs while the entity's gate is held: it must not call the
+// Node, neither on its own entity (the call waits until its context ends,
+// then fails with outcome_unknown or unavailable) nor on another one (two
+// such callbacks deadlock the same way). Do cross-entity work after the
+// callback returns.
 package garden

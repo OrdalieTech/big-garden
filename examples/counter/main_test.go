@@ -113,8 +113,8 @@ func TestCounter(t *testing.T) {
 	if out := p.ok("b", "incr", "foo"); !out.TookOver || out.Value != 8 || out.Owner != "b" {
 		t.Fatalf("takeover by b: %+v", out)
 	}
-	// A strong read from node a takes it back.
-	if out := p.ok("a", "get", "foo"); !out.TookOver || out.Value != 8 {
+	// A strong read from node a sees b's write and leaves b the owner (D24).
+	if out := p.ok("a", "get", "foo"); out.TookOver || out.Value != 8 {
 		t.Fatalf("read by a: %+v", out)
 	}
 
