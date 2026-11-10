@@ -87,12 +87,19 @@ type DB struct {
 	pub     Image           // image of the main file (the last checkpointed, published state)
 }
 
-const schemaSQL = `
-CREATE TABLE _state_meta(format INTEGER NOT NULL, namespace BLOB NOT NULL, key TEXT NOT NULL,
+// The library's tables (PROTOCOL §1), compared verbatim with sqlite_schema at
+// activation. Receipts are a rowid table keyed by sequence: a table b-tree
+// leaf holds up to 4,061 bytes of a row, where a WITHOUT ROWID (index) leaf
+// spilled every result above ~940 bytes to a 4 KiB overflow page.
+var reservedSQL = [2]string{
+	`CREATE TABLE _state_meta(format INTEGER NOT NULL, namespace BLOB NOT NULL, key TEXT NOT NULL,
   incarnation BLOB NOT NULL, schema INTEGER NOT NULL, sequence INTEGER NOT NULL,
-  expiry_floor_ms INTEGER NOT NULL) STRICT;
-CREATE TABLE _state_receipts(operation_id BLOB PRIMARY KEY, input_hash BLOB NOT NULL,
-  result BLOB NOT NULL, sequence INTEGER NOT NULL) STRICT, WITHOUT ROWID;`
+  expiry_floor_ms INTEGER NOT NULL) STRICT`,
+	`CREATE TABLE _state_receipts(sequence INTEGER PRIMARY KEY, operation_id BLOB NOT NULL UNIQUE,
+  input_hash BLOB NOT NULL, result BLOB NOT NULL) STRICT`,
+}
+
+var schemaSQL = reservedSQL[0] + ";\n" + reservedSQL[1] + ";"
 
 // Driver opens the SQLite connections of one Node through a private modernc
 // driver, so the functions and modules registered on it reach no other
@@ -403,7 +410,7 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 		FROM _state_receipts WHERE operation_id < ? ORDER BY operation_id LIMIT ?)`, below[:], pruneBatch); err != nil {
 			return err
 		}
-		if err := d.exec("INSERT INTO _state_receipts VALUES (?, ?, x'', ?)", c.ID[:], c.Bound[:], seq); err != nil {
+		if err := d.exec("INSERT INTO _state_receipts VALUES (?, ?, ?, x'')", seq, c.ID[:], c.Bound[:]); err != nil {
 			return err
 		}
 		if err := d.exec("UPDATE _state_meta SET schema = ?, sequence = ?, expiry_floor_ms = ?", c.Schema, seq, floor); err != nil {
@@ -456,7 +463,7 @@ func (d *DB) schemaOwned() error {
 		if err := rows.Scan(&fk, &n); err != nil {
 			return err
 		}
-		if reserved(n) && (fk || n != "_state_meta" && n != "_state_receipts") {
+		if reserved(n) && (fk || n != "_state_meta" && n != "_state_receipts" && n != "sqlite_autoindex__state_receipts_1") {
 			return ErrReserved
 		}
 	}

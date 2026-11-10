@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 	"path/filepath"
 	"slices"
 	"time"
@@ -262,7 +263,7 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 			Message: "stored schema differs"}
 	}
 	var cb error
-	v, err := e.db.Read(scoped(n.cfg.Limits.ResultBytes, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
+	v, err := e.db.Read(scoped(math.MaxInt, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb)) // stores nothing: unbounded (D22)
 	if err != nil {
 		return Result{}, callbackError(err, cb)
 	}

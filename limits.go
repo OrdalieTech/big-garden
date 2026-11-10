@@ -16,7 +16,7 @@ import (
 //
 //	EntityBytes            64 MiB [4 KiB..256 MiB]  database size
 //	CacheBytes             8 GiB  local cache; >= Recoveries*(4*EntityBytes+1 MiB)
-//	ResultBytes            16 KiB [..64 KiB]        a callback's result (Result.Value)
+//	ResultBytes            4 KiB [..64 KiB]         a stored result (receipt) of Create, Update, Migrate, Import
 //	ResidentEntities       256                      open entities
 //	InflightStorage        64                       concurrent storage requests
 //	PendingPerEntity       64                       queued requests per entity
@@ -57,7 +57,7 @@ func (l Limits) resolve() (Limits, error) {
 	}
 	orDefault(&l.EntityBytes, 64<<20)
 	orDefault(&l.CacheBytes, 8<<30)
-	orDefault(&l.ResultBytes, 16<<10)
+	orDefault(&l.ResultBytes, 4<<10)
 	orDefault(&l.ResidentEntities, 256)
 	orDefault(&l.InflightStorage, 64)
 	orDefault(&l.PendingPerEntity, 64)

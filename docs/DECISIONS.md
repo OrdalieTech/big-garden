@@ -156,3 +156,11 @@ S3 holds the state; the local cache only saves downloads. An entity has three st
 
 Tests: `TestWarmTier` (hit after restart with zero object GETs, catch-up after another node's writes fetching at most the head's deltas, cold on a corrupted file, cold after a snapshot elsewhere, `Evict`), `TestWarmBudget` (20 entities in a 6 MiB budget: parked, evicted, all readable), `TestOracleRandomized` (catch-up of the previous full restore's image with the newer links compared with SQLite's image: `-long`, 105,004 transactions, 129 overlays) and `TestWarmKill`.
 
+## D22. Format 1 amendments from the consumer-side review (2026-11-10)
+
+A review of the public API from outside (`.work/paradigm-probe.md`) measured what consumers pay; these change format 1 before anything uses it, or a default.
+
+- **Receipts are a rowid table keyed by sequence** (`sequence INTEGER PRIMARY KEY, operation_id BLOB NOT NULL UNIQUE, input_hash, result`). The `WITHOUT ROWID` layout was an index b-tree whose leaf keeps at most 1,002 bytes of a row: any result above ~940 bytes paid a 4 KiB overflow page (4,686 bytes per receipt from 1 KiB to 4 KiB results). A table b-tree leaf keeps 4,061 bytes; sequences are monotonic, so inserts append. `TestReceiptCost`: 113, 389, 1,413 and 4,137 bytes per receipt for 0, 256, 1,024 and 3,900-byte results (page packing plus the operation-ID index). Activation compares both library tables' `sqlite_schema.sql` with the format 1 DDL, so an image in another layout is `corrupt` (`TestOldReceiptsLayoutRejected`).
+- **`ResultBytes` defaults to 4 KiB** (was 16 KiB) and bounds stored results only (Create, Update, Migrate, Import): a receipt is a result's whole cost, and at the default 1 h retention a 64 MiB entity holds about 18.6 KB/s of results. **A Read result is unbounded**: a Read stores nothing, and the bound was bypassable through a captured variable anyway.
+- **`secure_delete=FAST`** on every connection: deleted bytes leave the image, its delta and later snapshots at the deleting commit (`TestSecureDelete`); with `auto_vacuum=FULL` no page is added to a delta.
+

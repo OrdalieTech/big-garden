@@ -108,6 +108,12 @@ func (d *DB) check(h *head.Head) error {
 	if err := d.schemaOwned(); err != nil { // an image the library never publishes (an import)
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
+	for i, name := range []string{"_state_meta", "_state_receipts"} { // another layout of the library's tables
+		var sql string
+		if err := d.conn.QueryRowContext(context.Background(), "SELECT sql FROM sqlite_schema WHERE name = ?", name).Scan(&sql); err != nil || sql != reservedSQL[i] {
+			return fmt.Errorf("%w: %s is not the format 1 table", ErrCorrupt, name)
+		}
+	}
 	var res string
 	if err := d.conn.QueryRowContext(context.Background(), "PRAGMA integrity_check(1)").Scan(&res); err != nil {
 		return err

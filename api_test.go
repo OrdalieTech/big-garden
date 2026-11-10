@@ -155,7 +155,7 @@ func TestLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Limits{EntityBytes: 64 << 20, CacheBytes: 8 << 30, ResultBytes: 16 << 10, ResidentEntities: 256,
+	want := Limits{EntityBytes: 64 << 20, CacheBytes: 8 << 30, ResultBytes: 4 << 10, ResidentEntities: 256,
 		InflightStorage: 64, PendingPerEntity: 64, Recoveries: 8, BatchMax: 16, StorageAttemptTimeout: 2 * time.Second,
 		CommitTimeout: 10 * time.Second, IdleTimeout: time.Minute, ReceiptRetention: time.Hour}
 	if l != want {

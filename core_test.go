@@ -339,13 +339,16 @@ func TestCreateUpdateReadLookup(t *testing.T) {
 	if err != boom {
 		t.Fatalf("read callback error %v", err)
 	}
-	_, err = n.Read(bg, ref, 1, func(*View) ([]byte, error) { return make([]byte, 17<<10), nil })
-	wantCode(t, err, CodeCapacity)
+	if res, err := n.Read(bg, ref, 1, func(*View) ([]byte, error) { return make([]byte, 200<<10), nil }); err != nil || len(res.Value) != 200<<10 {
+		t.Fatalf("a Read result is unbounded (D22): %d bytes, %v", len(res.Value), err)
+	}
 
 	st := n.Stats()
 	if st.Commits < 6 || st.Replays != 1 || st.Conflicts != 1 || st.Reads < 1 || st.ResidentEntities != 1 || st.Mutations < 6 {
 		t.Fatalf("stats %+v", st)
 	}
+	_, err = n.Update(bg, ref, newReq(t, "big result", 1), func(*Tx) ([]byte, error) { return make([]byte, 4<<10+1), nil })
+	wantCode(t, err, CodeCapacity) // a stored result is bounded by ResultBytes
 	route, err := n.Resolve(bg, "doc")
 	if err != nil || route.Ref != ref || route.Owner != n.Owner() || route.Epoch != 1 {
 		t.Fatalf("resolve %+v %v", route, err)

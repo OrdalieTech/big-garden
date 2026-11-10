@@ -497,3 +497,56 @@ func TestSecureDelete(t *testing.T) {
 		}
 	}
 }
+
+// TestReceiptCost: a receipt costs its share of a leaf page (rows of result +
+// ~80 bytes packed whole into 4,061 bytes) plus its operation-ID index entry,
+// with no overflow page up to ~3.9 KiB (format 1 receipts are a rowid table;
+// the earlier WITHOUT ROWID layout cost 4,686 bytes for any result from ~940
+// bytes to 4 KiB).
+func TestReceiptCost(t *testing.T) {
+	for _, size := range []int{0, 256, 1024, 3900} {
+		f := newFixture(t, head.MaxPages)
+		size0 := f.d.Bytes()
+		const n = 400
+		for range n {
+			f.n++
+			if _, _, err := f.d.Mutate(commit(f.n), func(*Tx) ([]byte, error) { return make([]byte, size), nil }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.publish(t, true)
+		per := float64(f.d.Bytes()-size0) / n
+		t.Logf("result %4d B: %.0f B per receipt", size, per)
+		if want := 4096/float64(4061/(size+80)) + 60; per > want {
+			t.Errorf("result %d B: %.0f B per receipt, want at most %.0f", size, per, want)
+		}
+	}
+}
+
+// TestOldReceiptsLayoutRejected: an image whose library tables are not the
+// format 1 DDL (here the earlier WITHOUT ROWID receipts) fails check, so an
+// archive in another layout cannot be imported or activated.
+func TestOldReceiptsLayoutRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old")
+	raw := sql.OpenDB(connector{plain.sqlite, fileDSN(path, "rwc")})
+	ns, inc := head.NewID(), head.NewID()
+	for _, q := range []string{"PRAGMA auto_vacuum=FULL", "PRAGMA journal_mode=WAL", reservedSQL[0],
+		`CREATE TABLE _state_receipts(operation_id BLOB PRIMARY KEY, input_hash BLOB NOT NULL,
+  result BLOB NOT NULL, sequence INTEGER NOT NULL) STRICT, WITHOUT ROWID`} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := raw.Exec("INSERT INTO _state_meta VALUES (1, ?, 'key', ?, 1, 0, 0)", ns[:], inc[:]); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	d, err := open(bg, plain, path, head.MaxPages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Discard()
+	if err := d.check(&head.Head{Namespace: ns, Key: "key", Incarnation: inc, Schema: 1}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("old receipts layout: %v, want ErrCorrupt", err)
+	}
+}
