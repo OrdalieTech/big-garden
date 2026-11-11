@@ -132,3 +132,40 @@ func TestRouterTransportLossIsUnknown(t *testing.T) {
 		t.Fatalf("got %v, want outcome_unknown for the request", err)
 	}
 }
+
+// TestRouterTakeoverRoutes: the Node that took an entity over remembers it
+// owns it, so later forwarded mutations need no takeover, and a route
+// remembered from a reply (owner only, no epoch) is observed before a
+// takeover instead of failing it as stale.
+func TestRouterTakeoverRoutes(t *testing.T) {
+	c := newCluster(t, "a", "b", "c")
+	key := "k"
+	if _, _, err := c.routers["a"].Mutate(bg, Call{Op: "create", Key: key, Req: req(t, "create"), Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	pref, _ := garden.Preferred(key, c.Members())
+	var via string
+	for _, m := range c.Members() {
+		if m != pref {
+			via = m
+		}
+	}
+	c.incr(t, via, key) // via remembers the owner from the reply: no epoch
+	c.mu.Lock()
+	c.members = slices.DeleteFunc(c.members, func(m string) bool { return m == pref })
+	c.down[pref] = true
+	c.mu.Unlock()
+	next, _ := garden.Preferred(key, c.Members())
+	r := c.routers[next]
+	r.remember(key, garden.Route{Ref: garden.Ref{Key: key}, Owner: garden.Owner{NodeID: pref}})
+	rt, _ := c.routers[via].n.Resolve(bg, key)
+	if rep := r.run(bg, Call{Op: "incr", Key: key, Req: req(t, "local")}, garden.Route{Ref: rt.Ref, Owner: garden.Owner{NodeID: pref}}); rep.Err != nil {
+		t.Fatalf("takeover from an owner-only route: %v", rep.Err)
+	}
+	if got := r.owners[key].Owner.NodeID; got != next {
+		t.Fatalf("%s remembers %q as the owner after taking over", next, got)
+	}
+	for range 3 {
+		c.incr(t, via, key)
+	}
+}

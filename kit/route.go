@@ -164,16 +164,30 @@ func (r *Router) run(ctx context.Context, c Call, rt garden.Route) Reply {
 	fn := func(tx *garden.Tx) ([]byte, error) { v, err := h(tx, c.Input); cb = err; return v, err }
 	var rep Reply
 	var err error
+	self := r.n.Owner().NodeID
+	gone := func(rt garden.Route) bool {
+		return rt.Owner.NodeID != self && (rt.Owner.NodeID == "" || !slices.Contains(r.m.Members(), rt.Owner.NodeID))
+	}
 	if c.Create {
-		rep.Ref, rep.Result, err = r.n.Create(ctx, c.Key, c.Req, fn)
-	} else {
-		self := r.n.Owner().NodeID
-		if rt.Owner.NodeID != self && (rt.Owner.NodeID == "" || !slices.Contains(r.m.Members(), rt.Owner.NodeID)) {
-			if rt, err = r.n.Takeover(ctx, rt); err != nil {
-				cb = nil
-			}
+		if rep.Ref, rep.Result, err = r.n.Create(ctx, c.Key, c.Req, fn); err == nil {
+			r.remember(c.Key, garden.Route{Ref: rep.Ref, Owner: r.n.Owner()})
 		}
-		if err == nil {
+	} else {
+		if gone(rt) && rt.Epoch == 0 { // a route remembered from a reply names only its owner: observe the head first
+			rt, err = r.n.Resolve(ctx, c.Key)
+		}
+		switch {
+		case err != nil:
+		case gone(rt):
+			if rt, err = r.n.Takeover(ctx, rt); err == nil {
+				r.remember(c.Key, rt)
+			}
+		case rt.Owner.NodeID != self: // a live member owns it after all: the origin re-routes
+			return Reply{Err: &garden.Error{Code: garden.CodeNotOwner, Route: &rt, Message: "kit: owned elsewhere"}}
+		}
+		if err != nil {
+			cb = nil
+		} else {
 			rep.Ref = rt.Ref
 			rep.Result, err = r.n.Update(ctx, rt.Ref, c.Req, fn)
 		}
