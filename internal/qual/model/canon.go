@@ -87,7 +87,7 @@ func (k *canon) obj(o *Obj) {
 	k.id(o.Att)
 	k.id(o.Inc)
 	k.i16(o.Base)
-	k.b = append(k.b, uint8(o.Min), uint8(o.Max), uint8(o.Level), uint8(o.Stamp))
+	k.b = append(k.b, uint8(o.Min), uint8(o.Max), uint8(o.Level), uint8(o.Stamp), uint8(o.Gen))
 	k.bit(o.Snap)
 	k.bit(o.Present)
 	if !o.Snap {
@@ -372,6 +372,7 @@ func (k *canon) encode(c *Case, s *State) {
 		g := &s.Ghost[e]
 		k.bit(g.EverHead)
 		k.bit(g.Lost)
+		k.i8(g.MaxGen)
 		k.img(&g.LostImg)
 		k.i16(int16(g.Gone))
 		k.i16(int16(g.Gone >> 16))

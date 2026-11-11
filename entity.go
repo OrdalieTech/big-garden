@@ -143,12 +143,16 @@ func routeOf(h *head.Head) *Route {
 	return r
 }
 
-// missing returns state_missing if birth.json exists, else not_found.
+// missing returns not_found if no head was ever published (no head.json,
+// and nothing but birth.json, D27), else state_missing.
 func (n *Node) missing(ctx context.Context, key string) error {
 	_, err := n.st.Get(ctx, head.BirthKey(key), "", head.MaxBirthBytes)
 	switch store.OutcomeOf(err) {
 	case store.OK:
-		return newError(CodeStateMissing, "birth.json exists without head.json", nil)
+		if err := n.untouched(ctx, key); err != nil {
+			return err
+		}
+		return newError(CodeNotFound, "", nil)
 	case store.NotFound:
 		return newError(CodeNotFound, "", nil)
 	}
@@ -324,7 +328,9 @@ func (n *Node) dead(ctx context.Context, e *entity, c *candidate, cur *head.Head
 		}
 		// Absent from another incarnation, c may have committed in a deleted
 		// one, unless that incarnation began at the very revision c proposed.
-		deleted := cur.Incarnation != c.next.Incarnation && (c.base == nil || cur.Revision != c.base.Revision+1)
+		// A genesis of another incarnation at c's own revision lost a create race
+		// with c (D27): no delete can have come between.
+		deleted := cur.Incarnation != c.next.Incarnation && cur.Revision != c.next.Revision
 		if !ok && (deleted || tsOf(opOf(c)) <= int64(m.FloorMs)) { // or a newer owner pruned our receipt
 			e.discard()
 			e.resolved()

@@ -393,6 +393,11 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cOK, seq: p.Seq})
 			return
 		}
+		if p.PC == pcCrDone && p.Res == sDead && !p.Cur.Deleted && p.Cur.Rev == 1 && p.Cur.Inc != p.Inc {
+			// another incarnation's genesis won (D27): its state decides, as for a live key
+			x.wait(pcCrReplay, Msg{Kind: mGetObjs, Head: p.Cur})
+			return
+		}
 		x.subFail()
 
 	// §3 Read and Lookup.
@@ -599,23 +604,7 @@ func (x *px) run(ev, res uint8) {
 	case pcCrBirth:
 		x.crBirth(res == rOK, p.RBirth)
 	case pcCrList:
-		if p.Flag {
-			x.finish(out{code: cStateMissing, def: true})
-			return
-		}
-		if !p.Resume {
-			p.Inc = x.fresh()
-		}
-		img := Image{Seq: 1, Schema: x.r.Schema, Kept: 1}
-		img.Ops[0] = p.Req + 1
-		x.discard()
-		x.m.HasImg, x.m.Img = true, img
-		if p.Resume {
-			x.crUpload()
-			return
-		}
-		p.BAtt = x.fresh()
-		x.wait(pcCrPutBirth, x.birthMsg())
+		x.crList()
 	case pcCrPutBirth:
 		switch {
 		case ev == evTimeout && p.Put < 1:
@@ -653,7 +642,7 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cUnknown}) // after the birth, as above
 			return
 		}
-		next := Head{Inc: p.Inc, Gen: 1, Rev: 1, Nonce: x.fresh(), Owner: int8(x.n + 1), Sess: x.self(),
+		next := Head{Inc: p.Inc, Gen: p.O.Gen, Rev: 1, Nonce: x.fresh(), Owner: int8(x.n + 1), Sess: x.self(),
 			Epoch: 1, Img: x.m.Img, Snap: ref(p.O)}
 		if t := p.Cur; t.Deleted { // recreation: revision and epoch continue the tombstone's
 			next.Gen, next.Rev, next.Epoch = t.Gen+1, t.Rev+1, t.Epoch+1
@@ -1201,9 +1190,38 @@ func (x *px) crBirth(present bool, b Birth) {
 		x.wait(pcCrList, Msg{Kind: mList, List: listResume, Head: Head{Inc: b.Inc}})
 	case x.c.Reqs[b.Req-1].ID == x.r.ID:
 		x.finish(out{code: cIDConflict, def: true})
-	default:
-		x.finish(out{code: cStateMissing, def: true})
+	default: // D27: an interrupted create that left no object is superseded in a new incarnation, with no birth PUT
+		p.Resume, p.Inc = true, x.fresh()
+		if x.v == SupersedeUnchecked { // control: superseded whatever it left
+			p.Flag = false
+			x.crList()
+			return
+		}
+		x.wait(pcCrList, Msg{Kind: mList, List: listEmpty})
 	}
+}
+
+// crList is §5 step 3's outcome: refused over what the LIST found, else
+// genesis is built, and uploaded at once by a resume or a supersede.
+func (x *px) crList() {
+	p := x.p
+	if p.Flag {
+		x.finish(out{code: cStateMissing, def: true})
+		return
+	}
+	if !p.Resume {
+		p.Inc = x.fresh()
+	}
+	img := Image{Seq: 1, Schema: x.r.Schema, Kept: 1}
+	img.Ops[0] = p.Req + 1
+	x.discard()
+	x.m.HasImg, x.m.Img = true, img
+	if p.Resume {
+		x.crUpload()
+		return
+	}
+	p.BAtt = x.fresh()
+	x.wait(pcCrPutBirth, x.birthMsg())
 }
 
 func (x *px) birthMsg() Msg {
@@ -1212,9 +1230,10 @@ func (x *px) birthMsg() Msg {
 
 func (x *px) crUpload() {
 	p := x.p
-	p.O = Obj{Att: x.fresh(), Inc: p.Inc, Min: 1, Max: x.m.Img.Seq, Snap: true, Present: true, Post: x.m.Img, Stamp: x.clock()}
+	p.O = Obj{Att: x.fresh(), Inc: p.Inc, Min: 1, Max: x.m.Img.Seq, Snap: true, Present: true, Post: x.m.Img, Stamp: x.clock(),
+		Gen: x.s.Ghost[x.e].MaxGen + 1} // a fresh incarnation ID, which the model orders
 	if p.Cur.Deleted { // a recreation's snapshot is produced against the tombstone
-		p.O.Base = p.Cur.Rev
+		p.O.Base, p.O.Gen = p.Cur.Rev, p.Cur.Gen+1
 	}
 	p.Put = 0
 	x.wait(pcCrPutObj, Msg{Kind: mPutObj, Obj: p.O})

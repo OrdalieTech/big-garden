@@ -118,6 +118,11 @@ func (w *world) list(m *Msg, p *Proc) {
 			o := &en.Objs[i]
 			p.Flag = p.Flag || (o.Present && (o.Inc != m.Head.Inc || o.Base > 0))
 		}
+	case listEmpty:
+		p.Flag = false
+		for i := int8(0); i < en.NObj; i++ {
+			p.Flag = p.Flag || en.Objs[i].Present
+		}
 	case listCollect:
 		cur := &m.Head
 		p.NDel = 0
@@ -169,7 +174,7 @@ func (w *world) writeHead(e int, nh Head, node int8, sess ID, cond ID) {
 			g.Gone |= 1 << (nh.Img.Ops[i] - 1)
 		}
 	}
-	g.EverHead = true
+	g.EverHead, g.MaxGen = true, max(g.MaxGen, nh.Gen)
 	for _, f := range g.Failed[:g.NFailed] {
 		if f == nh.Cand {
 			w.fail("definite failure: candidate #%d committed after its operation reported it not committed", nh.Cand)
@@ -246,9 +251,9 @@ func (w *world) checkWrite(e int, nh Head, node int8, sess ID, cond ID) {
 			w.fail("G7: malformed genesis (revision %d, epoch %d, sequence %d)", nh.Rev, nh.Epoch, img.Seq)
 		case nh.Owner != node+1 || nh.Sess != sess:
 			w.fail("G3: genesis owned by node %d, written by node %d", nh.Owner-1, node)
-		case !b.Present || b.Inc != nh.Inc || img.Ops[0] != b.Req:
+		case !b.Present || b.Inc == nh.Inc && img.Ops[0] != b.Req: // another incarnation supersedes (D27)
 			w.fail("G6: genesis does not match birth.json (birth request r%d, genesis request r%d)", b.Req-1, img.Ops[0]-1)
-		case g.EverHead && *img != g.LostImg:
+		case g.EverHead && g.LostImg != (Image{}) && *img != g.LostImg:
 			w.fail("G6: genesis published over a used key with a different image (%s, lost head had %s)", imgString(img), imgString(&g.LostImg))
 		}
 		w.checkChain(e, &nh)
@@ -377,7 +382,8 @@ func (w *world) checkState() {
 		}
 		img := &en.Head.Img
 		for q, seq := range w.s.Acked {
-			if seq != 0 && int(w.c.Reqs[q].Ent) == e && w.s.AckGen[q] == en.Head.Gen && (seq > img.Seq || img.Ops[seq-1] != int8(q+1)) {
+			// (a genesis after a lost tombstone starts at generation 1 again: Gone scopes it, D27)
+			if seq != 0 && int(w.c.Reqs[q].Ent) == e && w.s.AckGen[q] == en.Head.Gen && w.s.Ghost[e].Gone&(1<<q) == 0 && (seq > img.Seq || img.Ops[seq-1] != int8(q+1)) {
 				w.fail("G1: acknowledged r%d (sequence %d) is not in the current head %s", q, seq, imgString(img))
 			}
 		}

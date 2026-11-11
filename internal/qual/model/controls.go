@@ -10,6 +10,8 @@ func controlCase(v Variant) *Case {
 		return caseG()
 	case D5NoIdentity:
 		return caseC0()
+	case SupersedeUnchecked:
+		return caseCD()
 	case TailWithoutObject:
 		return caseCD()
 	case BatchLeaderReceipt:

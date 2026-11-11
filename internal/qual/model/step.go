@@ -212,6 +212,9 @@ func step(c *Case, v Variant, s *State, t Tr, cov *coverage) (bound uint8, viol 
 	case tLoss:
 		en, g := &s.Ents[t.A], &s.Ghost[t.A]
 		g.Lost, g.LostImg = true, en.Head.Img
+		if en.Head.Deleted { // a lost tombstone held no data: a later genesis replaces nothing (D27)
+			g.LostImg = Image{}
+		}
 		en.HasHead, en.Head = false, Head{}
 		s.Losses++
 	}

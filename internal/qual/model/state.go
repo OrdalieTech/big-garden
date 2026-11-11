@@ -106,6 +106,7 @@ type Obj struct {
 	Att, Inc               ID
 	Base                   int16
 	Min, Max, Level, Stamp int8
+	Gen                    int8 // ghost: the incarnation ordinal a genesis snapshot belongs to
 	Snap, Present          bool
 	Pre, Post              Image
 }
@@ -149,6 +150,7 @@ const (
 const (
 	listFresh  uint8 = iota + 1 // create, birth absent: anything under the entity prefix
 	listResume                  // create D5: objects outside birth.inc or with base > 0
+	listEmpty                   // create D27: any object
 	listCollect
 )
 
@@ -247,6 +249,7 @@ type Node struct {
 // Ghost is per-entity history needed by the invariants.
 type Ghost struct {
 	EverHead, Lost bool
+	MaxGen         int8 // highest incarnation ordinal published: a new incarnation's genesis takes the next (D27)
 	LostImg        Image
 	NFailed        int8
 	Failed         [maxFailed]ID // candidates reported as definitely not committed
@@ -302,6 +305,7 @@ const (
 	DeleteAsRelease
 	ReceiptAcrossIncarnation
 	RecreateKeepsData
+	SupersedeUnchecked
 	numVariants
 )
 
@@ -311,6 +315,7 @@ var variantNames = [...]string{
 	"d5-resume-without-identity", "compaction-retargeted", "inline-tail-without-object",
 	"batch-ack-on-leader-receipt", "read-rides-unresolved",
 	"follower-stale-read", "delete-done-as-release", "receipt-across-incarnation", "recreation-keeps-data",
+	"supersede-over-objects",
 }
 
 func (v Variant) String() string { return variantNames[v] }

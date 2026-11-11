@@ -431,7 +431,7 @@ func TestConcurrentCreates(t *testing.T) {
 			switch {
 			case err == nil:
 				wins.Add(1)
-			case errors.As(err, &e) && (e.Code == CodeStateMissing || e.Code == CodeInvalidArgument):
+			case errors.As(err, &e) && (e.Code == CodeStateMissing || e.Code == CodeInvalidArgument): // never outcome_unknown
 			default:
 				t.Errorf("create %d: %v", i, err)
 			}
@@ -470,7 +470,7 @@ func TestCreateResumeD5(t *testing.T) {
 	// a new process resumes from birth.json with the same request (D5)
 	n2 := testNode(t, mem, "a", nil)
 	_, _, err = n2.Create(bg, "k", newReq(t, "other", 1), createKV)
-	wantCode(t, err, CodeStateMissing)
+	wantCode(t, err, CodeStateMissing) // its snapshot may be a genesis whose head was lost (D27)
 	ref, res, err := n2.Create(bg, "k", req, createKV)
 	if err != nil || res.Replayed || string(res.Value) != "created" {
 		t.Fatalf("resume %+v %v", res, err)
@@ -478,10 +478,106 @@ func TestCreateResumeD5(t *testing.T) {
 	l := newLedger()
 	mustPut(t, n2, ref, "a", "1", l)
 	l.verify(t, mem, "a")
-	// a used head that disappears is never resumed
+	// a used head that disappears is never resumed nor superseded
 	mem.Delete(bg, head.HeadKey("k"))
-	_, _, err = testNode(t, mem, "a", nil).Create(bg, "k", req, createKV)
-	wantCode(t, err, CodeStateMissing)
+	for _, r := range []Request{req, newReq(t, "other", 1)} {
+		_, _, err = testNode(t, mem, "a", nil).Create(bg, "k", r, createKV)
+		wantCode(t, err, CodeStateMissing)
+	}
+}
+
+// TestCreateLosesGenesisRace: two requests superseding the same interrupted
+// create race at the genesis CAS; the loser finds the winner's genesis in
+// another incarnation at its own revision 1, which no delete can have come
+// before, so it is not committed and answers "key exists", never
+// outcome_unknown (D27).
+func TestCreateLosesGenesisRace(t *testing.T) {
+	mem := newStore(t)
+	var armed atomic.Bool
+	armed.Store(true)
+	hold := make(chan struct{})
+	var held atomic.Bool
+	mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+		switch {
+		case armed.Load() && a.Op == "put" && strings.HasSuffix(a.Key, ".ltx"):
+			return storetest.MemFault{Reject: store.Failed} // the first create leaves birth.json only
+		case !armed.Load() && a.Op == "put" && strings.HasSuffix(a.Key, ".ltx") && held.CompareAndSwap(false, true):
+			return storetest.MemFault{Hold: hold} // the loser's snapshot lands after the winner's LIST
+		}
+		return storetest.MemFault{}
+	})
+	_, _, err := testNode(t, mem, "a", nil).Create(bg, "k", newReq(t, "create", 1), createKV)
+	wantCode(t, err, CodeOutcomeUnknown)
+	armed.Store(false)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := testNode(t, mem, "b", nil).Create(bg, "k", newReq(t, "loser", 1), createKV)
+		done <- err
+	}()
+	for !held.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	if _, _, err := testNode(t, mem, "c", nil).Create(bg, "k", newReq(t, "winner", 1), createKV); err != nil {
+		t.Fatal(err)
+	}
+	close(hold)
+	wantCode(t, <-done, CodeInvalidArgument)
+}
+
+// TestCreateAfterInterruptedBirth: a create interrupted before it wrote any
+// object never published a head, so the key reads as absent and another
+// request creates it in a new incarnation (D27). Once a snapshot exists it
+// may be a genesis whose head was lost: only the interrupted request resumes
+// it (D5), and an acknowledged genesis whose head.json was deleted stays
+// refused (D14).
+func TestCreateAfterInterruptedBirth(t *testing.T) {
+	interrupted := func(t *testing.T, fault func(a storetest.Attempt) bool) (faultStore, Request) {
+		mem := newStore(t)
+		n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+		var armed atomic.Bool
+		armed.Store(true)
+		mem.SetPlan(func(a storetest.Attempt) storetest.MemFault {
+			if armed.Load() && fault(a) {
+				return storetest.MemFault{Reject: store.Failed}
+			}
+			return storetest.MemFault{}
+		})
+		req := newReq(t, "create", 1)
+		_, _, err := n.Create(bg, "k", req, createKV)
+		wantCode(t, err, CodeOutcomeUnknown)
+		armed.Store(false)
+		return mem, req
+	}
+	t.Run("no object: a new incarnation", func(t *testing.T) {
+		mem, req := interrupted(t, func(a storetest.Attempt) bool { return a.Op == "put" && strings.HasSuffix(a.Key, ".ltx") })
+		n := testNode(t, mem, "b", nil)
+		_, err := n.Resolve(bg, "k")
+		wantCode(t, err, CodeNotFound)
+		_, err = n.Read(bg, Ref{Key: "k"}, 1, func(*View) ([]byte, error) { return nil, nil })
+		wantCode(t, err, CodeNotFound)
+		ref, res, err := n.Create(bg, "k", newReq(t, "other", 1), createKV)
+		if b, _ := n.birth(bg, "k"); err != nil || res.Replayed || string(res.Value) != "created" || b == nil || b.Incarnation == ref.Incarnation {
+			t.Fatalf("create %+v %v, birth %+v", res, err, b)
+		}
+		_, _, err = n.Create(bg, "k", req, createKV)
+		wantCode(t, err, CodeInvalidArgument)
+		l := newLedger()
+		mustPut(t, n, ref, "a", "1", l)
+		l.verify(t, mem, "a")
+	})
+	t.Run("an acknowledged genesis whose head was deleted", func(t *testing.T) {
+		mem := newStore(t)
+		ref := mustCreate(t, testNode(t, mem, "a", nil), "k", nil)
+		mem.Delete(bg, head.HeadKey("k"))
+		n := testNode(t, mem, "b", nil)
+		_, err := n.Resolve(bg, "k")
+		wantCode(t, err, CodeStateMissing)
+		_, _, err = n.Create(bg, "k", newReq(t, "other", 1), createKV)
+		wantCode(t, err, CodeStateMissing)
+		if page, _, _ := mem.List(bg, head.ObjectPrefix("k", ref.Incarnation), "", 2); len(page) != 1 {
+			t.Fatalf("the genesis snapshot was touched: %d objects", len(page))
+		}
+	})
 }
 
 // TestCreateAfterBirthIsUnknown: once birth.json may exist, only the same

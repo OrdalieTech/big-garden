@@ -435,8 +435,11 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			inc = birth.Incarnation
 		case birth != nil && birth.OperationID == head.OpID(req.ID):
 			return Ref{}, Result{}, &Error{Code: CodeIDConflict, Operation: req.ID, Message: "operation ID used with another input"}
-		case birth != nil:
-			return Ref{}, Result{}, newError(CodeStateMissing, "birth.json exists without head.json", nil)
+		case birth != nil: // D27: an interrupted create that left no object is superseded, in a new incarnation
+			if err := n.untouched(ctx, key); err != nil {
+				return Ref{}, Result{}, err
+			}
+			inc = head.NewID()
 		default:
 			page, _, err := n.st.List(ctx, head.EntityDir(key)+"/", "", 1)
 			if err != nil {
@@ -528,6 +531,9 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			Owner: &self, Epoch: c.next.Epoch, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
 			PageCount: snap.PageCount, DatabaseChecksum: ref.PostChecksum, Snapshot: ref, Deltas: []head.Ref{}}
 		rec, err := n.publish(e, &c)
+		if tomb == nil && lostGenesis(err) { // another create published genesis first (D27)
+			return n.answer(ctx, e, key, req, bound, t0)
+		}
 		if err != nil {
 			return unknown(err)
 		}
@@ -597,6 +603,37 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 			return nil
 		}
 	}
+}
+
+// untouched is the D27 check: an interrupted create that left no object never
+// published a head, so another request may take the key. A snapshot left may
+// be a genesis whose head was published, then lost (D14): only its request
+// resumes it (D5).
+func (n *Node) untouched(ctx context.Context, key string) error {
+	page, _, err := n.st.List(ctx, head.EntityDir(key)+"/objects/", "", 1)
+	if err != nil {
+		return storeError(err)
+	}
+	if len(page) > 0 {
+		return newError(CodeStateMissing, "birth.json and objects exist without head.json", nil)
+	}
+	return nil
+}
+
+// lostGenesis is a genesis publication that found another genesis.
+func lostGenesis(err error) bool {
+	var pe *Error
+	return errors.As(err, &pe) && (pe.Code == CodeRouteChanged || pe.Code == CodeNotOwner)
+}
+
+// answer is a create's reply from the key's current head (§5 step 2).
+func (n *Node) answer(ctx context.Context, e *entity, key string, req Request, bound head.Digest, t0 time.Time) (Ref, Result, error) {
+	obj, err := n.st.Get(ctx, head.HeadKey(key), "", head.MaxHeadBytes)
+	if err != nil {
+		return Ref{}, Result{}, storeError(err)
+	}
+	h, err := n.decodeHead(obj.Body, key, head.ID{})
+	return n.createExists(ctx, e, req, bound, h, err, t0)
 }
 
 func withOp(err error, id MutationID) error {
