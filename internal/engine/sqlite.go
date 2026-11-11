@@ -20,7 +20,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"syscall"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/superfly/ltx"
@@ -192,7 +191,7 @@ func (c connector) Driver() driver.Driver                        { return c.d }
 // the reserved tables and a meta row at sequence 0 (PROTOCOL §5 step 4). The
 // first Mutate then produces sequence 1.
 func Create(ctx context.Context, drv *Driver, path string, maxPages uint32, ns head.ID, key string, inc head.ID) (*DB, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|NoFollow, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +238,7 @@ func open(ctx context.Context, drv *Driver, path string, maxPages uint32) (*DB, 
 		err = d.setup(maxPages)
 	}
 	if err == nil {
-		d.main, err = os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		d.main, err = os.OpenFile(path, os.O_RDONLY|NoFollow, 0)
 	}
 	if err != nil {
 		return nil, errors.Join(err, d.close())

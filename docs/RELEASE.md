@@ -1,3 +1,7 @@
+# Milestone v0.2.1 (2026-11-11)
+
+v0.2.0 plus a build for every OS a consumer ships to: the two calls that were Unix-only, an open that refuses a symbolic link and the node directory's lock, move to `internal/engine/os_unix.go` and `os_windows.go` (`FILE_FLAG_OPEN_REPARSE_POINT` and `LockFileEx` on Windows). Behaviour on Unix is unchanged. Qualification remains Linux only: Windows and macOS compile, they are not qualified to run a node.
+
 # Milestone v0.2.0 (2026-11-11)
 
 v0.1.0 plus the kit package (D26) and the primitives a consumer with deterministic keys needs (D27-D32): a create that left no object no longer blocks its key; `exists` is its own code; a wake handler returns a result handed to a non-blocking hook, with a backoff on failure; the router remembers the routes it learns; a Create is admitted at any age, so a create cut between birth and head is resumed by its Request at any time, and only a tombstone refuses an expired ID; Wakes creates its shards under a constant Request. Still not the PLAN §22 production release, for the reasons v0.1.0 lists.

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"syscall"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/superfly/ltx"
@@ -49,7 +48,7 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 	if len(objs) != len(refs) || h.PageCount > maxPages {
 		return nil, nil, errors.New("engine: objects do not match the head or exceed the page limit")
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|flag|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|flag|NoFollow, 0o600)
 	if err != nil {
 		return nil, nil, err
 	}

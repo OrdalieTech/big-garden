@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/engine"
@@ -417,11 +416,11 @@ func (n *Node) sessionDir() error {
 // lockDir opens dir/lock (never following symlinks) and takes an exclusive
 // non-blocking flock on it.
 func lockDir(dir string, flags int) (*os.File, bool) {
-	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR|syscall.O_NOFOLLOW|flags, 0o600)
+	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR|engine.NoFollow|flags, 0o600)
 	if err != nil {
 		return nil, false
 	}
-	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+	if engine.Lock(f) != nil {
 		f.Close()
 		return nil, false
 	}
