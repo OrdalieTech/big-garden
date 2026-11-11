@@ -25,6 +25,7 @@ const (
 	CodeStateMissing        Code = "state_missing"        // existing state is incomplete; never recreated
 	CodeClosed              Code = "closed"               // the Node is closed
 	CodeInvalidArgument     Code = "invalid_argument"     // the call itself is malformed
+	CodeExists              Code = "exists"               // Create or Import: the key has a live head; Error.Route names it
 )
 
 // Error is the only error type returned by this package, apart from caller

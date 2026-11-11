@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"time"
 
 	garden "github.com/OrdalieTech/big-garden"
@@ -103,12 +104,23 @@ func (w *Wakes) Arm(ctx context.Context, key string, due time.Time) error {
 		return err
 	}
 	c := Call{Op: armOp, Key: w.shard(key), Req: req, Input: in}
-	_, _, err = w.r.Mutate(ctx, c)
-	var ge *garden.Error
-	if errors.As(err, &ge) && ge.Code == garden.CodeNotFound { // the shard's first arm
+	for try := range attempts {
+		c.Create = false
+		_, _, err = w.r.Mutate(ctx, c)
+		var ge *garden.Error
+		if !errors.As(err, &ge) || ge.Code != garden.CodeNotFound { // the shard's first arm creates it
+			return err
+		}
 		c.Create = true
-		if _, _, err = w.r.Mutate(ctx, c); errors.As(err, &ge) && ge.Code == garden.CodeIDConflict {
-			return w.Arm(ctx, key, due) // another Node created the shard first
+		// exists: another Node created the shard first; state_missing: its
+		// create is still between birth and head. Either way, arm it again.
+		if _, _, err = w.r.Mutate(ctx, c); !errors.As(err, &ge) || ge.Code != garden.CodeExists && ge.Code != garden.CodeStateMissing {
+			return err
+		}
+		select {
+		case <-time.After(rand.N(50 * time.Millisecond << try)):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return err

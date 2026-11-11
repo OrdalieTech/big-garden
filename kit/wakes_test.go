@@ -3,6 +3,7 @@ package kit
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -99,5 +100,37 @@ func TestWakes(t *testing.T) {
 			t.Fatalf("done %d, %d left", n, left)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestWakesArmRacesShardCreation: the first arms of a shard, from two Nodes
+// at once, race to create it; every arm still lands, whichever Node won and
+// whether its create was still between birth and head.
+func TestWakesArmRacesShardCreation(t *testing.T) {
+	c := newCluster(t, "a", "b")
+	ws := map[string]*Wakes{}
+	for _, id := range []string{"a", "b"} {
+		ws[id] = NewWakes(c.routers[id], 1, func(*garden.Tx, time.Time) (time.Time, error) { return time.Time{}, nil })
+	}
+	errs := make(chan error, 8)
+	for i := range 8 {
+		go func() { errs <- ws[[]string{"a", "b"}[i%2]].Arm(bg, fmt.Sprint("key", i), time.Now().Add(time.Hour)) }()
+	}
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := c.routers["a"].n
+	rt, err := n.Resolve(bg, "kit/wakes/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	n.Read(bg, rt.Ref, 1, func(v *garden.View) ([]byte, error) {
+		return nil, v.Query(bg, "SELECT count(*) FROM kit_wakes", nil, func(r *sql.Rows) error { r.Next(); return r.Scan(&rows) })
+	})
+	if rows != 8 {
+		t.Fatalf("%d of 8 arms landed", rows)
 	}
 }

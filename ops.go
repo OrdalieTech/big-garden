@@ -546,7 +546,7 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 
 // createExists answers a Create (invoked at t0) whose key has a live head
 // h, decoded with err (§5 step 2): the receipt of its ID in the current
-// state, a replay or id_conflict by bound, else "key exists". The receipt,
+// state, a replay or id_conflict by bound, else exists. The receipt,
 // not birth.json, decides: a recreation's create is not in birth.json (D25).
 func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound head.Digest, h *head.Head, err error, t0 time.Time) (Ref, Result, error) {
 	if err != nil {
@@ -566,7 +566,7 @@ func (n *Node) createExists(ctx context.Context, e *entity, req Request, bound h
 	case ok:
 		return Ref{}, Result{}, &Error{Code: CodeIDConflict, Operation: req.ID, Message: "operation ID used with another input"}
 	}
-	return Ref{}, Result{}, &Error{Code: CodeInvalidArgument, Route: routeOf(e.h), Message: "key exists"}
+	return Ref{}, Result{}, &Error{Code: CodeExists, Route: routeOf(e.h), Message: "key exists"}
 }
 
 // birth reads birth.json; nil if absent.

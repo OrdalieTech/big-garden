@@ -394,7 +394,7 @@ func TestCreateIdempotentAndConflicts(t *testing.T) {
 	_, _, err = n.Create(bg, "k", conflict, createKV)
 	wantCode(t, err, CodeIDConflict)
 	_, _, err = n.Create(bg, "k", newReq(t, "other", 1), createKV)
-	if e := wantCode(t, err, CodeInvalidArgument); e.Route == nil || e.Route.Ref != ref {
+	if e := wantCode(t, err, CodeExists); e.Route == nil || e.Route.Ref != ref {
 		t.Fatalf("key exists without a route: %+v", e)
 	}
 	// a failing callback leaves no trace: the key stays creatable (D11)
@@ -431,7 +431,7 @@ func TestConcurrentCreates(t *testing.T) {
 			switch {
 			case err == nil:
 				wins.Add(1)
-			case errors.As(err, &e) && (e.Code == CodeStateMissing || e.Code == CodeInvalidArgument): // never outcome_unknown
+			case errors.As(err, &e) && (e.Code == CodeStateMissing || e.Code == CodeExists): // never outcome_unknown
 			default:
 				t.Errorf("create %d: %v", i, err)
 			}
@@ -521,7 +521,7 @@ func TestCreateLosesGenesisRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	close(hold)
-	wantCode(t, <-done, CodeInvalidArgument)
+	wantCode(t, <-done, CodeExists)
 }
 
 // TestCreateAfterInterruptedBirth: a create interrupted before it wrote any
@@ -560,7 +560,7 @@ func TestCreateAfterInterruptedBirth(t *testing.T) {
 			t.Fatalf("create %+v %v, birth %+v", res, err, b)
 		}
 		_, _, err = n.Create(bg, "k", req, createKV)
-		wantCode(t, err, CodeInvalidArgument)
+		wantCode(t, err, CodeExists)
 		l := newLedger()
 		mustPut(t, n, ref, "a", "1", l)
 		l.verify(t, mem, "a")

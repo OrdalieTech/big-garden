@@ -140,7 +140,7 @@ func TestDelete(t *testing.T) {
 		t.Fatalf("retried recreation: %+v %v", res, err) // the receipt decides, not birth.json
 	}
 	_, _, err = a.Create(bg, "k", newReq(t, "other", 1), createKV)
-	wantCode(t, err, CodeInvalidArgument)
+	wantCode(t, err, CodeExists)
 	if got := readAll(t, a, ref2); len(got) != 0 { // nothing of the deleted incarnation
 		t.Fatalf("recreated entity holds %v", got)
 	}

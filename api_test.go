@@ -125,9 +125,9 @@ func recvName(r *ast.FieldList) string {
 func TestErrorCodes(t *testing.T) {
 	codes := []Code{CodeNotFound, CodeNotOwner, CodeRouteChanged, CodeIncarnationMismatch, CodeSchemaMismatch,
 		CodeIDConflict, CodeIDExpired, CodeAbsentAtVersion, CodeOutcomeUnknown, CodeUnavailable, CodeCapacity,
-		CodeUnsupported, CodeCorrupt, CodeStateMissing, CodeClosed, CodeInvalidArgument}
+		CodeUnsupported, CodeCorrupt, CodeStateMissing, CodeClosed, CodeInvalidArgument, CodeExists}
 	want := "not_found not_owner route_changed incarnation_mismatch schema_mismatch id_conflict id_expired " +
-		"absent_at_version outcome_unknown unavailable capacity unsupported corrupt state_missing closed invalid_argument"
+		"absent_at_version outcome_unknown unavailable capacity unsupported corrupt state_missing closed invalid_argument exists"
 	var got []string
 	for _, c := range codes {
 		got = append(got, string(c))
