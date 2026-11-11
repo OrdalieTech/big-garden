@@ -231,6 +231,15 @@ func TestWarmBudget(t *testing.T) {
 	for _, ref := range refs {
 		wantRows(t, n, ref, 20)
 	}
+	n.wmu.Lock() // the kept total matches the files after parks, claims and evictions
+	var sum int64
+	for _, w := range n.warm {
+		sum += w.bytes
+	}
+	if sum != n.warmUsed {
+		t.Errorf("warm bytes %d, files %d", n.warmUsed, sum)
+	}
+	n.wmu.Unlock()
 }
 
 // TestWarmActivationCost (GARDEN_MEASURE=1, best with GARDEN_TEST_S3=1)

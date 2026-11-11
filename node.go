@@ -34,6 +34,7 @@ type Node struct {
 	entities   map[string]*entity
 	wmu        sync.Mutex          // the warm tier below; after mu, never before
 	warm       map[string]warmFile // by EntityDir hash (D21)
+	warmUsed   int64               // sum of the warm files' bytes, under wmu
 	warmDir    string
 	reserved   int64         // cache bytes reserved by activations in progress
 	recoveries chan struct{} // one token per activation in progress (Limits.Recoveries)
@@ -180,7 +181,7 @@ type warmFile struct {
 // warmIndex lists this namespace's warm tier, left by earlier sessions:
 // each <hash>.db with a readable <hash>.json; anything else is removed.
 func (n *Node) warmIndex() error {
-	n.warmDir, n.warm = filepath.Join(n.cfg.CacheDir, "warm", n.ns.String()), map[string]warmFile{}
+	n.warmDir, n.warm, n.warmUsed = filepath.Join(n.cfg.CacheDir, "warm", n.ns.String()), map[string]warmFile{}, 0
 	if err := os.MkdirAll(n.warmDir, 0o700); err != nil {
 		return newError(CodeUnavailable, "warm dir", err)
 	}
@@ -194,7 +195,7 @@ func (n *Node) warmIndex() error {
 		switch {
 		case db && err == nil && serr == nil && st.Mode().IsRegular() && json.Unmarshal(b, &w) == nil:
 			w.bytes, w.used = st.Size(), st.ModTime()
-			n.warm[filepath.Base(name)] = w
+			n.warmPut(filepath.Base(name), w)
 		case db || !strings.HasSuffix(path, ".json") || serr != nil: // a .json is removed with its .db
 			os.Remove(path)
 		}
@@ -220,7 +221,7 @@ func (n *Node) park(e *entity) {
 	name := filepath.Join(n.warmDir, hash)
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
-	delete(n.warm, hash)
+	n.warmDel(hash)
 	size, err := e.db.Park(name + ".db")
 	failpoint("warm.park")
 	if err == nil {
@@ -229,7 +230,7 @@ func (n *Node) park(e *entity) {
 	if err == nil {
 		w.bytes = size
 		os.Chtimes(name+".db", w.used, w.used)
-		n.warm[hash] = w
+		n.warmPut(hash, w)
 		e.clear()
 		return
 	}
@@ -246,7 +247,7 @@ func (n *Node) claimWarm(key, path string) (warmFile, bool) {
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
 	w, ok := n.warm[hash]
-	delete(n.warm, hash)
+	n.warmDel(hash)
 	if path == "" {
 		os.Remove(name + ".db")
 		os.Remove(name + ".json")
@@ -261,7 +262,7 @@ func (n *Node) unclaimWarm(key, path string, w warmFile) {
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
 	if os.Rename(path, filepath.Join(n.warmDir, hash)+".db") == nil {
-		n.warm[hash] = w
+		n.warmPut(hash, w)
 	}
 }
 
@@ -280,7 +281,7 @@ func (n *Node) evictWarm(keep string) bool {
 	if lru == "" {
 		return false
 	}
-	delete(n.warm, lru)
+	n.warmDel(lru)
 	name := filepath.Join(n.warmDir, lru)
 	os.Remove(name + ".db")
 	os.Remove(name + ".json")
@@ -288,14 +289,23 @@ func (n *Node) evictWarm(keep string) bool {
 	return true
 }
 
-// warmBytes sums the sizes of the warm files.
-func (n *Node) warmBytes() (b int64) {
+// warmBytes is the size of the warm files, kept by warmPut and warmDel
+// (under wmu): fit asks on every admission, and the tier may hold every
+// entity the node ever touched.
+func (n *Node) warmBytes() int64 {
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
-	for _, w := range n.warm {
-		b += w.bytes
-	}
-	return b
+	return n.warmUsed
+}
+
+func (n *Node) warmPut(hash string, w warmFile) {
+	n.warmDel(hash)
+	n.warm[hash], n.warmUsed = w, n.warmUsed+w.bytes
+}
+
+func (n *Node) warmDel(hash string) {
+	n.warmUsed -= n.warm[hash].bytes
+	delete(n.warm, hash)
 }
 
 func (n *Node) namespace(ctx context.Context) error {
