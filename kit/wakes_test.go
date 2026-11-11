@@ -3,7 +3,9 @@ package kit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,20 +49,20 @@ func TestWakes(t *testing.T) {
 			_, err := tx.Exec(bg, "INSERT INTO todo VALUES (?), (?)", ms(in), ms(in[8:]))
 			return nil, err
 		})
-		ws = append(ws, NewWakes(r, 1, func(tx *garden.Tx, now time.Time) (time.Time, error) {
+		ws = append(ws, NewWakes(r, 1, func(tx *garden.Tx, now time.Time) (time.Time, []byte, error) {
 			if _, err := tx.Exec(bg, "UPDATE done SET n = n + (SELECT count(*) FROM todo WHERE at <= ?)", now.UnixMilli()); err != nil {
-				return time.Time{}, err
+				return time.Time{}, nil, err
 			}
 			if _, err := tx.Exec(bg, "DELETE FROM todo WHERE at <= ?", now.UnixMilli()); err != nil {
-				return time.Time{}, err
+				return time.Time{}, nil, err
 			}
 			var next sql.NullInt64
 			err := tx.Query(bg, "SELECT min(at) FROM todo", nil, func(r *sql.Rows) error { r.Next(); return r.Scan(&next) })
 			if !next.Valid {
-				return time.Time{}, err
+				return time.Time{}, nil, err
 			}
-			return time.UnixMilli(next.Int64), err
-		}))
+			return time.UnixMilli(next.Int64), nil, err
+		}, nil))
 	}
 	ctx, cancel := context.WithCancel(bg)
 	defer cancel()
@@ -110,7 +112,7 @@ func TestWakesArmRacesShardCreation(t *testing.T) {
 	c := newCluster(t, "a", "b")
 	ws := map[string]*Wakes{}
 	for _, id := range []string{"a", "b"} {
-		ws[id] = NewWakes(c.routers[id], 1, func(*garden.Tx, time.Time) (time.Time, error) { return time.Time{}, nil })
+		ws[id] = NewWakes(c.routers[id], 1, func(*garden.Tx, time.Time) (time.Time, []byte, error) { return time.Time{}, nil, nil }, nil)
 	}
 	errs := make(chan error, 8)
 	for i := range 8 {
@@ -132,5 +134,50 @@ func TestWakesArmRacesShardCreation(t *testing.T) {
 	})
 	if rows != 8 {
 		t.Fatalf("%d of 8 arms landed", rows)
+	}
+}
+
+// TestWakesResultAndBackoff: a wake's result reaches done once the wake is
+// recorded, and a failing handler backs off instead of firing every tick.
+func TestWakesResultAndBackoff(t *testing.T) {
+	c := newCluster(t, "a")
+	r := c.routers["a"]
+	var calls atomic.Int32
+	got := make(chan string, 4)
+	w := NewWakes(r, 1, func(tx *garden.Tx, _ time.Time) (time.Time, []byte, error) {
+		var key string
+		tx.Query(bg, "SELECT name FROM who", nil, func(rows *sql.Rows) error { rows.Next(); return rows.Scan(&key) })
+		if key == "fails" {
+			calls.Add(1)
+			return time.Time{}, nil, errors.New("handler failed")
+		}
+		return time.Time{}, []byte("claimed " + key), nil
+	}, func(key string, result []byte) { got <- key + ": " + string(result) })
+	r.Handle("named", func(tx *garden.Tx, in []byte) ([]byte, error) {
+		_, err := tx.Exec(bg, "CREATE TABLE who(name TEXT); INSERT INTO who VALUES (?)", string(in))
+		return nil, err
+	})
+	for _, key := range []string{"fails", "works"} {
+		if _, _, err := r.Mutate(bg, Call{Op: "named", Key: key, Req: req(t, key), Input: []byte(key), Create: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Arm(bg, key, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	go w.Run(ctx, 20*time.Millisecond)
+	select {
+	case s := <-got:
+		if s != "works: claimed works" {
+			t.Fatal(s)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no result")
+	}
+	time.Sleep(500 * time.Millisecond) // 25 ticks
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the failing handler ran %d times in 25 ticks", n)
 	}
 }

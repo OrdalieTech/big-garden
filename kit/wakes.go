@@ -22,11 +22,14 @@ import (
 // returns the next time it wants (zero: none). Arm before the mutation that
 // needs the wake (a crash in between costs a spurious wake, never a lost
 // one). A wake fires at least once, at or after its time, while some Node
-// runs Run.
+// runs Run. The handler may also return a small result, which Run hands to
+// done once the wake is recorded: what the handler claimed is acted on
+// outside the shard's loop, so one slow effect never holds the others back.
 type Wakes struct {
 	r      *Router
 	shards int
 	op     string
+	done   func(key string, result []byte)
 }
 
 const armOp, doneOp, wakeTable = "kit.wakes.arm", "kit.wakes.done", "kit_wakes"
@@ -35,6 +38,10 @@ const armOp, doneOp, wakeTable = "kit.wakes.arm", "kit.wakes.done", "kit_wakes"
 // skew two Nodes may have (D22: 5 min each way): a wake may come once more
 // up to grace after an arm, and the mutation must commit within it.
 const grace = 15 * time.Minute
+
+// backoff is when a wake whose handler failed fires again, rather than at
+// every tick.
+const backoff = time.Minute
 
 func ms(b []byte) int64 { return int64(binary.BigEndian.Uint64(b)) }
 
@@ -47,9 +54,11 @@ func stamp(ts ...int64) []byte {
 }
 
 // NewWakes registers h as the wake handler of the entities woken through r
-// (on every Node), over shards shard entities.
-func NewWakes(r *Router, shards int, h func(tx *garden.Tx, now time.Time) (next time.Time, err error)) *Wakes {
-	w := &Wakes{r: r, shards: shards, op: "kit.wakes.wake"}
+// (on every Node), over shards shard entities. done, if not nil, receives
+// each successful wake's key and result after Run recorded it; it must not
+// block (hand the work to a pool of the caller's).
+func NewWakes(r *Router, shards int, h func(tx *garden.Tx, now time.Time) (next time.Time, result []byte, err error), done func(key string, result []byte)) *Wakes {
+	w := &Wakes{r: r, shards: shards, op: "kit.wakes.wake", done: done}
 	r.Handle(armOp, func(tx *garden.Tx, in []byte) ([]byte, error) { // in: due, armed at, key
 		ctx := context.Background()
 		if _, err := tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+wakeTable+"(key TEXT PRIMARY KEY, due INTEGER NOT NULL, armed INTEGER NOT NULL) STRICT"); err != nil {
@@ -71,12 +80,16 @@ func NewWakes(r *Router, shards int, h func(tx *garden.Tx, now time.Time) (next 
 		_, err := tx.Exec(ctx, "DELETE FROM "+wakeTable+" WHERE key = ? AND due = 0", key)
 		return nil, err
 	})
-	r.Handle(w.op, func(tx *garden.Tx, in []byte) ([]byte, error) {
-		next, err := h(tx, time.UnixMilli(ms(in)))
-		if err != nil || next.IsZero() {
+	r.Handle(w.op, func(tx *garden.Tx, in []byte) ([]byte, error) { // out: next (0: none), result
+		next, result, err := h(tx, time.UnixMilli(ms(in)))
+		if err != nil {
 			return nil, err
 		}
-		return stamp(next.UnixMilli()), nil
+		at := int64(0)
+		if !next.IsZero() {
+			at = next.UnixMilli()
+		}
+		return append(stamp(at), result...), nil
 	})
 	return w
 }
@@ -179,16 +192,20 @@ func (w *Wakes) fire(ctx context.Context, shard string) {
 		}
 		res, _, err := w.r.Mutate(ctx, Call{Op: w.op, Key: d.key, Req: req, Input: at})
 		var ge *garden.Error
-		if err != nil && !(errors.As(err, &ge) && ge.Code == garden.CodeNotFound) { // a deleted entity wants no wake
-			continue
-		}
-		var next int64 // 0: no next wake
-		if len(res.Value) == 8 {
+		next := int64(0) // a deleted entity wants no wake
+		switch {
+		case err == nil && len(res.Value) >= 8:
 			next = ms(res.Value)
+		case err == nil || errors.As(err, &ge) && ge.Code == garden.CodeNotFound:
+		default: // the handler failed, or its outcome is unknown: it is idempotent, so try again later
+			next = now + backoff.Milliseconds()
 		}
 		in := append(stamp(next, now), d.key...)
-		if req, err = request([]byte(doneOp), in); err == nil {
+		if req, rerr := request([]byte(doneOp), in); rerr == nil {
 			w.r.Mutate(ctx, Call{Op: doneOp, Key: shard, Req: req, Input: in})
+		}
+		if err == nil && w.done != nil && len(res.Value) > 8 {
+			w.done(d.key, res.Value[8:])
 		}
 	}
 }
