@@ -537,7 +537,7 @@ func (d *DB) Park(dst string) (int64, error) {
 // Bytes is the size of the database and -wal files (0 for a missing file).
 func (d *DB) Bytes() int64 {
 	var n int64
-	for _, s := range []string{"", "-wal"} {
+	for _, s := range []string{"", "-wal", "-shm"} { // all three sit in the cache directory
 		if st, err := os.Stat(d.path + s); err == nil {
 			n += st.Size()
 		}

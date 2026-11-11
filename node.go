@@ -194,7 +194,7 @@ func (n *Node) warmIndex() error {
 		st, serr := os.Lstat(name + ".db")
 		switch {
 		case db && err == nil && serr == nil && st.Mode().IsRegular() && json.Unmarshal(b, &w) == nil:
-			w.bytes, w.used = st.Size(), st.ModTime()
+			w.bytes, w.used = st.Size()+int64(len(b)), st.ModTime() // the hint counts too
 			n.warmPut(filepath.Base(name), w)
 		case db || !strings.HasSuffix(path, ".json") || serr != nil: // a .json is removed with its .db
 			os.Remove(path)
@@ -228,7 +228,7 @@ func (n *Node) park(e *entity) {
 		err = os.WriteFile(name+".json", b, 0o600)
 	}
 	if err == nil {
-		w.bytes = size
+		w.bytes = size + int64(len(b)) // the hint counts too: 100,000 of them are megabytes
 		os.Chtimes(name+".db", w.used, w.used)
 		n.warmPut(hash, w)
 		e.clear()
