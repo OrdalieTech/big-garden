@@ -116,6 +116,7 @@ func (p *proc) call(t *testing.T, r Req) (Resp, bool) {
 
 // stop closes stdin and reports whether the process was SIGKILLed.
 func (p *proc) stop() (killed bool) {
+	p.cmd.Process.Signal(syscall.SIGCONT) // a test that failed with p stopped must not wait on it forever
 	p.in.Close()
 	for range p.lines {
 	}

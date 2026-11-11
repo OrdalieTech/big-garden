@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"slices"
@@ -69,12 +70,18 @@ func staleMaintenanceRun(t *testing.T, ep storetest.Endpoint, fp string) {
 	}
 	inc := must(a, Req{Op: "create", Key: "k", ID: newID()}).Inc
 	committed := map[string]bool{}
+	pending := "" // an add a never answered before stopping: either outcome is allowed
 	for i := 0; ; i++ {
 		if i == 30 {
 			t.Fatalf("%s: maintenance never reached the failpoint", fp)
 		}
 		r := Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: strconv.Itoa(i), Big: true}
-		must(a, r)
+		if resp, answered := callUntilStopped(t, a, r); !answered {
+			pending = r.ID // maintenance runs beside the add: the stop froze a before it replied
+			break
+		} else if !resp.OK {
+			t.Fatalf("%s: %+v: %+v", fp, r, resp)
+		}
 		committed[r.ID] = true
 		deadline := time.Now().Add(300 * time.Millisecond)
 		for !a.stopped() && time.Now().Before(deadline) {
@@ -93,6 +100,17 @@ func staleMaintenanceRun(t *testing.T, ep storetest.Endpoint, fp string) {
 	}
 	a.cmd.Process.Signal(syscall.SIGCONT)
 	time.Sleep(1500 * time.Millisecond) // a's maintenance finishes (CommitTimeout 1 s)
+	if pending != "" {
+		select {
+		case line, ok := <-a.lines:
+			var resp Resp
+			if ok && json.Unmarshal(line, &resp) == nil && resp.OK {
+				committed[pending] = true
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatalf("%s: a never answered its pending add after SIGCONT", fp)
+		}
+	}
 	if resp, alive := a.call(t, Req{Op: "add", Key: "k", Inc: inc, ID: newID(), Input: "stale"}); !alive || resp.OK {
 		t.Fatalf("%s: stale owner wrote after the takeover: %+v alive %v", fp, resp, alive)
 	}
@@ -121,8 +139,38 @@ func staleMaintenanceRun(t *testing.T, ep storetest.Endpoint, fp string) {
 			t.Fatalf("%s: acknowledged ID %s lost", fp, id)
 		}
 	}
-	if len(ids) != len(committed) {
-		t.Fatalf("%s: %d IDs committed, %d acknowledged", fp, len(ids), len(committed))
+	for _, id := range ids {
+		if !committed[id] && id != pending {
+			t.Fatalf("%s: ID %s read but never sent or acknowledged", fp, id)
+		}
+	}
+}
+
+// callUntilStopped sends r to p and returns its reply, or answered=false once
+// p is SIGSTOPped without having replied.
+func callUntilStopped(t *testing.T, p *proc, r Req) (resp Resp, answered bool) {
+	b, _ := json.Marshal(r)
+	if _, err := p.in.Write(append(b, '\n')); err != nil {
+		t.Fatalf("node died on %+v", r)
+	}
+	deadline := time.After(60 * time.Second)
+	for {
+		select {
+		case line, ok := <-p.lines:
+			if !ok {
+				t.Fatalf("node died on %+v", r)
+			}
+			if err := json.Unmarshal(line, &resp); err != nil {
+				t.Fatal(err)
+			}
+			return resp, true
+		case <-deadline:
+			t.Fatalf("node hung on %+v", r)
+		case <-time.After(5 * time.Millisecond):
+			if p.stopped() {
+				return resp, false
+			}
+		}
 	}
 }
 
