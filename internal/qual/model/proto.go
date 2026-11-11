@@ -566,6 +566,8 @@ func (x *px) run(ev, res uint8) {
 		}
 	case pcCrHead:
 		switch {
+		case res == rOK && p.Cur.Deleted && x.r.TS <= x.clock()-x.c.Retention: // a stale create never recreates (D31)
+			x.finish(out{code: cIDExpired, def: true})
 		case res == rOK && p.Cur.Deleted: // recreation: a new incarnation by a CAS on the tombstone (D25)
 			p.Resume, p.Inc = false, x.fresh()
 			img := Image{Seq: 1, Schema: x.r.Schema, Kept: 1}
@@ -596,9 +598,7 @@ func (x *px) run(ev, res uint8) {
 			x.finish(out{code: cReplayed, seq: i + 1, img: img, hasImg: true})
 		case i >= 0:
 			x.finish(out{code: cIDConflict, img: img, hasImg: true, def: true})
-		case x.r.TS <= img.Floor:
-			x.finish(out{code: cIDExpired, img: img, hasImg: true, def: true})
-		default: // "key exists"
+		default: // "key exists", also when this ID's receipt may have been pruned (D31)
 			x.finish(out{code: cInvalid, def: true})
 		}
 	case pcCrBirth:
@@ -705,11 +705,7 @@ func (x *px) start() {
 		x.wait(pcCmpGot, Msg{Kind: mGetObjs, Head: q})
 	case kCollect:
 		x.getHead(pcColGot)
-	case kCreate:
-		if r.TS <= x.clock()-x.c.Retention {
-			x.finish(out{code: cIDExpired, def: true})
-			return
-		}
+	case kCreate: // admitted at any age (D31): a create has no receipt to lose but over a tombstone
 		x.settle(pcCrBegin) // §2 rule 5: an earlier unresolved candidate first
 	}
 }

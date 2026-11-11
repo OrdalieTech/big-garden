@@ -38,10 +38,14 @@ type Route struct {
 // MutationID is 8-byte big-endian Unix ms + 16 cryptographic random bytes.
 // Its time must be at most 5 minutes ahead of the Node's clock
 // (invalid_argument) and within Limits.ReceiptRetention of it (id_expired),
-// both checked when a mutation is admitted. The caller generates and keeps
-// the ID: for a client idempotency key, call NewMutationID once when the key
-// is first seen, store the ID with the key, and send the same Request on
-// every retry, even after a restart; never generate a fresh ID for a retry.
+// both checked when a mutation is admitted. A Create is admitted at any age
+// and answers id_expired only over a tombstone (DECISIONS D31): a key a
+// crashed create left between birth and head is resumed by its Request at
+// any time, so a deterministic key can use a constant Request. The caller
+// generates and keeps the ID: for a client idempotency key, call
+// NewMutationID once when the key is first seen, store the ID with the key,
+// and send the same Request on every retry, even after a restart; never
+// generate a fresh ID for a retry.
 type MutationID [24]byte
 
 // Request is the stable identity of one mutation; reuse it unchanged to retry.

@@ -40,10 +40,11 @@ const all = 0xff
 // time: finding F1, accepted by D14), C0 (no deletion) and CD (deletion only
 // while no create of the key is in flight, D14's scope), and the group-commit
 // case B (D18), its read-member variant BR (D23), the follower-read case
-// F (D24) and the deletion cases D, DT, DR and DU (D25).
+// F (D24), the deletion cases D, DT, DR and DU (D25), and the aged cases CA
+// and DA (D31).
 func Cases() []*Case {
 	return []*Case{caseP(), caseO(), caseG(), caseI(), caseC(), caseC0(), caseCD(), caseB(), caseBR(), caseF(),
-		caseD(), caseDT(), caseDR(), caseDU()}
+		caseD(), caseDT(), caseDR(), caseDU(), caseCA(), caseDA()}
 }
 
 // CaseByName returns one bounded case, or the random case "R<nodes><entities><active>".
@@ -167,6 +168,15 @@ func caseCD() *Case {
 	return c
 }
 
+// CA is CD aged (D31): retention 2 and one clock jump to 3, so every
+// request (timestamp 1) may be admitted, resumed or answered after its ID
+// expired, including the D5 resume over a genesis whose head was deleted.
+func caseCA() *Case {
+	c := caseCD()
+	c.Name, c.Jumps, c.Clocks, c.Retention = "CA", 1, []int8{3}, 2
+	return c
+}
+
 // B: group commit (D18). Two nodes, one entity; r1 may run alone or as the
 // leader of a batch whose member r2 is queued behind it; both may be retried
 // alone on either node; one takeover by n1, one crash, one hedge; replies may
@@ -277,6 +287,24 @@ func caseDR() *Case {
 	}
 	c.Init = c.newState()
 	c.existing(&c.Init, 0, 0, []int{1}, 0, true)
+	return c
+}
+
+// DA: a stale create over a tombstone (D31). n0 owns the entity and deletes
+// it; the genesis request is retried on either node and another create
+// recreates the entity, both possibly after their IDs expired (retention 2,
+// one clock jump to 3); n0 updates the new incarnation. One hedge, no crash.
+func caseDA() *Case {
+	c := &Case{Name: "DA", Nodes: 2, Ents: 1, Msgs: 4, Active: 3, Depth: 48,
+		Hedges: 1, Jumps: 1, Clocks: []int8{3}, Retention: 2, Age: 1}
+	c.Reqs = []Req{
+		{Kind: kCreate, Nodes: 3, Tries: 1, ID: 1, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kDelete, Nodes: 1, Tries: 1},
+		{Kind: kCreate, Nodes: 3, Tries: 2, ID: 5, Hash: 1, TS: 1, Schema: 1},
+		{Kind: kUpdate, Nodes: 1, Tries: 1, ID: 7, Hash: 1, TS: 1, Schema: 1, Gen: 2},
+	}
+	c.Init = c.newState()
+	c.existing(&c.Init, 0, 0, nil, 0, true)
 	return c
 }
 

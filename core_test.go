@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -407,12 +408,7 @@ func TestCreateIdempotentAndConflicts(t *testing.T) {
 		t.Fatal("failed create left artifacts")
 	}
 	mustCreate(t, n, "k2", nil)
-	// expired and future IDs
-	old := newReq(t, "old", 1)
-	id, _ := NewMutationID(time.Now().Add(-2 * time.Hour))
-	old.ID = id
-	_, _, err = n.Create(bg, "k3", old, createKV)
-	wantCode(t, err, CodeIDExpired)
+	// an expired ID creates (D31, TestCreateAgedID); a future one is refused
 	future := newReq(t, "future", 1)
 	future.ID, _ = NewMutationID(time.Now().Add(time.Hour))
 	_, _, err = n.Create(bg, "k3", future, createKV)
@@ -451,6 +447,50 @@ func failHeadCAS(mem faultStore, key string, armed *atomic.Bool) {
 		}
 		return storetest.MemFault{}
 	})
+}
+
+// TestCreateAgedID: a Create is admitted with an ID older than
+// ReceiptRetention (D32). A create cut before its head is resumed with it by
+// any process, a fresh key is created, a live key answers as for any create,
+// and only a tombstone refuses it, so a stale create never recreates.
+func TestCreateAgedID(t *testing.T) {
+	aged := func(input string) Request {
+		r := newReq(t, input, 1)
+		binary.BigEndian.PutUint64(r.ID[:8], uint64(time.Now().Add(-2*time.Hour).UnixMilli()))
+		return r
+	}
+	mem := newStore(t)
+	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 300 * time.Millisecond })
+	var armed atomic.Bool
+	armed.Store(true)
+	failHeadCAS(mem, "k", &armed)
+	req := aged("create")
+	_, _, err := n.Create(bg, "k", req, createKV)
+	wantCode(t, err, CodeOutcomeUnknown)
+	armed.Store(false)
+	n2 := testNode(t, mem, "b", nil)
+	ref, res, err := n2.Create(bg, "k", req, createKV)
+	if err != nil || string(res.Value) != "created" {
+		t.Fatalf("aged resume %+v %v", res, err)
+	}
+	if _, _, err := n2.Create(bg, "k", aged("other"), createKV); err == nil {
+		t.Fatal("a live key was created again")
+	}
+	other, _, err := n2.Create(bg, "j", aged("fresh"), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n2.Delete(bg, other); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = n2.Create(bg, "j", aged("stale"), createKV)
+	wantCode(t, err, CodeIDExpired)
+	if _, _, err := n2.Create(bg, "j", newReq(t, "recreate", 1), createKV); err != nil {
+		t.Fatal(err)
+	}
+	l := newLedger()
+	mustPut(t, n2, ref, "a", "1", l)
+	l.verify(t, mem, "a")
 }
 
 func TestCreateResumeD5(t *testing.T) {

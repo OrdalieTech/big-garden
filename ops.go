@@ -39,7 +39,8 @@ func checkRequest(key string, req Request) error {
 // A node clock more than clockSkew from the store's (the Date of its latest
 // reply, re-sampled once with a namespace GET before refusing) refuses every
 // mutation: its IDs would move the receipt floor for every node (D22).
-func (n *Node) checkClock(ctx context.Context, req Request) error {
+// anyAge admits an ID older than ReceiptRetention (Create, D31).
+func (n *Node) checkClock(ctx context.Context, req Request, anyAge bool) error {
 	s, sampled := n.st.(limited).Store.(interface{ Skew() time.Duration })
 	far := func() bool { return sampled && (s.Skew() > clockSkew || s.Skew() < -clockSkew) }
 	if far() {
@@ -50,10 +51,15 @@ func (n *Node) checkClock(ctx context.Context, req Request) error {
 		return newError(CodeUnavailable, "node clock differs from storage by "+s.Skew().Round(time.Second).String(), nil)
 	case tsOf(req.ID) > now.Add(clockSkew).UnixMilli():
 		return invalid("mutation ID time is in the future")
-	case tsOf(req.ID) <= now.Add(-n.cfg.Limits.ReceiptRetention).UnixMilli():
+	case !anyAge && n.expired(req.ID):
 		return &Error{Code: CodeIDExpired, Operation: req.ID, Message: "mutation ID is older than ReceiptRetention"}
 	}
 	return nil
+}
+
+// expired reports whether id is older than ReceiptRetention.
+func (n *Node) expired(id MutationID) bool {
+	return tsOf(id) <= n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
 }
 
 // binding is the request binding of PROTOCOL §1.
@@ -359,7 +365,7 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 	if ctx == nil || fn == nil {
 		return Ref{}, Result{}, invalid("nil context or callback")
 	}
-	if err := cmp.Or(checkRequest(key, req), n.checkClock(ctx, req)); err != nil {
+	if err := cmp.Or(checkRequest(key, req), n.checkClock(ctx, req, true)); err != nil {
 		return Ref{}, Result{}, err
 	}
 	bound := binding(1, req.Schema, req.Schema, req.Hash)
@@ -408,6 +414,9 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 	case store.OK:
 		if tomb, err = n.decodeHead(obj.Body, key, head.ID{}); err != nil || !tomb.Deleted {
 			return n.createExists(ctx, e, req, bound, tomb, err, t0)
+		}
+		if n.expired(req.ID) { // it may have made the deleted incarnation: never recreate under it (D31)
+			return Ref{}, Result{}, &Error{Code: CodeIDExpired, Operation: req.ID, Message: "mutation ID is older than ReceiptRetention"}
 		}
 		if err := n.reap(ctx, tomb); err != nil { // the deleted incarnation's objects, if its Delete was cut
 			return Ref{}, Result{}, err
@@ -683,7 +692,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		if err := n.owned(ctx, e, ref, time.Time{}); err != nil { // a redo follows a discard: it GETs
 			return Result{}, withOp(err, req.ID)
 		}
-		if err := n.checkClock(ctx, req); err != nil { // admission starts with the clock (§6 step 3)
+		if err := n.checkClock(ctx, req, false); err != nil { // admission starts with the clock (§6 step 3)
 			return Result{}, err
 		}
 		res, verdict := n.admit(e, req, bound)
@@ -905,7 +914,7 @@ func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 		if m.err = m.ctx.Err(); m.err != nil { // its caller already got outcome_unknown
 			continue
 		}
-		if m.err = n.checkClock(m.ctx, m.req); m.err != nil {
+		if m.err = n.checkClock(m.ctx, m.req, false); m.err != nil {
 			continue
 		}
 		if res, verdict := n.admit(e, m.req, m.bound); res != nil || verdict != nil {
