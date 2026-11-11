@@ -32,7 +32,7 @@ type Wakes struct {
 	done   func(key string, result []byte)
 }
 
-const armOp, doneOp, wakeTable = "kit.wakes.arm", "kit.wakes.done", "kit_wakes"
+const initOp, armOp, doneOp, wakeTable = "kit.wakes.init", "kit.wakes.arm", "kit.wakes.done", "kit_wakes"
 
 // grace covers a business mutation that follows its Arm, plus the clock
 // skew two Nodes may have (D22: 5 min each way): a wake may come once more
@@ -59,12 +59,12 @@ func stamp(ts ...int64) []byte {
 // block (hand the work to a pool of the caller's).
 func NewWakes(r *Router, shards int, h func(tx *garden.Tx, now time.Time) (next time.Time, result []byte, err error), done func(key string, result []byte)) *Wakes {
 	w := &Wakes{r: r, shards: shards, op: "kit.wakes.wake", done: done}
+	r.Handle(initOp, func(tx *garden.Tx, _ []byte) ([]byte, error) {
+		_, err := tx.Exec(context.Background(), "CREATE TABLE "+wakeTable+"(key TEXT PRIMARY KEY, due INTEGER NOT NULL, armed INTEGER NOT NULL) STRICT")
+		return nil, err
+	})
 	r.Handle(armOp, func(tx *garden.Tx, in []byte) ([]byte, error) { // in: due, armed at, key
-		ctx := context.Background()
-		if _, err := tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+wakeTable+"(key TEXT PRIMARY KEY, due INTEGER NOT NULL, armed INTEGER NOT NULL) STRICT"); err != nil {
-			return nil, err
-		}
-		_, err := tx.Exec(ctx, "INSERT INTO "+wakeTable+" VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET due = min(due, excluded.due), armed = excluded.armed",
+		_, err := tx.Exec(context.Background(), "INSERT INTO "+wakeTable+" VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET due = min(due, excluded.due), armed = excluded.armed",
 			string(in[16:]), ms(in), ms(in[8:]))
 		return nil, err
 	})
@@ -118,16 +118,18 @@ func (w *Wakes) Arm(ctx context.Context, key string, due time.Time) error {
 	}
 	c := Call{Op: armOp, Key: w.shard(key), Req: req, Input: in}
 	for try := range attempts {
-		c.Create = false
 		_, _, err = w.r.Mutate(ctx, c)
 		var ge *garden.Error
-		if !errors.As(err, &ge) || ge.Code != garden.CodeNotFound { // the shard's first arm creates it
+		// not_found: the shard's first arm creates it; state_missing: a create
+		// of it is between birth and head, or was cut there: resume it.
+		if !errors.As(err, &ge) || ge.Code != garden.CodeNotFound && ge.Code != garden.CodeStateMissing {
 			return err
 		}
-		c.Create = true
-		// exists: another Node created the shard first; state_missing: its
-		// create is still between birth and head. Either way, arm it again.
-		if _, _, err = w.r.Mutate(ctx, c); !errors.As(err, &ge) || ge.Code != garden.CodeExists && ge.Code != garden.CodeStateMissing {
+		if err = w.init(ctx, c.Key); err == nil {
+			_, _, err = w.r.Mutate(ctx, c)
+			return err
+		}
+		if !errors.As(err, &ge) || ge.Code != garden.CodeStateMissing { // still between birth and head: again
 			return err
 		}
 		select {
@@ -135,6 +137,22 @@ func (w *Wakes) Arm(ctx context.Context, key string, due time.Time) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	return err
+}
+
+// init creates shard, empty, under a constant Request (DECISIONS D32): if
+// the Node creating it dies between its snapshot and its head, the next arm
+// on any Node, at any time, resumes that create (D5) instead of leaving the
+// shard state_missing. Shards are never deleted, so no two creates share it.
+func (w *Wakes) init(ctx context.Context, shard string) error {
+	req := garden.Request{Hash: sha256.Sum256([]byte(initOp + "\x00" + shard)), Schema: 1}
+	req.ID[7] = 1 // Unix ms 1: a Create is admitted at any age
+	copy(req.ID[8:], req.Hash[:])
+	_, _, err := w.r.Mutate(ctx, Call{Op: initOp, Key: shard, Req: req, Create: true})
+	var ge *garden.Error
+	if errors.As(err, &ge) && ge.Code == garden.CodeExists {
+		return nil
 	}
 	return err
 }

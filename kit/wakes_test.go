@@ -5,11 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	garden "github.com/OrdalieTech/big-garden"
+	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
 // kept reports whether key's wake row survived its last wake, due again
@@ -134,6 +137,41 @@ func TestWakesArmRacesShardCreation(t *testing.T) {
 	})
 	if rows != 8 {
 		t.Fatalf("%d of 8 arms landed", rows)
+	}
+}
+
+// cutHeads refuses every head.json PUT: a Node that dies between its
+// snapshot and its head.
+type cutHeads struct{ http.RoundTripper }
+
+func (c cutHeads) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/head.json") {
+		return nil, errors.New("cut")
+	}
+	return c.RoundTripper.RoundTrip(r)
+}
+
+// TestWakesResumesACutShardCreate: the first arm's Node dies after the
+// shard's snapshot, before its head; the next arm, on another Node, resumes
+// that create instead of finding the shard state_missing.
+func TestWakesResumesACutShardCreate(t *testing.T) {
+	ep := storetest.Local(t).Sub("cut")
+	a, err := garden.Open(bg, garden.Config{S3: ep.Client(&http.Client{Transport: cutHeads{http.DefaultTransport.(*http.Transport).Clone()}}),
+		Bucket: ep.Bucket, Prefix: ep.Prefix, NodeID: "a", CacheDir: t.TempDir(),
+		Limits: garden.Limits{StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close(bg)
+	c := &cluster{members: []string{"a"}, routers: map[string]*Router{}, down: map[string]bool{}}
+	c.routers["a"], c.routers["b"] = NewRouter(a, c, c), NewRouter(open(t, ep, "b"), c, c)
+	nothing := func(*garden.Tx, time.Time) (time.Time, []byte, error) { return time.Time{}, nil, nil }
+	if err := NewWakes(c.routers["a"], 1, nothing, nil).Arm(bg, "x", time.Now()); err == nil {
+		t.Fatal("arm without a head succeeded")
+	}
+	c.members = []string{"b"}
+	if err := NewWakes(c.routers["b"], 1, nothing, nil).Arm(bg, "y", time.Now()); err != nil {
+		t.Fatal(err)
 	}
 }
 
