@@ -26,8 +26,4 @@ Generic Go library: durable SQLite entities over S3. `docs/PLAN.md` is the contr
 
 ## Git
 
-Commit each verified step to `main` as you go (small commits, each stating what was tested); a post-commit hook pushes every commit to github.com/OrdalieTech/big-garden. Never force-push or rewrite pushed history. End every commit message with:
-
-```
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-```
+Commit each verified step to `main` as you go (small commits, each stating what was tested); a post-commit hook pushes every commit to github.com/OrdalieTech/big-garden. Never force-push or rewrite pushed history. Commit messages carry no `Co-Authored-By` trailer.
