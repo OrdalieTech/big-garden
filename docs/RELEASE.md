@@ -1,3 +1,9 @@
+# Milestone v0.2.0 (2026-11-11)
+
+v0.1.0 plus the kit package (D26) and the primitives a consumer with deterministic keys needs (D27-D32): a create that left no object no longer blocks its key; `exists` is its own code; a wake handler returns a result handed to a non-blocking hook, with a backoff on failure; the router remembers the routes it learns; a Create is admitted at any age, so a create cut between birth and head is resumed by its Request at any time, and only a tombstone refuses an expired ID; Wakes creates its shards under a constant Request. Still not the PLAN §22 production release, for the reasons v0.1.0 lists.
+
+Model qualification on this model: complete and passing G, I, BR, F, D, DT, DU, DA (190 M states) and CD (557 M states, containing C0); C shows only finding F1, accepted by D14; P, O, B, DR and CA stop at their state budget (150 M; CA 800 M) with no violation, as P, O, B and DR did for v0.1.0; 1 M random traces (R323) pass; all 16 negative controls are detected. `go test ./...`, and the root and kit packages on local RustFS, pass.
+
 # Milestone v0.1.0 (2026-11-10)
 
 The implementation is complete against PLAN M0-M9 and the 2026-11-10 review,
