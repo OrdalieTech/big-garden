@@ -141,8 +141,7 @@ func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, l
 		if e.db != nil && e.unresolved == nil && e.used.Before(cutoff) {
 			n.park(e)
 		}
-		if e.db != nil {
-			e.bytes.Store(e.db.Bytes())
+		if e.db != nil { // its bytes as of its last publication (entity.go): no stat per resident under n.mu
 			resident, used = resident+1, used+e.bytes.Load()
 			if e.unresolved == nil && (lru == nil || e.used.Before(at)) {
 				lru, at = e, e.used
