@@ -260,10 +260,10 @@ func (k *canon) Hash(c *Case, s *State) uint64 {
 }
 
 // fpset is a set of 64-bit state fingerprints (hash compaction): open
-// addressing, 8 bytes per slot, grown by doubling up to a fixed maximum. Two
-// distinct states share a fingerprint with probability 2^-64 per pair, so a
-// search over n states merges some pair wrongly with probability at most
-// n^2/2^65 (reported with each result).
+// addressing, 8 bytes per slot, grown by doubling up to 2^30 slots (8 GiB,
+// about 805 M states). Two distinct states share a fingerprint with
+// probability 2^-64 per pair, so a search over n states merges some pair
+// wrongly with probability at most n^2/2^65 (reported with each result).
 type fpset struct {
 	t    []uint64
 	n    uint64
@@ -273,7 +273,7 @@ type fpset struct {
 
 func newFPSet(maxStates uint64) *fpset {
 	max := 1 << 16
-	for uint64(max)*3/4 < maxStates && max < 1<<28 {
+	for uint64(max)*3/4 < maxStates && max < 1<<30 {
 		max <<= 1
 	}
 	return &fpset{t: make([]uint64, 1<<16), max: max}
