@@ -702,7 +702,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		if verdict == nil && res == nil {
 			floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
 			failpoint("sql.before")
-			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor)},
+			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor), Fresh: n.fresh(e)},
 				scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
 			if err != nil && (cb == nil || cb == errResultTooLarge) {
 				e.discard()
@@ -923,7 +923,7 @@ func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 		}
 		var cb error
 		floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
-		result, seq, err := e.db.Mutate(engine.Commit{ID: head.OpID(m.req.ID), Bound: m.bound, Schema: m.req.Schema, FloorMs: uint64(floor)},
+		result, seq, err := e.db.Mutate(engine.Commit{ID: head.OpID(m.req.ID), Bound: m.bound, Schema: m.req.Schema, FloorMs: uint64(floor), Fresh: n.fresh(e)},
 			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) (r []byte, err error) {
 				defer func() {
 					if p := recover(); p != nil {

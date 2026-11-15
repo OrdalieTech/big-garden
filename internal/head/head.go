@@ -494,3 +494,24 @@ func ParseObjectKey(prefix, k string) (base uint64, attempt ID, sum Digest, err 
 	}
 	return base, attempt, sum, nil
 }
+
+// BlobPrefix is the directory holding every blob of one incarnation,
+// outside ObjectPrefix: collection of LTX objects never lists it.
+func BlobPrefix(key string, inc ID) string {
+	return EntityDir(key) + "/blobs/" + inc.String() + "/"
+}
+
+// BlobName is "<epoch-16-hex>-<attempt-32-hex>", relative to BlobPrefix:
+// the ownership epoch that uploaded it is part of its name (DECISIONS D33).
+func BlobName(epoch uint64, attempt ID) string { return fmt.Sprintf("%016x-%s", epoch, attempt) }
+
+// BlobEpoch returns the epoch of a blob name, or ok false.
+func BlobEpoch(name string) (epoch uint64, ok bool) {
+	var b [8]byte
+	var a ID
+	e, at, found := strings.Cut(name, "-")
+	if !found || unhex(b[:], []byte(e)) != nil || unhex(a[:], []byte(at)) != nil {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(b[:]), true
+}

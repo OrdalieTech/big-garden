@@ -3,8 +3,10 @@ package storetest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sort"
 	"strings"
@@ -220,3 +222,28 @@ func (m *Mem) Delete(ctx context.Context, key string) error {
 }
 
 var _ store.Store = (*Mem)(nil)
+
+func (m *Mem) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
+	b, err := io.ReadAll(io.NewSectionReader(body, 0, size))
+	if err != nil || int64(len(b)) != size || sha256.Sum256(b) != sum {
+		return &store.Error{Outcome: store.Failed, Op: "put", Key: key, Err: errors.New("body does not match its size and SHA-256")}
+	}
+	return m.PutImmutable(ctx, key, b)
+}
+
+func (m *Mem) Copy(ctx context.Context, from, to string) error {
+	o, err := m.Get(ctx, from, "", 1<<40)
+	if err != nil {
+		return err
+	}
+	return m.PutImmutable(ctx, to, o.Body)
+}
+
+func (m *Mem) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	o, err := m.Get(ctx, key, "", 1<<40)
+	if err != nil {
+		return nil, err
+	}
+	b := o.Body[min(off, int64(len(o.Body))):]
+	return io.NopCloser(bytes.NewReader(b[:min(n, int64(len(b)))])), nil
+}

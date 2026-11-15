@@ -3,12 +3,16 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -288,4 +292,91 @@ func classify(op, key string, err error) error {
 
 func failed(op, key string, o Outcome, msg string) error {
 	return &Error{Outcome: o, Op: op, Key: key, Err: errors.New(msg)}
+}
+
+func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
+	k := aws.String(s.prefix + key)
+	if size <= PartBytes {
+		return retry(ctx, func() error {
+			_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: k, Body: io.NewSectionReader(body, 0, size),
+				ContentLength: aws.Int64(size), ChecksumSHA256: b64(sum[:]), IfNoneMatch: aws.String("*")}, s.once)
+			return s.done(opPut, int(size), 0, classify("put", key, err))
+		})
+	}
+	var up *s3.CreateMultipartUploadOutput
+	if err := retry(ctx, func() (err error) {
+		up, err = s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &s.bucket, Key: k,
+			ChecksumAlgorithm: types.ChecksumAlgorithmSha256}, s.once)
+		return s.done(opPut, 0, 0, classify("put", key, err))
+	}); err != nil {
+		return err
+	}
+	complete := false
+	defer func() {
+		if !complete { // parts are billed until aborted
+			s.client.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{Bucket: &s.bucket, Key: k, UploadId: up.UploadId})
+		}
+	}()
+	parts := make([]types.CompletedPart, (size+PartBytes-1)/PartBytes)
+	errs := make([]error, len(parts))
+	sem, wg := make(chan struct{}, 4), sync.WaitGroup{}
+	for i := range parts {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			off := int64(i) * PartBytes
+			part := io.NewSectionReader(body, off, min(PartBytes, size-off))
+			h := sha256.New()
+			if _, errs[i] = io.Copy(h, part); errs[i] != nil {
+				return
+			}
+			errs[i] = retry(ctx, func() error {
+				part.Seek(0, io.SeekStart)
+				out, err := s.client.UploadPart(ctx, &s3.UploadPartInput{Bucket: &s.bucket, Key: k, UploadId: up.UploadId,
+					PartNumber: aws.Int32(int32(i + 1)), Body: part, ContentLength: aws.Int64(part.Size()), ChecksumSHA256: b64(h.Sum(nil))}, s.once)
+				if err == nil {
+					parts[i] = types.CompletedPart{ETag: out.ETag, PartNumber: aws.Int32(int32(i + 1)), ChecksumSHA256: out.ChecksumSHA256}
+				}
+				return s.done(opPut, int(part.Size()), 0, classify("put", key, err))
+			})
+		})
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	_, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &s.bucket, Key: k, UploadId: up.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}}, s.once) // not retried: a lost reply is Unknown
+	complete = err == nil
+	return s.done(opPut, 0, 0, classify("put", key, err))
+}
+
+func (s *S3) Copy(ctx context.Context, from, to string) error {
+	return retry(ctx, func() error {
+		src := strings.Split(s.bucket+"/"+s.prefix+from, "/")
+		for i := range src {
+			src[i] = url.PathEscape(src[i])
+		}
+		_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + to),
+			CopySource: aws.String(strings.Join(src, "/"))}, s.once)
+		return s.done(opPut, 0, 0, classify("get", to, err)) // "get": a missing source is NotFound
+	})
+}
+
+func b64(b []byte) *string { return aws.String(base64.StdEncoding.EncodeToString(b)) }
+
+func (s *S3) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	var out *s3.GetObjectOutput
+	err := retry(ctx, func() (err error) {
+		out, err = s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + key),
+			Range: aws.String(fmt.Sprintf("bytes=%d-%d", off, off+n-1))}, s.once)
+		return s.done(opGet, 0, int(n), classify("get", key, err))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(out.Body, n), out.Body}, nil
 }

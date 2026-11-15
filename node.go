@@ -40,6 +40,8 @@ type Node struct {
 	staging    atomic.Int64  // bytes of objects being uploaded (Stats)
 	logged     atomic.Int64  // unix nanos of the last log line (rate limit)
 	closed     bool
+	uploads    map[string]upload // blob uploads of this Node by full key, under mu (D33)
+	chunks     chunkCache
 
 	done            chan struct{} // closed by Close: stops the sweeper
 	counters        counters
@@ -61,7 +63,7 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, now: time.Now,
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {
@@ -78,6 +80,9 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 		return nil, err
 	}
 	if err := n.warmIndex(); err != nil {
+		return nil, err
+	}
+	if err := n.openChunks(); err != nil {
 		return nil, err
 	}
 	n.done = make(chan struct{})
@@ -597,6 +602,8 @@ func engineError(err error) *Error {
 		return newError(CodeCorrupt, "local image failed validation", err)
 	case engine.Full(err):
 		return newError(CodeCapacity, "entity size limit reached", err)
+	case errors.Is(err, engine.ErrStaleBlob):
+		return newError(CodeInvalidArgument, err.Error(), nil)
 	case errors.Is(err, engine.ErrReserved):
 		return newError(CodeInvalidArgument, "reserved table name", err)
 	}

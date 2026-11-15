@@ -204,6 +204,9 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	etag, unsure, err := n.cas(ctx, e, c)
 	if err == nil {
 		n.settle(e, c, &c.next, etag, issued)
+		if c.base != nil && c.next.Epoch != c.base.Epoch && e.db != nil { // a new owner epoch: blobs of earlier ones may be dead
+			e.db.SweepDue = true
+		}
 		return nil, nil
 	}
 	if !unsure { // definitely not committed (§2 step 5)

@@ -35,6 +35,21 @@
 //	//               INSERT INTO docs VALUES (1, vec_f32('[0.1, 0.7, 0.2]'))
 //	// in a Read:    SELECT id FROM docs ORDER BY vec_distance_cosine(emb, vec_f32(?)) LIMIT 10
 //
+// # Files
+//
+// An entity holds named files beside its tables (DECISIONS D33): PutBlob
+// stores bytes on the owner, Tx.SetFile names them in the same mutation as
+// the rows that use them, View.File finds them in a read, OpenBlob reads
+// them on any Node, by range, each 1 MiB checked against the SHA-256 the
+// image recorded. Up to 16 KiB a file is inline in the image; larger ones
+// are immutable objects under the entity's prefix, collected once no name
+// holds them and deleted with the entity:
+//
+//	b, err := node.PutBlob(ctx, ref, pdf)
+//	// in an Update: INSERT INTO docs ... ; tx.SetFile("contract.pdf", &b)
+//	// in a Read:    f, ok, err := v.File(ctx, "contract.pdf")
+//	r, err := node.OpenBlob(ctx, ref, f) // io.ReadSeekCloser and io.ReaderAt
+//
 // Errors are *Error values with a stable Code. CodeOutcomeUnknown means the
 // mutation may have committed: retry with the identical Request, never with
 // a new ID.

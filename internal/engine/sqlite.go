@@ -74,6 +74,7 @@ type Commit struct {
 	Bound   head.Digest
 	Schema  uint32
 	FloorMs uint64
+	Fresh   func(object string) bool // whether a blob the image does not link yet may be linked (D33)
 }
 
 // DB is one exclusively owned SQLite cache file.
@@ -84,6 +85,8 @@ type DB struct {
 	modules map[string]bool // virtual table modules application SQL may use
 	main    *os.File        // read-only; holds the published image between checkpoints
 	pub     Image           // image of the main file (the last checkpointed, published state)
+
+	SweepDue bool // a mutation changed files, or the epoch changed: Node.Sweep has work (D33)
 }
 
 // The library's tables (PROTOCOL §1), compared verbatim with sqlite_schema at
@@ -99,6 +102,31 @@ var reservedSQL = [2]string{
 }
 
 var schemaSQL = reservedSQL[0] + ";\n" + reservedSQL[1] + ";"
+
+// filesSQL is the library's table of the entity's named files (D33),
+// created by the first mutation that sets one. A file is inline (object
+// NULL) or the immutable blob object under head.BlobPrefix; chunks holds
+// the SHA-256 of each FileChunk bytes of it, so any range is verifiable.
+// Application SQL may read it, never write it.
+const filesSQL = `CREATE TABLE _state_blobs(name TEXT PRIMARY KEY, object TEXT, size INTEGER NOT NULL,
+  sha256 BLOB NOT NULL, chunks BLOB NOT NULL, inline BLOB) STRICT`
+
+// FileChunk is the verification unit of a blob read.
+const FileChunk = 1 << 20
+
+// File is one row of _state_blobs.
+type File struct {
+	Object string // "" for an inline file
+	Size   int64
+	SHA256 [32]byte
+	Chunks []byte
+	Inline []byte
+}
+
+type fileOp struct {
+	name string
+	f    *File // nil deletes
+}
 
 // Driver opens the SQLite connections of one Node through a private modernc
 // driver, so the functions and modules registered on it reach no other
@@ -418,11 +446,14 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 		if err := d.setMode(mutation); err != nil {
 			return err
 		}
-		tx := &Tx{scope{conn: d.conn}}
+		tx := &Tx{scope: scope{conn: d.conn}}
 		if result, err = runScoped(&tx.scope, func() ([]byte, error) { return fn(tx) }); err != nil {
 			return err
 		}
 		if err := d.setMode(library); err != nil {
+			return err
+		}
+		if err := d.applyFiles(tx.files, c.Fresh); err != nil {
 			return err
 		}
 		if err := d.schemaOwned(); err != nil {
@@ -462,11 +493,91 @@ func (d *DB) schemaOwned() error {
 		if err := rows.Scan(&fk, &n); err != nil {
 			return err
 		}
-		if reserved(n) && (fk || n != "_state_meta" && n != "_state_receipts" && n != "sqlite_autoindex__state_receipts_1") {
+		if reserved(n) && (fk || !libraryObjects[n]) {
 			return ErrReserved
 		}
 	}
 	return rows.Err()
+}
+
+var libraryObjects = map[string]bool{"_state_meta": true, "_state_receipts": true, "sqlite_autoindex__state_receipts_1": true,
+	"_state_blobs": true, "sqlite_autoindex__state_blobs_1": true}
+
+// ErrStaleBlob: a callback set a file to a blob that is neither linked by
+// the image nor freshly uploaded by this owner in its current epoch.
+var ErrStaleBlob = errors.New("engine: the blob is not linkable: upload it again")
+
+// applyFiles applies a callback's file operations in library mode. A blob
+// enters the image only if the image links it already or fresh says so:
+// a committed row never names bytes that may be missing (D33).
+func (d *DB) applyFiles(ops []fileOp, fresh func(string) bool) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	d.SweepDue = true
+	var n int
+	if err := d.conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sqlite_schema WHERE name = '_state_blobs'").Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if err := d.exec(filesSQL); err != nil {
+			return err
+		}
+	}
+	for _, op := range ops {
+		if op.f == nil {
+			if err := d.exec("DELETE FROM _state_blobs WHERE name = ?", op.name); err != nil {
+				return err
+			}
+			continue
+		}
+		f := op.f
+		var object any
+		if f.Object != "" {
+			object = f.Object
+			var linked int
+			if err := d.conn.QueryRowContext(context.Background(), "SELECT count(*) FROM _state_blobs WHERE object = ?", f.Object).Scan(&linked); err != nil {
+				return err
+			}
+			if linked == 0 && (fresh == nil || !fresh(f.Object)) {
+				return ErrStaleBlob
+			}
+		}
+		if err := d.exec(`INSERT INTO _state_blobs VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET object = excluded.object,
+			size = excluded.size, sha256 = excluded.sha256, chunks = excluded.chunks, inline = excluded.inline`,
+			op.name, object, f.Size, f.SHA256[:], f.Chunks, f.Inline); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Files returns the blob objects the image links, and the one holding sum
+// (nil if none), for the sweep and for deduplication.
+func (d *DB) Files(sum *[32]byte) (linked map[string]bool, same *File, err error) {
+	linked = map[string]bool{}
+	var n int
+	if err := d.conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sqlite_schema WHERE name = '_state_blobs'").Scan(&n); err != nil || n == 0 {
+		return linked, nil, err
+	}
+	rows, err := d.conn.QueryContext(context.Background(), "SELECT object, size, sha256, chunks FROM _state_blobs WHERE object IS NOT NULL")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var f File
+		var h []byte
+		if err := rows.Scan(&f.Object, &f.Size, &h, &f.Chunks); err != nil {
+			return nil, nil, err
+		}
+		linked[f.Object] = true
+		if sum != nil && same == nil && string(h) == string(sum[:]) {
+			f.SHA256 = *sum
+			same = &f
+		}
+	}
+	return linked, same, rows.Err()
 }
 
 // Read runs fn in a read-only scope inside a library read transaction, with

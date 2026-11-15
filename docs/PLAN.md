@@ -244,7 +244,7 @@ func (*Tx) Query(context.Context, string, []any,
 func (*Tx) Exec(context.Context, string, ...any) (sql.Result, error)
 ```
 
-This is not an implementation. `Limits`, `Stats`, and the typed error definition are specified in the sections below. Do not add public `Begin`, `Commit`, `RawDB`, arbitrary transaction nesting, general hooks, or blob-storage APIs.
+This is not an implementation. `Limits`, `Stats`, and the typed error definition are specified in the sections below. Do not add public `Begin`, `Commit`, `RawDB`, arbitrary transaction nesting, general hooks, or blob-storage APIs (amended: DECISIONS D33 adds named files).
 
 `Query` owns and closes the rows before returning, checks `Rows.Err`, and rejects use outside the callback scope. Mutation cursors such as `INSERT ... RETURNING` must be fully consumed or safely closed before local transaction completion. There is no exported prepared-statement handle with an unbounded lifetime.
 

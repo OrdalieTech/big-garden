@@ -1,9 +1,13 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -379,4 +383,42 @@ func TestHedge(t *testing.T) {
 	if err != nil || etag != "second" || len(errs) != 2 || store.OutcomeOf(errs[0]) != store.Unknown || errs[1] != nil {
 		t.Fatalf("stall: %s %v %v", etag, errs, err)
 	}
+}
+
+// TestS3Files runs on the real servers only: the Mem front-end does not
+// speak multipart, ranges or copies.
+func TestS3Files(t *testing.T) {
+	ep := storetest.Local(t)
+	s := store.NewS3(s3.New(ep.Client(nil).Options()), ep.Bucket, ep.Prefix, attempt)
+	c, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // tens of MiB, maybe over a home uplink
+	defer cancel()
+	for _, size := range []int{5, store.PartBytes, 2*store.PartBytes + 3} {
+		body := make([]byte, size)
+		rand.Read(body)
+		key := fmt.Sprintf("f%d", size)
+		bad := sha256.Sum256(append(body, 0))
+		if err := s.PutFile(c, key+"-bad", bytes.NewReader(body), int64(size), bad); size <= store.PartBytes {
+			want(t, err, store.Failed) // the server checks the whole-body SHA-256
+		}
+		want(t, s.PutFile(c, key, bytes.NewReader(body), int64(size), sha256.Sum256(body)), store.OK)
+		want(t, s.Copy(c, key, key+"-copy"), store.OK)
+		for _, k := range []string{key, key + "-copy"} {
+			off, n := int64(size/3), int64(size/2+1)
+			r, err := s.Open(c, k, off, n)
+			want(t, err, store.OK)
+			got, err := io.ReadAll(r)
+			r.Close()
+			if err != nil || !bytes.Equal(got, body[off:off+n]) {
+				t.Fatalf("%s: range read of %d bytes: %d bytes, %v", k, n, len(got), err)
+			}
+		}
+		for _, k := range []string{key, key + "-copy", key + "-bad"} {
+			if err := s.Delete(c, k); err != nil { // cleanup only: a remote store may stall a DELETE past the attempt timeout
+				t.Logf("cleanup %s: %v", k, err)
+			}
+		}
+	}
+	_, err := s.Open(c, "absent", 0, 1)
+	want(t, err, store.NotFound)
+	want(t, s.Copy(c, "absent", "x"), store.NotFound)
 }

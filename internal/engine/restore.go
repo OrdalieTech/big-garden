@@ -113,6 +113,12 @@ func (d *DB) check(h *head.Head) error {
 			return fmt.Errorf("%w: %s is not the format 1 table", ErrCorrupt, name)
 		}
 	}
+	var files string // optional (D33)
+	switch err := d.conn.QueryRowContext(context.Background(), "SELECT sql FROM sqlite_schema WHERE name = '_state_blobs'").Scan(&files); {
+	case err == sql.ErrNoRows:
+	case err != nil || files != filesSQL:
+		return fmt.Errorf("%w: _state_blobs is not the format 1 table", ErrCorrupt)
+	}
 	var res string
 	if err := d.conn.QueryRowContext(context.Background(), "PRAGMA integrity_check(1)").Scan(&res); err != nil {
 		return err

@@ -27,15 +27,23 @@ func (n *Node) maintainLater(e *entity) {
 	go func() {
 		defer n.wg.Done()
 		e.mu.Lock()
-		var ref *Ref
-		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) && n.maintain(e, false) {
-			ref = &Ref{e.key, e.h.Incarnation}
+		var ref, sweep *Ref
+		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) {
+			if e.db.SweepDue {
+				sweep = &Ref{e.key, e.h.Incarnation}
+			}
+			if n.maintain(e, false) {
+				ref = &Ref{e.key, e.h.Incarnation}
+			}
 		}
 		n.leave(e)
+		ctx, cancel := n.commitContext()
+		defer cancel()
 		if ref != nil { // the step superseded objects: collect them now, outside the gate (best effort)
-			ctx, cancel := n.commitContext()
-			defer cancel()
 			n.Collect(ctx, *ref)
+		}
+		if sweep != nil {
+			n.sweep(ctx, *sweep)
 		}
 	}()
 }
@@ -150,7 +158,7 @@ func (n *Node) reap(ctx context.Context, h *head.Head) error {
 	for _, r := range links(h) {
 		live[r.Key] = !h.Deleted
 	}
-	prefix := head.ObjectPrefix(h.Key, h.Incarnation)
+	prefix, blobs := head.ObjectPrefix(h.Key, h.Incarnation), head.BlobPrefix(h.Key, h.Incarnation)
 	for after := ""; ; {
 		page, more, err := n.st.List(ctx, prefix, after, 1000)
 		if err != nil {
@@ -158,7 +166,8 @@ func (n *Node) reap(ctx context.Context, h *head.Head) error {
 		}
 		for _, o := range page {
 			after = o.Key
-			if base, _, _, err := head.ParseObjectKey(prefix, o.Key); err == nil && base < h.Revision && !live[o.Key] {
+			base, _, _, err := head.ParseObjectKey(prefix, o.Key)
+			if prefix == blobs || err == nil && base < h.Revision && !live[o.Key] { // a tombstone's blobs all go (D33)
 				failpoint("collect.del")
 				switch err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) {
 				case store.OK:
@@ -168,6 +177,10 @@ func (n *Node) reap(ctx context.Context, h *head.Head) error {
 					return storeError(err)
 				} // Unknown: left for a later pass
 			}
+		}
+		if (!more || len(page) == 0) && h.Deleted && prefix != blobs {
+			prefix, after, more = blobs, "", true
+			continue
 		}
 		if !more || len(page) == 0 {
 			n.counters.collections.Add(1)

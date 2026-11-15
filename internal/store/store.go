@@ -10,6 +10,7 @@ package store
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 )
 
@@ -125,6 +126,9 @@ func Hedge(ctx context.Context, delay time.Duration, put func(context.Context) (
 	return "", errs, errs[0]
 }
 
+// PartBytes is the multipart threshold and part size of PutFile.
+const PartBytes = 8 << 20
+
 // Object is a whole object body and its opaque ETag.
 type Object struct {
 	Body []byte
@@ -170,4 +174,21 @@ type Store interface {
 	// Delete removes key; deleting an absent key is OK.
 	// Outcomes: OK, Unknown, Failed.
 	Delete(ctx context.Context, key string) error
+
+	// PutFile creates key from the size bytes of body, in one PUT up to
+	// PartBytes and in parallel parts above, each carrying its SHA-256 for
+	// the server to check (sum, the whole body's, for a single PUT). It is
+	// bounded by ctx alone; a failed multipart upload is aborted. A key is
+	// written once: callers never reuse one.
+	// Outcomes: OK, Unknown, Failed.
+	PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error
+
+	// Copy creates key to as a server-side copy of key from (at most 5 GiB).
+	// Outcomes: OK, NotFound, Unknown, Failed.
+	Copy(ctx context.Context, from, to string) error
+
+	// Open streams at most n bytes of key from offset off; the caller
+	// checks their length and digest.
+	// Outcomes: OK, NotFound, Unknown, Failed.
+	Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error)
 }

@@ -98,6 +98,9 @@ func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 		if a == sqlite.AuthReindex && reserved(arg1) { // arg1 is the index: skip it, so a bare REINDEX still runs
 			return sqlite.AuthorizerIgnore
 		}
+		if a == sqlite.AuthRead && strings.EqualFold(arg1, "_state_blobs") && (db == "" || db == "main") {
+			return sqlite.AuthorizerOK // readable, never writable (D33)
+		}
 		if (db != "" && db != "main" && !tempSchema) || reserved(arg1) {
 			return sqlite.AuthorizerDeny
 		}
@@ -171,7 +174,21 @@ func (s *scope) Query(ctx context.Context, q string, args []any, fn func(*sql.Ro
 }
 
 // Tx is the scoped SQL handle of a mutation callback.
-type Tx struct{ scope }
+type Tx struct {
+	scope
+	files []fileOp
+}
+
+// SetFile sets (or with f nil deletes) the named file when the callback
+// returns, in library mode.
+func (t *Tx) SetFile(name string, f *File) error {
+	if err := t.enter(); err != nil {
+		return err
+	}
+	defer t.mu.RUnlock()
+	t.files = append(t.files, fileOp{name, f})
+	return nil
+}
 
 // Exec runs one or more statements, each authorized separately.
 func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
