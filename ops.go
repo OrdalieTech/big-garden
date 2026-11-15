@@ -463,8 +463,7 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 	if err == nil {
 		n.mu.Lock()
 		for _, b := range born {
-			os.Remove(b.spool)
-			delete(n.unborn, b.spool)
+			n.dropUnborn(b.spool)
 		}
 		n.mu.Unlock()
 	}

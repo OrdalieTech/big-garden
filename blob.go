@@ -138,6 +138,10 @@ func (n *Node) PutBlob(ctx context.Context, ref Ref, r io.Reader) (Blob, error) 
 			if _, err := io.Copy(io.MultiWriter(spool, c), r); err != nil {
 				return Blob{}, newError(CodeInvalidArgument, "reading the blob", err)
 			}
+			n.staging.Add(f.Size) // counted in CacheBytes while spooled (D37)
+			if !unborn {
+				defer n.staging.Add(-f.Size)
+			}
 			body = spool
 		}
 		c.close()
@@ -150,7 +154,7 @@ func (n *Node) PutBlob(ctx context.Context, ref Ref, r io.Reader) (Blob, error) 
 			b := blobOf(f)
 			b.spool = body.(*os.File).Name()
 			n.mu.Lock()
-			n.unborn[b.spool] = n.now().Add(blobLinkWindow)
+			n.unborn[b.spool] = spooledBlob{n.now().Add(blobLinkWindow), f.Size}
 			n.mu.Unlock()
 			return b, nil
 		}

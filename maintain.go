@@ -174,6 +174,7 @@ func (n *Node) startSnapshot(ctx context.Context, e *entity) bool {
 		return true
 	}
 	e.snap = &snapJob{attempt, e.h.Incarnation, next.Revision, f, img}
+	n.staging.Add(int64(img.PageCount) * head.PageSize) // the copy counts in CacheBytes until the job ends (D37)
 	return true
 }
 
@@ -186,6 +187,7 @@ func (n *Node) startSnapshot(ctx context.Context, e *entity) bool {
 func (n *Node) runSnapshot(e *entity, job *snapJob) bool {
 	defer os.Remove(job.file.Name())
 	defer job.file.Close()
+	defer n.staging.Add(-int64(job.img.PageCount) * head.PageSize)
 	ctx, cancel := context.WithCancel(context.Background()) // the upload may outlast CommitTimeout; Close ends it
 	defer cancel()
 	go func() {

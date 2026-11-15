@@ -43,8 +43,8 @@ type Node struct {
 	staging    atomic.Int64  // bytes of objects being uploaded (Stats)
 	logged     atomic.Int64  // unix nanos of the last log line (rate limit)
 	closed     bool
-	uploads    map[string]upload    // blob uploads of this Node by full key, under mu (D33)
-	unborn     map[string]time.Time // spools of blobs for a Create, until when they are kept, under mu
+	uploads    map[string]upload      // blob uploads of this Node by full key, under mu (D33)
+	unborn     map[string]spooledBlob // spools of blobs for a Create, under mu
 	chunks     chunkCache
 
 	done            chan struct{} // closed by Close: stops the sweeper
@@ -83,7 +83,7 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 	if cfg.Key != nil {
 		st, _ = store.Sealed(st, cfg.Key) // validated: 32 bytes
 	}
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]time.Time{}, offGate: 16 << 20 / head.PageSize, now: time.Now,
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]spooledBlob{}, offGate: 16 << 20 / head.PageSize, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {
@@ -130,11 +130,26 @@ func (n *Node) sweeper() {
 // pruneUnborn removes the spools of blobs for a Create that no Create used
 // in time; under n.mu.
 func (n *Node) pruneUnborn(now time.Time) {
-	for path, until := range n.unborn {
-		if now.After(until) {
-			os.Remove(path)
-			delete(n.unborn, path)
+	for path, b := range n.unborn {
+		if now.After(b.until) {
+			n.dropUnborn(path)
 		}
+	}
+}
+
+// spooledBlob is the spool of a blob for a Create: kept until, size bytes
+// counted in CacheBytes (D37).
+type spooledBlob struct {
+	until time.Time
+	size  int64
+}
+
+// dropUnborn removes a blob spool for a Create; under n.mu.
+func (n *Node) dropUnborn(path string) {
+	if b, ok := n.unborn[path]; ok {
+		os.Remove(path)
+		n.staging.Add(-b.size)
+		delete(n.unborn, path)
 	}
 }
 
@@ -543,7 +558,8 @@ func (n *Node) cache(ctx context.Context, e *entity) error {
 }
 
 // fit reserves buildBytes for self if it fits in CacheBytes beside the other
-// reserves, the files of the other resident entities and the warm tier,
+// reserves, the files of the other resident entities, the warm tier and the
+// spools of objects and blobs in flight (D37),
 // deleting warm files then parking idle, settled entities, least recently
 // used first, until it does. A busy
 // entity is pinned and counts with its last seen size. It never blocks on an
@@ -553,7 +569,7 @@ func (n *Node) fit(self *entity) bool {
 	defer n.mu.Unlock()
 	for {
 		_, used, lru := n.scan(time.Time{}, self)
-		if n.reserved+used+n.warmBytes()+n.buildBytes() <= n.cfg.Limits.CacheBytes {
+		if n.reserved+used+n.warmBytes()+n.staging.Load()+n.buildBytes() <= n.cfg.Limits.CacheBytes {
 			n.reserved += n.buildBytes()
 			return true
 		}

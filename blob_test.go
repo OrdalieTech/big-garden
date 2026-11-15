@@ -546,3 +546,42 @@ func TestFilesReadAfterCachedChunks(t *testing.T) {
 		t.Fatalf("sequential read after cached chunks: %d bytes, %v", len(got), err)
 	}
 }
+
+// Spooled bytes count in CacheBytes (D37): a blob kept for a Create shows
+// in StagingBytes and takes room an activation needs, until it is used.
+func TestSpoolsCountInCacheBytes(t *testing.T) {
+	mem := storetest.NewMem()
+	small := func(l *Limits) { l.EntityBytes, l.Recoveries, l.CacheBytes = 1<<20, 1, 6<<20 } // one activation: 5 MiB
+	a := testNode(t, mem, "a", small)
+	b := testNode(t, mem, "b", nil)
+	ref, _, err := b.Create(bg, "other", newReq(t, "other", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := a.PutBlob(bg, Ref{Key: "doc"}, bytes.NewReader(random(2<<20)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := a.Stats().StagingBytes; s != 2<<20 {
+		t.Fatalf("staging %d, want the spool's 2 MiB", s)
+	}
+	_, err = a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil }) // 5 MiB more do not fit in 6
+	wantCode(t, err, CodeCapacity)
+	if _, _, err := a.Create(bg, "doc", newReq(t, "doc", 1), func(tx *Tx) ([]byte, error) {
+		if _, err := createKV(tx); err != nil {
+			return nil, err
+		}
+		return nil, tx.SetFile("f", &blob)
+	}); err == nil {
+		t.Fatal("a create fitted beside the spool")
+	}
+	a.mu.Lock()
+	a.pruneUnborn(time.Now().Add(blobLinkWindow + time.Minute))
+	a.mu.Unlock()
+	if s := a.Stats().StagingBytes; s != 0 {
+		t.Fatalf("staging %d after the spool went", s)
+	}
+	if _, err := a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+}

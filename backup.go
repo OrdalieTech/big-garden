@@ -135,6 +135,12 @@ func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader)
 		return Ref{}, Result{}, err
 	}
 	m, snap, spools, err := n.readArchive(r)
+	staged := snap.n // counted in CacheBytes until the import returns (D37)
+	for _, sp := range spools {
+		staged += sp.f.Size
+	}
+	n.staging.Add(staged)
+	defer n.staging.Add(-staged)
 	defer snap.Close()
 	defer func() {
 		for _, sp := range spools {
