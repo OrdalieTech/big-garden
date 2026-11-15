@@ -159,6 +159,7 @@ func (n *Node) PutBlob(ctx context.Context, ref Ref, r io.Reader) (Blob, error) 
 	} else {
 		err = n.st.PutFile(ctx, key, body, f.Size, f.SHA256)
 	}
+	failpoint("blob.after")
 	n.mu.Lock()
 	n.uploads[key] = upload{epoch, n.now()} // never fresh: the sweep takes it if it landed
 	if err == nil {
@@ -497,6 +498,7 @@ func (n *Node) sweep(ctx context.Context, ref Ref) error {
 	n.leave(e)
 	var errs []error
 	for _, k := range dead {
+		failpoint("sweep.del")
 		if err := n.st.Delete(ctx, k); store.OutcomeOf(err) != store.OK {
 			errs = append(errs, err)
 		}

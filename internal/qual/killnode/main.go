@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/rand"
@@ -17,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
@@ -141,6 +143,12 @@ func main() {
 	n.Close(ctx)
 }
 
+// FileBytes is the content attached under name: 70 KiB, a blob, not inline.
+func FileBytes(name string) []byte {
+	sum := sha256.Sum256([]byte(name))
+	return bytes.Repeat(sum[:], 70<<10/32)
+}
+
 // errRefused is the callback error of a Fail add: it must reach the caller
 // unchanged (code "other") and roll its row back.
 var errRefused = errors.New("refused by callback")
@@ -179,6 +187,59 @@ func serve(ctx context.Context, n *garden.Node, r Req) Resp {
 			})
 			return []byte(strconv.Itoa(c)), err
 		})
+	case "attach": // PutBlob of the file named Input, then link it with a log row
+		var b garden.Blob
+		if b, err = n.PutBlob(ctx, ref, bytes.NewReader(FileBytes(r.Input))); err == nil {
+			res, err = n.Update(ctx, ref, req, func(tx *garden.Tx) ([]byte, error) {
+				if _, err := tx.Exec(ctx, "INSERT INTO log VALUES (?, x'')", r.ID); err != nil {
+					return nil, err
+				}
+				return nil, tx.SetFile(r.Input, &b)
+			})
+		}
+	case "detach":
+		res, err = n.Update(ctx, ref, req, func(tx *garden.Tx) ([]byte, error) {
+			if _, err := tx.Exec(ctx, "INSERT INTO log VALUES (?, x'')", r.ID); err != nil {
+				return nil, err
+			}
+			return nil, tx.SetFile(r.Input, nil)
+		})
+	case "files": // every file name, each read back whole and checked against FileBytes
+		var names []string
+		if _, err = n.Read(ctx, ref, 1, func(v *garden.View) ([]byte, error) {
+			return nil, v.Query(ctx, "SELECT name FROM _state_blobs ORDER BY name", nil, func(rows *sql.Rows) error {
+				for rows.Next() {
+					var s string
+					if err := rows.Scan(&s); err != nil {
+						return err
+					}
+					names = append(names, s)
+				}
+				return rows.Err()
+			})
+		}); err != nil && !strings.Contains(err.Error(), "no such table") {
+			break
+		}
+		err = nil
+		for _, name := range names {
+			var b garden.Blob
+			if _, err = n.Read(ctx, ref, 1, func(v *garden.View) (_ []byte, err error) { b, _, err = v.File(ctx, name); return nil, err }); err != nil {
+				break
+			}
+			var f io.ReadSeekCloser
+			if f, err = n.OpenBlob(ctx, ref, b); err != nil {
+				break
+			}
+			got, rerr := io.ReadAll(f)
+			f.Close()
+			if err = rerr; err == nil && !bytes.Equal(got, FileBytes(name)) {
+				err = fmt.Errorf("file %s: %d bytes differ from what was attached", name, len(got))
+			}
+			if err != nil {
+				break
+			}
+			ids = append(ids, name)
+		}
 	case "delete":
 		err = n.Delete(ctx, ref)
 	case "resolve":
