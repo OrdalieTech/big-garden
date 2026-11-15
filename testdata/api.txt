@@ -125,7 +125,8 @@ type Stats struct {
 		Time				time.Duration
 	}
 }
-type Tx struct{}
+type Tx struct {
+}
 type Version struct {
 	Incarnation	[16]byte
 	Sequence	uint64

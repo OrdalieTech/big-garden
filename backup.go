@@ -177,13 +177,8 @@ func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader)
 		return db, nil, nil
 	}, func(ctx context.Context, inc head.ID) error { // the blobs, renamed to epoch 0 by Rebase
 		for object, sp := range spools {
-			k := head.BlobPrefix(key, inc) + "0000000000000000" + object[16:]
-			err := n.st.PutFile(ctx, k, sp.file, sp.f.Size, sp.f.SHA256)
-			if store.OutcomeOf(err) == store.PreconditionFailed { // a resumed import: keep what is there only if it is these bytes
-				err = verify(ctx, n, k, sp.f)
-			}
-			if err != nil {
-				return storeError(err)
+			if err := n.putSpooled(ctx, head.BlobPrefix(key, inc)+"0000000000000000"+object[16:], sp.file.Name(), sp.f); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -196,12 +191,24 @@ type spooled struct {
 	f    engine.File
 }
 
-// verify reads the object at key whole and checks it against f.
-func verify(ctx context.Context, n *Node, key string, f engine.File) error {
-	r := &blobReader{n: n, ctx: ctx, key: key, f: f, last: -2}
-	defer r.Close()
-	_, err := io.Copy(io.Discard, r)
-	return err
+// putSpooled uploads the blob f from the file at path to key before a
+// genesis; a resumed create that finds the key keeps it only if it verifies.
+func (n *Node) putSpooled(ctx context.Context, key, path string, f engine.File) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return newError(CodeUnavailable, "blob spool", err)
+	}
+	defer file.Close()
+	err = n.st.PutFile(ctx, key, file, f.Size, f.SHA256)
+	if store.OutcomeOf(err) == store.PreconditionFailed {
+		r := &blobReader{n: n, ctx: ctx, key: key, f: f, last: -2}
+		_, err = io.Copy(io.Discard, r)
+		r.Close()
+	}
+	if err != nil {
+		return storeError(err)
+	}
+	return nil
 }
 
 // readArchive reads exactly manifest.json then snapshot.ltx, regular files

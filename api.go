@@ -101,7 +101,10 @@ type Config struct {
 
 // Tx is the scoped SQL handle of a mutation callback. It is invalid after the
 // callback returns.
-type Tx struct{ t *engine.Tx }
+type Tx struct {
+	t    *engine.Tx
+	born *[]Blob // in a Create: the spooled blobs it names
+}
 
 // View is the scoped read-only SQL handle of a Read callback. It is invalid
 // after the callback returns.

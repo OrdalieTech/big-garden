@@ -41,7 +41,8 @@ type Node struct {
 	staging    atomic.Int64  // bytes of objects being uploaded (Stats)
 	logged     atomic.Int64  // unix nanos of the last log line (rate limit)
 	closed     bool
-	uploads    map[string]upload // blob uploads of this Node by full key, under mu (D33)
+	uploads    map[string]upload    // blob uploads of this Node by full key, under mu (D33)
+	unborn     map[string]time.Time // spools of blobs for a Create, until when they are kept, under mu
 	chunks     chunkCache
 
 	done            chan struct{} // closed by Close: stops the sweeper
@@ -64,7 +65,7 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, now: time.Now,
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]time.Time{}, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {
@@ -102,7 +103,19 @@ func (n *Node) sweeper() {
 		case now := <-t.C:
 			n.mu.Lock()
 			n.scan(now.Add(-n.cfg.Limits.IdleTimeout), nil)
+			n.pruneUnborn(now)
 			n.mu.Unlock()
+		}
+	}
+}
+
+// pruneUnborn removes the spools of blobs for a Create that no Create used
+// in time; under n.mu.
+func (n *Node) pruneUnborn(now time.Time) {
+	for path, until := range n.unborn {
+		if now.After(until) {
+			os.Remove(path)
+			delete(n.unborn, path)
 		}
 	}
 }

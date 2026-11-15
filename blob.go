@@ -51,9 +51,10 @@ type Blob struct {
 	Size   int64
 	SHA256 [32]byte
 	f      engine.File
+	spool  string // the bytes of a blob for a Create, on this Node
 }
 
-func blobOf(f engine.File) Blob { return Blob{f.Size, f.SHA256, f} }
+func blobOf(f engine.File) Blob { return Blob{Size: f.Size, SHA256: f.SHA256, f: f} }
 
 type upload struct {
 	epoch uint64
@@ -96,9 +97,15 @@ func (c *chunker) close() {
 // holds are not stored again; up to 8 MiB is buffered, more is spooled to
 // the cache directory and sent in parallel parts. A reader from OpenBlob,
 // unread, is copied inside the storage service.
+//
+// With a Ref of zero Incarnation (a key not created yet), the bytes stay
+// spooled on this Node, for Tx.SetFile in a Create of ref.Key on it, which
+// uploads them after birth.json (DECISIONS D33); the spool is removed when
+// that Create succeeds, or after blobLinkWindow.
 func (n *Node) PutBlob(ctx context.Context, ref Ref, r io.Reader) (Blob, error) {
+	unborn := ref.Incarnation == head.ID{}
 	src, copied := r.(*blobReader)
-	copied = copied && src.n == n && src.off == 0 && src.f.Size > inlineFile && src.f.Size <= 5<<30
+	copied = copied && !unborn && src.n == n && src.off == 0 && src.f.Size > inlineFile && src.f.Size <= 5<<30
 	var f engine.File
 	var body io.ReaderAt
 	if copied {
@@ -110,13 +117,21 @@ func (n *Node) PutBlob(ctx context.Context, ref Ref, r io.Reader) (Blob, error) 
 			return Blob{}, newError(CodeInvalidArgument, "reading the blob", err)
 		}
 		body = bytes.NewReader(buf.Bytes())
-		if f.Size > store.PartBytes {
+		if f.Size > store.PartBytes || unborn && f.Size > inlineFile {
 			spool, err := os.CreateTemp(n.dir, "blob-*")
 			if err != nil {
 				return Blob{}, newError(CodeUnavailable, "blob spool", err)
 			}
-			defer os.Remove(spool.Name())
 			defer spool.Close()
+			if !unborn {
+				defer os.Remove(spool.Name())
+			} else {
+				defer func() {
+					if f.Object == "" { // failed: nothing keeps it
+						os.Remove(spool.Name())
+					}
+				}()
+			}
 			if _, err := spool.Write(buf.Bytes()); err != nil {
 				return Blob{}, newError(CodeUnavailable, "blob spool", err)
 			}
@@ -129,6 +144,15 @@ func (n *Node) PutBlob(ctx context.Context, ref Ref, r io.Reader) (Blob, error) 
 		if f.Size <= inlineFile {
 			f.Inline = append([]byte{}, buf.Bytes()...) // non-nil, even empty: inline
 			return blobOf(f), nil
+		}
+		if unborn { // epoch 0: linked from genesis, never fresh (as an import's)
+			f.Object = head.BlobName(0, head.NewID())
+			b := blobOf(f)
+			b.spool = body.(*os.File).Name()
+			n.mu.Lock()
+			n.unborn[b.spool] = n.now().Add(blobLinkWindow)
+			n.mu.Unlock()
+			return b, nil
 		}
 	}
 	e, err := n.enter(ctx, ref.Key, nil, nil, false)
@@ -187,8 +211,13 @@ func (n *Node) fresh(e *entity) func(string) bool {
 // hold the same Blob. A blob neither in the image nor fresh from PutBlob on
 // this Node is refused (invalid_argument): upload it again.
 func (t *Tx) SetFile(name string, b *Blob) error {
-	if b == nil {
+	switch {
+	case b == nil:
 		return t.t.SetFile(name, nil)
+	case b.spool != "" && t.born == nil:
+		return invalid("a Blob of PutBlob on a key not created yet names a file only in that key's Create")
+	case b.spool != "":
+		*t.born = append(*t.born, *b)
 	}
 	return t.t.SetFile(name, &b.f)
 }

@@ -434,7 +434,9 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 		return Ref{}, Result{}, err
 	}
 	bound := binding(1, req.Schema, req.Schema, req.Hash)
-	return n.create(ctx, key, req, bound, func(path string, inc head.ID) (*engine.DB, []byte, error) {
+	var born []Blob // the spooled blobs the callback names (D33)
+	ref, res, err := n.create(ctx, key, req, bound, func(path string, inc head.ID) (*engine.DB, []byte, error) {
+		born = born[:0]
 		db, err := engine.Create(ctx, n.drv, path, n.maxPages(), n.ns, key, inc)
 		if err != nil {
 			return nil, nil, engineError(err)
@@ -447,15 +449,34 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 			}
 		}()
 		failpoint("sql.before")
-		result, _, err := db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema},
-			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
+		fresh := func(object string) bool {
+			return slices.ContainsFunc(born, func(b Blob) bool { return b.f.Object == object })
+		}
+		result, _, err := db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: req.Schema, Fresh: fresh},
+			scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t, &born}) }, &cb))
 		if err != nil {
 			return nil, nil, callbackError(err, cb)
 		}
 		failpoint("sql.after")
 		built = true
 		return db, result, nil
-	}, nil)
+	}, func(ctx context.Context, inc head.ID) error { // after birth.json: only this Request resumes what it leaves
+		for _, b := range born {
+			if err := n.putSpooled(ctx, head.BlobPrefix(key, inc)+b.f.Object, b.spool, b.f); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		n.mu.Lock()
+		for _, b := range born {
+			os.Remove(b.spool)
+			delete(n.unborn, b.spool)
+		}
+		n.mu.Unlock()
+	}
+	return ref, res, err
 }
 
 func (n *Node) maxPages() uint32 { return uint32(n.cfg.Limits.EntityBytes / head.PageSize) }
@@ -778,7 +799,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 			floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
 			failpoint("sql.before")
 			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor), Fresh: n.fresh(e)},
-				scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t}) }, &cb))
+				scoped(n.cfg.Limits.ResultBytes, func(t *engine.Tx) ([]byte, error) { failpoint("sql.inside"); return fn(&Tx{t: t}) }, &cb))
 			if err != nil && (cb == nil || cb == errResultTooLarge) {
 				e.discard()
 				return Result{}, withOp(callbackError(err, cb), req.ID)
@@ -1009,7 +1030,7 @@ func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 					}
 				}()
 				failpoint("sql.member")
-				return m.fn(&Tx{t})
+				return m.fn(&Tx{t: t})
 			}, &cb))
 		switch {
 		case err == nil:

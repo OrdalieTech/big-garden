@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
+	"github.com/OrdalieTech/big-garden/internal/store"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
@@ -443,5 +444,77 @@ func TestFilesRename(t *testing.T) {
 	}
 	if _, ok := fileOf(t, n, ref, "crdt/current"); ok {
 		t.Fatal("the old name survived")
+	}
+}
+
+// A Create carries files uploaded before its key exists: they are part of
+// genesis, read on any Node, survive a sweep; a cut create resumed under its
+// Request keeps one object per file; an unused spool is pruned.
+func TestFilesInCreate(t *testing.T) {
+	mem := storetest.NewMem()
+	a, b := testNode(t, mem, "a", nil), testNode(t, mem, "b", nil)
+	pdf := random(300 << 10)
+	doc, err := a.PutBlob(bg, Ref{Key: "doc"}, bytes.NewReader(pdf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, err := a.PutBlob(bg, Ref{Key: "doc"}, strings.NewReader("small"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// genesis fails after birth.json and the uploads: the create is cut
+	var cut bool
+	mem.SetPlan(func(at storetest.Attempt) storetest.MemFault {
+		if at.Op == "put" && strings.Contains(at.Key, "/objects/") && !cut {
+			cut = true
+			return storetest.MemFault{Reject: store.Failed}
+		}
+		return storetest.MemFault{}
+	})
+	req := newReq(t, "create", 1)
+	create := func(tx *Tx) ([]byte, error) {
+		if _, err := createKV(tx); err != nil {
+			return nil, err
+		}
+		return nil, errors.Join(tx.SetFile("source.pdf", &doc), tx.SetFile("note", &note))
+	}
+	if _, _, err := a.Create(bg, "doc", req, create); err == nil {
+		t.Fatal("the cut create succeeded")
+	}
+	mem.SetPlan(nil)
+	ref, _, err := a.Create(bg, "doc", req, create) // resumed: the blob is there already and verifies
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := blobKeys(t, mem, ref); len(got) != 1 {
+		t.Fatalf("blob objects %v, want one", got)
+	}
+	if _, err := os.Stat(doc.spool); !os.IsNotExist(err) {
+		t.Fatalf("the spool outlived its Create: %v", err)
+	}
+	if err := a.sweep(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string][]byte{"source.pdf": pdf, "note": []byte("small")} {
+		f, ok := fileOf(t, b, ref, name)
+		if got, err := readBlob(t, b, ref, f, 0, f.Size); !ok || err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s: %v %v", name, ok, err)
+		}
+	}
+
+	// a Blob for a Create is refused anywhere else
+	later, err := a.PutBlob(bg, Ref{Key: "other"}, bytes.NewReader(pdf[:100<<10]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Update(bg, ref, newReq(t, "elsewhere", 1), setFile("x", &later))
+	wantCode(t, err, CodeInvalidArgument)
+
+	// never used: pruned once its window passes
+	a.mu.Lock()
+	a.pruneUnborn(time.Now().Add(blobLinkWindow + time.Minute))
+	a.mu.Unlock()
+	if _, err := os.Stat(later.spool); !os.IsNotExist(err) {
+		t.Fatalf("an unused spool survived its window: %v", err)
 	}
 }
