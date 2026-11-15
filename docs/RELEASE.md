@@ -1,3 +1,17 @@
+# Milestone v0.3.0 (2026-11-16)
+
+v0.2.1 plus five capabilities, each recorded as a decision with its evidence:
+
+- **Files (D33).** An entity holds named files beside its tables: `PutBlob`, `Tx.SetFile` (nil deletes), `Tx.File`, `View.File`, `OpenBlob` (an `io.ReadSeekCloser` and `io.ReaderAt`, every 1 MiB checked). Small files are inline, larger ones immutable objects under the entity's prefix named by ownership epoch, collected by a list-then-judge sweep, deleted with the entity, carried by Export, Import and a Create, copied server-side between entities. Exhaustive model (`TestBlobProtocol`), SIGKILL lanes (`TestProcessKillFiles`).
+- **Size (D34).** No ceiling below SQLite's (16 TiB); every object streams through a spool, transfers get size-based timeouts, SQLite's lock page at 1 GiB is handled. `TestEntityAcrossLockPage` takes 1.1 GiB through growth, snapshot, activation, shrink, export and import at 231 MB peak RSS.
+- **Off-mutex snapshots (D35).** From 16 MiB, maintenance snapshots without holding the entity mutex: an intent in the head keeps collection a proof. Exhaustive model (`TestSnapshotProtocol`, 3 M states, four controls).
+- **Encryption at rest (D36).** `Config.Key` seals every object and blob (AES-256-GCM, 1 MiB segments, a key per object); `namespace.json` binds a namespace to its key. The root suite runs sealed under `GARDEN_TEST_SEALED=1`.
+- **Spools in the cache budget (D37)**, and **two-stage vector search** in `vec` (binary prefilter and exact rerank, recall@10 1.000 and 11x faster at 30k vectors).
+
+API: 16 exported types and 31 callables (`Tx.File` raised the budget from 30, D33); 6,280 production lines of a budget raised to 6,500 (D35). Format: heads may carry `pending` and namespaces `key_check`, both absent unless used; a v0.2 library refuses them (fail closed), and v0.3 reads every v0.2 namespace.
+
+Evidence at e267511: `go test` of every package; the root package again with `GARDEN_TEST_BATCH=1`, `GARDEN_TEST_SEALED=1` and `GARDEN_TEST_S3=1` (RustFS); `-race` on the new tests; `qual faults` locally at 10 repetitions: 37 of 37 lanes pass; the store and sealed-namespace tests on Scaleway fr-par; `qual footprint` passes. Still not the PLAN §22 production release, for the reasons v0.1.0 lists (full-length remote campaigns, 24 h soaks).
+
 # Milestone v0.2.1 (2026-11-11)
 
 v0.2.0 plus a build for every OS a consumer ships to: the two calls that were Unix-only, an open that refuses a symbolic link and the node directory's lock, move to `internal/engine/os_unix.go` and `os_windows.go` (`FILE_FLAG_OPEN_REPARSE_POINT` and `LockFileEx` on Windows). Behaviour on Unix is unchanged. Qualification remains Linux only: Windows and macOS compile, they are not qualified to run a node.
