@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -26,12 +27,23 @@ import (
 func Backup(ctx context.Context, n *garden.Node, w io.Writer) (int, error) {
 	tw := tar.NewWriter(w)
 	count := 0
+	b, err := os.CreateTemp("", "garden-backup-*") // one archive at a time: an entity's files may not fit in memory
+	if err != nil {
+		return count, err
+	}
+	defer os.Remove(b.Name())
+	defer b.Close()
 	for route, err := range n.Scan(ctx, "") {
 		if err != nil {
 			return count, err
 		}
-		var b bytes.Buffer
-		if _, err := n.Export(ctx, route.Ref, &b); err != nil {
+		if _, err := b.Seek(0, io.SeekStart); err != nil {
+			return count, err
+		}
+		if err := b.Truncate(0); err != nil {
+			return count, err
+		}
+		if _, err := n.Export(ctx, route.Ref, b); err != nil {
 			var ge *garden.Error
 			if errors.As(err, &ge) && ge.Code == garden.CodeNotFound { // deleted since the scan
 				continue
@@ -39,11 +51,17 @@ func Backup(ctx context.Context, n *garden.Node, w io.Writer) (int, error) {
 			return count, err
 		}
 		hdr := &tar.Header{Name: hex.EncodeToString([]byte(route.Ref.Key)) + ".tar", Typeflag: tar.TypeReg, Mode: 0o600,
-			Size: int64(b.Len()), ModTime: time.Unix(0, 0), Format: tar.FormatPAX}
+			ModTime: time.Unix(0, 0), Format: tar.FormatPAX}
+		if hdr.Size, err = b.Seek(0, io.SeekCurrent); err != nil {
+			return count, err
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return count, err
 		}
-		if _, err := tw.Write(b.Bytes()); err != nil {
+		if _, err := b.Seek(0, io.SeekStart); err != nil {
+			return count, err
+		}
+		if _, err := io.Copy(tw, b); err != nil {
 			return count, err
 		}
 		count++

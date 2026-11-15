@@ -90,7 +90,12 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 // import receipt at the following sequence.
 func (d *DB) Rebase(ns head.ID, key string, inc head.ID) error {
 	return d.inTx(func() error {
-		return d.exec("UPDATE _state_meta SET namespace = ?, key = ?, incarnation = ?", ns[:], key, inc[:])
+		var files int
+		err := d.conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sqlite_schema WHERE name = '_state_blobs'").Scan(&files)
+		if err == nil && files > 0 { // the imported blobs are uploaded at epoch 0, before genesis (D33)
+			err = d.exec("UPDATE _state_blobs SET object = '0000000000000000' || substr(object, 17) WHERE object IS NOT NULL")
+		}
+		return errors.Join(err, d.exec("UPDATE _state_meta SET namespace = ?, key = ?, incarnation = ?", ns[:], key, inc[:]))
 	})
 }
 

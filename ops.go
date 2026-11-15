@@ -390,7 +390,7 @@ func (n *Node) Create(ctx context.Context, key string, req Request, fn func(*Tx)
 		failpoint("sql.after")
 		built = true
 		return db, result, nil
-	})
+	}, nil)
 }
 
 func (n *Node) maxPages() uint32 { return uint32(n.cfg.Limits.EntityBytes / head.PageSize) }
@@ -400,7 +400,8 @@ func (n *Node) maxPages() uint32 { return uint32(n.cfg.Limits.EntityBytes / head
 type builder func(path string, inc head.ID) (*engine.DB, []byte, error)
 
 // create runs PROTOCOL §5 for Create (kind 1) and Import (kind 4).
-func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder) (ref Ref, res Result, err error) {
+func (n *Node) create(ctx context.Context, key string, req Request, bound head.Digest, build builder,
+	upload func(context.Context, head.ID) error) (ref Ref, res Result, err error) {
 	defer func() { n.observe(key, false, res, err) }()
 	e, err := n.enter(ctx, key, &req.ID, nil, false)
 	if err != nil {
@@ -524,6 +525,12 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 				return unknown(storeError(err))
 			}
 		}
+		if upload != nil { // after birth.json: only this request can resume what it leaves
+			if err := upload(ctx, inc); err != nil {
+				e.discard()
+				return unknown(err)
+			}
+		}
 		ref := snap.Ref
 		c := candidate{next: head.Head{Revision: 1, Epoch: 1}, object: &ref, op: &op, bound: bound, pages: []uint32{snap.Pages}}
 		if tomb != nil { // revision and epoch continue across incarnations; the snapshot is produced against the tombstone
@@ -619,12 +626,14 @@ func (n *Node) resumable(ctx context.Context, key string, inc head.ID) error {
 // be a genesis whose head was published, then lost (D14): only its request
 // resumes it (D5).
 func (n *Node) untouched(ctx context.Context, key string) error {
-	page, _, err := n.st.List(ctx, head.EntityDir(key)+"/objects/", "", 1)
-	if err != nil {
-		return storeError(err)
-	}
-	if len(page) > 0 {
-		return newError(CodeStateMissing, "birth.json and objects exist without head.json", nil)
+	for _, dir := range []string{"/objects/", "/blobs/"} { // an import uploads its blobs before genesis (D33)
+		page, _, err := n.st.List(ctx, head.EntityDir(key)+dir, "", 1)
+		if err != nil {
+			return storeError(err)
+		}
+		if len(page) > 0 {
+			return newError(CodeStateMissing, "birth.json and objects exist without head.json", nil)
+		}
 	}
 	return nil
 }

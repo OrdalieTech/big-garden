@@ -929,7 +929,7 @@ func TestImportRejectsMalformedArchives(t *testing.T) {
 	if _, err := a.Export(bg, src, &archive); err != nil {
 		t.Fatal(err)
 	}
-	m, snap, err := a.readArchive(bytes.NewReader(archive.Bytes()))
+	m, snap, _, err := a.readArchive(bytes.NewReader(archive.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1023,7 +1023,7 @@ func FuzzImport(f *testing.F) {
 	f.Add(tarOf(member{name: "manifest.json", body: []byte("{}")}, member{name: "snapshot.ltx", body: []byte("x")}))
 	var keys atomic.Int64
 	f.Fuzz(func(t *testing.T, b []byte) {
-		m, snap, err := n.readArchive(bytes.NewReader(b))
+		m, snap, _, err := n.readArchive(bytes.NewReader(b))
 		if err != nil {
 			wantCode(t, err, CodeCorrupt)
 			return

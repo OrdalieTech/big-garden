@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -68,6 +69,14 @@ func TestBackupRestoreDrill(t *testing.T) {
 		}
 		refs[key] = ref
 	}
+	file := bytes.Repeat([]byte("a file of e3 "), 30000) // a blob, not inline: the backup carries its bytes
+	blob, err := src.PutBlob(bg, refs["e3"], bytes.NewReader(file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Update(bg, refs["e3"], req(t, "e3f"), func(tx *garden.Tx) ([]byte, error) { return nil, tx.SetFile("f", &blob) }); err != nil {
+		t.Fatal(err)
+	}
 	if err := src.Delete(bg, refs["e7"]); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +104,18 @@ func TestBackupRestoreDrill(t *testing.T) {
 		}
 		if v := value(t, dst, route.Ref); v != key+"-state" {
 			t.Fatalf("%s restored as %q", key, v)
+		}
+		if key == "e3" {
+			var f garden.Blob
+			dst.Read(bg, route.Ref, 1, func(v *garden.View) (_ []byte, err error) { f, _, err = v.File(bg, "f"); return nil, err })
+			r, err := dst.OpenBlob(bg, route.Ref, f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(r)
+			if err != nil || !bytes.Equal(got, file) {
+				t.Fatalf("e3's file restored as %d bytes, %v", len(got), err)
+			}
 		}
 	}
 }

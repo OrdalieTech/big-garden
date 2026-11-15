@@ -470,7 +470,7 @@ func (n *Node) sweep(ctx context.Context, ref Ref) error {
 	n.mu.Lock()
 	inflight := map[string]bool{}
 	for k, u := range n.uploads { // a committed link protects its blob from now on: unlinking it frees it
-		if strings.HasPrefix(k, prefix) && !u.until.IsZero() && (linked[strings.TrimPrefix(k, prefix)] || !n.now().Before(u.until)) {
+		if _, ok := linked[strings.TrimPrefix(k, prefix)]; strings.HasPrefix(k, prefix) && !u.until.IsZero() && (ok || !n.now().Before(u.until)) {
 			delete(n.uploads, k)
 		}
 		inflight[k] = u.until.IsZero()
@@ -479,7 +479,8 @@ func (n *Node) sweep(ctx context.Context, ref Ref) error {
 	var dead []string
 	for _, k := range listed {
 		name := strings.TrimPrefix(k, prefix)
-		if ep, ok := head.BlobEpoch(name); ok && ep <= epoch && !linked[name] && !inflight[k] && !fresh(name) {
+		_, live := linked[name]
+		if ep, ok := head.BlobEpoch(name); ok && ep <= epoch && !live && !inflight[k] && !fresh(name) {
 			dead = append(dead, k)
 		}
 	}

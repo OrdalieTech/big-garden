@@ -1,6 +1,7 @@
 package garden
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -333,4 +335,73 @@ func TestFilesEpochFence(t *testing.T) {
 	if err := a.sweep(bg, ref); err == nil {
 		t.Fatal("a non-owner swept")
 	}
+}
+
+// Export carries the files and Import recreates them under the new key;
+// an archive whose blobs differ from its image is refused.
+func TestFilesExportImport(t *testing.T) {
+	mem := storetest.NewMem()
+	a, b := testNode(t, mem, "a", nil), testNode(t, mem, "b", nil)
+	ref, _, err := a.Create(bg, "doc", newReq(t, "create", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, mid := random(2<<20+5), random(100<<10)
+	var blobs []Blob
+	for _, data := range [][]byte{big, mid, []byte("inline")} {
+		bl, err := a.PutBlob(bg, ref, bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		blobs = append(blobs, bl)
+	}
+	if _, err := a.Update(bg, ref, newReq(t, "attach", 1), func(tx *Tx) ([]byte, error) {
+		return nil, errors.Join(tx.SetFile("big", &blobs[0]), tx.SetFile("big-again", &blobs[0]), tx.SetFile("mid", &blobs[1]), tx.SetFile("note", &blobs[2]))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	if _, err := b.Export(bg, ref, &archive); err != nil {
+		t.Fatal(err)
+	}
+	dst, _, err := b.Import(bg, "copy", newReq(t, "import", 1), bytes.NewReader(archive.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := blobKeys(t, mem, dst); len(got) != 2 {
+		t.Fatalf("imported blob objects %v, want 2", got)
+	}
+	if err := b.sweep(bg, dst); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string][]byte{"big": big, "big-again": big, "mid": mid, "note": []byte("inline")} {
+		f, ok := fileOf(t, a, dst, name)
+		if got, err := readBlob(t, a, dst, f, 0, f.Size); !ok || err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("imported %s: %v %v", name, ok, err)
+		}
+	}
+
+	// A flipped byte in an archived blob, or a missing blob, is refused.
+	raw := archive.Bytes()
+	at := bytes.Index(raw, mid[:64])
+	bad := bytes.Clone(raw)
+	bad[at+10] ^= 1
+	_, _, err = b.Import(bg, "bad", newReq(t, "bad", 1), bytes.NewReader(bad))
+	wantCode(t, err, CodeCorrupt)
+	tr, short := tar.NewReader(bytes.NewReader(raw)), &bytes.Buffer{}
+	tw := tar.NewWriter(short)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if strings.HasPrefix(hdr.Name, "blobs/") && hdr.Size == int64(len(mid)) {
+			continue
+		}
+		tw.WriteHeader(hdr)
+		io.Copy(tw, tr)
+	}
+	tw.Close()
+	_, _, err = b.Import(bg, "short", newReq(t, "short", 1), bytes.NewReader(short.Bytes()))
+	wantCode(t, err, CodeCorrupt)
 }

@@ -553,9 +553,9 @@ func (d *DB) applyFiles(ops []fileOp, fresh func(string) bool) error {
 }
 
 // Files returns the blob objects the image links, and the one holding sum
-// (nil if none), for the sweep and for deduplication.
-func (d *DB) Files(sum *[32]byte) (linked map[string]bool, same *File, err error) {
-	linked = map[string]bool{}
+// (nil if none), for the sweep, export and deduplication.
+func (d *DB) Files(sum *[32]byte) (linked map[string]File, same *File, err error) {
+	linked = map[string]File{}
 	var n int
 	if err := d.conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sqlite_schema WHERE name = '_state_blobs'").Scan(&n); err != nil || n == 0 {
 		return linked, nil, err
@@ -571,9 +571,9 @@ func (d *DB) Files(sum *[32]byte) (linked map[string]bool, same *File, err error
 		if err := rows.Scan(&f.Object, &f.Size, &h, &f.Chunks); err != nil {
 			return nil, nil, err
 		}
-		linked[f.Object] = true
-		if sum != nil && same == nil && string(h) == string(sum[:]) {
-			f.SHA256 = *sum
+		f.SHA256 = [32]byte(h)
+		linked[f.Object] = f
+		if sum != nil && same == nil && f.SHA256 == *sum {
 			same = &f
 		}
 	}
