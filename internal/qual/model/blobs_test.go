@@ -35,13 +35,13 @@ type obj struct {
 }
 
 type bnode struct {
-	Epoch  int8           // the epoch of the head this Node caches
-	Owner  bool           // the cached head names it
-	Image  [names]int8    // the cached image's names (object index + 1, 0 = none)
-	Up     [maxObj]uint8  // its uploads
-	Listed [maxObj]bool   // a sweep's listing, between list and judge
-	Swept  bool           // listing taken
-	Dead   [maxObj]bool   // judged dead, to delete
+	Epoch  int8          // the epoch of the head this Node caches
+	Owner  bool          // the cached head names it
+	Image  [names]int8   // the cached image's names (object index + 1, 0 = none)
+	Up     [maxObj]uint8 // its uploads
+	Listed [maxObj]bool  // a sweep's listing, between list and judge
+	Swept  bool          // listing taken
+	Dead   [maxObj]bool  // judged dead, to delete
 }
 
 type bstate struct {
@@ -55,12 +55,12 @@ type bstate struct {
 type mutant int
 
 const (
-	sound        mutant = iota
-	judgeFirst          // judge on the image before listing (Aldo's ordering hole)
-	anyEpoch            // delete objects of epochs above the sweeper's
-	staleLink           // link an object of another epoch or past its window
-	noInflight          // a judge does not protect uploads in flight
-	noFresh             // a judge does not protect fresh uploads
+	sound      mutant = iota
+	judgeFirst        // judge on the image before listing (Aldo's ordering hole)
+	anyEpoch          // delete objects of epochs above the sweeper's
+	staleLink         // link an object of another epoch or past its window
+	noInflight        // a judge does not protect uploads in flight
+	noFresh           // a judge does not protect fresh uploads
 )
 
 func linked(img [names]int8, o int) bool {

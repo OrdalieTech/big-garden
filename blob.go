@@ -231,13 +231,13 @@ func (n *Node) OpenBlob(ctx context.Context, ref Ref, b Blob) (io.ReadSeekCloser
 }
 
 type blobReader struct {
-	n    *Node
-	ctx  context.Context
-	key  string
-	f    engine.File
-	mu   sync.Mutex
-	off  int64         // Read and Seek position
-	body io.ReadCloser // an open GET serving chunks next..end-1
+	n               *Node
+	ctx             context.Context
+	key             string
+	f               engine.File
+	mu              sync.Mutex
+	off             int64         // Read and Seek position
+	body            io.ReadCloser // an open GET serving chunks next..end-1
 	next, end, last int64
 	window, prev    int64
 	cur             []byte // chunk last
