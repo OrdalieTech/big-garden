@@ -1,3 +1,7 @@
+# Milestone v0.4.0 (2026-11-16)
+
+v0.3.0 plus files through the kit router (D38): `Router.MutateFile` stores a file on the entity's owner and runs a `FileHandler` with its Blob there, `Transport.ForwardFile` and `Router.ServeFile` carry the bytes between Nodes. Breaking for `Transport` implementations, which gain `ForwardFile`; the core API and the formats are unchanged.
+
 # Milestone v0.3.0 (2026-11-16)
 
 v0.2.1 plus five capabilities, each recorded as a decision with its evidence:

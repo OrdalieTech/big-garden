@@ -1,9 +1,11 @@
 package kit
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"slices"
 	"strconv"
 	"sync"
@@ -36,6 +38,16 @@ func (c *cluster) Forward(ctx context.Context, node string, call Call) (Reply, e
 		return Reply{}, errors.New("unreachable")
 	}
 	return r.Serve(ctx, call), nil
+}
+
+func (c *cluster) ForwardFile(ctx context.Context, node string, call Call, body io.Reader) (Reply, error) {
+	c.mu.Lock()
+	r, down := c.routers[node], c.down[node]
+	c.mu.Unlock()
+	if down || r == nil {
+		return Reply{}, errors.New("unreachable")
+	}
+	return r.ServeFile(ctx, call, body), nil
 }
 
 func newCluster(t *testing.T, ids ...string) *cluster {
@@ -159,7 +171,7 @@ func TestRouterTakeoverRoutes(t *testing.T) {
 	r := c.routers[next]
 	r.remember(key, garden.Route{Ref: garden.Ref{Key: key}, Owner: garden.Owner{NodeID: pref}})
 	rt, _ := c.routers[via].n.Resolve(bg, key)
-	if rep := r.run(bg, Call{Op: "incr", Key: key, Req: req(t, "local")}, garden.Route{Ref: rt.Ref, Owner: garden.Owner{NodeID: pref}}); rep.Err != nil {
+	if rep := r.run(bg, Call{Op: "incr", Key: key, Req: req(t, "local")}, garden.Route{Ref: rt.Ref, Owner: garden.Owner{NodeID: pref}}, nil); rep.Err != nil {
 		t.Fatalf("takeover from an owner-only route: %v", rep.Err)
 	}
 	if got := r.owners[key].Owner.NodeID; got != next {
@@ -167,5 +179,87 @@ func TestRouterTakeoverRoutes(t *testing.T) {
 	}
 	for range 3 {
 		c.incr(t, via, key)
+	}
+}
+
+// TestRouterFiles: a file sent from a Node that does not own the entity is
+// stored on the owner, which alone may link it, and named in the same
+// mutation; a retried Request replays; a Create carries its file from any
+// Node; a FileHandler called without a file gets nil.
+func TestRouterFiles(t *testing.T) {
+	c := newCluster(t, "a", "b")
+	for _, r := range c.routers {
+		r.HandleFile("attach", func(tx *garden.Tx, input []byte, b *garden.Blob) ([]byte, error) {
+			if b == nil {
+				return []byte("none"), nil
+			}
+			if string(input) == "create" {
+				if _, err := tx.Exec(bg, "CREATE TABLE t(x INTEGER)"); err != nil {
+					return nil, err
+				}
+			}
+			return []byte(strconv.FormatInt(b.Size, 10)), tx.SetFile("doc", b)
+		})
+	}
+	key := "k"
+	if _, _, err := c.routers["a"].Mutate(bg, Call{Op: "create", Key: key, Req: req(t, "create"), Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	pref, _ := garden.Preferred(key, c.Members())
+	other := map[string]string{"a": "b", "b": "a"}[pref]
+	body := bytes.Repeat([]byte("file "), 20000) // past the inline size: an object
+	read := func(via, key string) ([]byte, int) {
+		t.Helper()
+		n := c.routers[via].n
+		rt, err := n.Resolve(bg, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f garden.Blob
+		var files int
+		if _, err := n.Read(bg, rt.Ref, 1, func(v *garden.View) ([]byte, error) {
+			var err error
+			if f, _, err = v.File(bg, "doc"); err != nil {
+				return nil, err
+			}
+			return nil, v.Query(bg, "SELECT count(DISTINCT object) FROM _state_blobs", nil, func(r *sql.Rows) error { r.Next(); return r.Scan(&files) })
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rc, err := n.OpenBlob(bg, rt.Ref, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		got, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got, files
+	}
+	r := req(t, "attach")
+	for range 2 { // the retry replays
+		res, _, err := c.routers[other].MutateFile(bg, Call{Op: "attach", Key: key, Req: r}, bytes.NewReader(body))
+		if err != nil || string(res.Value) != strconv.Itoa(len(body)) {
+			t.Fatalf("attach from %s: %q, %v", other, res.Value, err)
+		}
+	}
+	if got, files := read(other, key); !bytes.Equal(got, body) || files != 1 {
+		t.Fatalf("read back %d bytes in %d objects, want %d in 1", len(got), files, len(body))
+	}
+	if c.routers[other].n.Stats().OwnerChanges != 0 {
+		t.Fatal("the sender took the entity over")
+	}
+	for _, via := range []string{"a", "b"} {
+		k := "new-" + via
+		if _, _, err := c.routers[via].MutateFile(bg, Call{Op: "attach", Key: k, Req: req(t, k), Input: []byte("create"), Create: true}, bytes.NewReader(body)); err != nil {
+			t.Fatalf("create with a file from %s: %v", via, err)
+		}
+		if got, _ := read(via, k); !bytes.Equal(got, body) {
+			t.Fatalf("created file read back %d bytes", len(got))
+		}
+	}
+	if res, _, err := c.routers[other].Mutate(bg, Call{Op: "attach", Key: key, Req: req(t, "plain")}); err != nil || string(res.Value) != "none" {
+		t.Fatalf("a file handler without a file: %q, %v", res.Value, err)
 	}
 }

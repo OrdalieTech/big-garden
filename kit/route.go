@@ -3,6 +3,7 @@ package kit
 import (
 	"context"
 	"errors"
+	"io"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -20,6 +21,9 @@ type Membership interface{ Members() []string }
 // Call and Reply are plain data: encoding/json round-trips both.
 type Transport interface {
 	Forward(ctx context.Context, node string, c Call) (Reply, error)
+	// ForwardFile is Forward of a Call carrying a file (Router.MutateFile):
+	// the receiving side calls Router.ServeFile with c and body.
+	ForwardFile(ctx context.Context, node string, c Call, body io.Reader) (Reply, error)
 }
 
 // Call is one mutation by name: a callback cannot travel, so the receiving
@@ -43,6 +47,11 @@ type Reply struct {
 // Handler is a mutation callback registered by name.
 type Handler func(tx *garden.Tx, input []byte) ([]byte, error)
 
+// FileHandler is a Handler that may name a file: b is the file the Call
+// carried (Router.MutateFile), already stored on this Node for tx.SetFile,
+// or nil for a Call without one.
+type FileHandler func(tx *garden.Tx, input []byte, b *garden.Blob) ([]byte, error)
+
 // Router sends each mutation to its entity's owner, with the identical
 // Request on every attempt: sticky to the owner it last saw (one Resolve on
 // a miss), a takeover only by the Node Preferred names when the owner is
@@ -55,7 +64,7 @@ type Router struct {
 	m      Membership
 	t      Transport
 	mu     sync.Mutex
-	ops    map[string]Handler
+	ops    map[string]FileHandler
 	owners map[string]garden.Route // last seen, by key
 }
 
@@ -63,11 +72,16 @@ const attempts = 4
 
 // NewRouter routes n's mutations among m's members over t.
 func NewRouter(n *garden.Node, m Membership, t Transport) *Router {
-	return &Router{n: n, m: m, t: t, ops: map[string]Handler{}, owners: map[string]garden.Route{}}
+	return &Router{n: n, m: m, t: t, ops: map[string]FileHandler{}, owners: map[string]garden.Route{}}
 }
 
 // Handle registers h under op, on every Node.
 func (r *Router) Handle(op string, h Handler) {
+	r.HandleFile(op, func(tx *garden.Tx, input []byte, _ *garden.Blob) ([]byte, error) { return h(tx, input) })
+}
+
+// HandleFile registers h under op, on every Node.
+func (r *Router) HandleFile(op string, h FileHandler) {
 	r.mu.Lock()
 	r.ops[op] = h
 	r.mu.Unlock()
@@ -77,6 +91,20 @@ func (r *Router) Handle(op string, h Handler) {
 // transport failure on the last attempt is outcome_unknown for req.ID: the
 // remote owner may have committed it, so retry with the same Request.
 func (r *Router) Mutate(ctx context.Context, c Call) (garden.Result, garden.Ref, error) {
+	return r.mutate(ctx, c, nil)
+}
+
+// MutateFile is Mutate with a file: the owner stores body with PutBlob (a
+// Create, on the Node it runs on, before the key exists), then runs the
+// FileHandler of op with the Blob, which a Blob cannot leave since only its
+// uploader may link it (DECISIONS D38). Each attempt reads body from its
+// start. A retry of a committed Request stores nothing new: PutBlob finds
+// the bytes in the image.
+func (r *Router) MutateFile(ctx context.Context, c Call, body io.ReadSeeker) (garden.Result, garden.Ref, error) {
+	return r.mutate(ctx, c, body)
+}
+
+func (r *Router) mutate(ctx context.Context, c Call, body io.ReadSeeker) (garden.Result, garden.Ref, error) {
 	var err error
 	for try := range attempts {
 		if try > 0 {
@@ -91,9 +119,22 @@ func (r *Router) Mutate(ctx context.Context, c Call) (garden.Result, garden.Ref,
 			return garden.Result{}, garden.Ref{}, rerr
 		}
 		var rep Reply
-		if target == r.n.Owner().NodeID {
-			rep = r.run(ctx, c, rt)
-		} else if rep, err = r.t.Forward(ctx, target, c); err != nil {
+		var in io.Reader
+		if body != nil {
+			if _, err := body.Seek(0, io.SeekStart); err != nil {
+				return garden.Result{}, garden.Ref{}, err
+			}
+			in = body
+		}
+		switch {
+		case target == r.n.Owner().NodeID:
+			rep = r.run(ctx, c, rt, in)
+		case body == nil:
+			rep, err = r.t.Forward(ctx, target, c)
+		default:
+			rep, err = r.t.ForwardFile(ctx, target, c, body)
+		}
+		if err != nil {
 			r.forget(c.Key)
 			err = &garden.Error{Code: garden.CodeOutcomeUnknown, Operation: c.Req.ID, Message: "kit: forwarding failed: " + err.Error()}
 			continue
@@ -116,7 +157,14 @@ func (r *Router) Mutate(ctx context.Context, c Call) (garden.Result, garden.Ref,
 
 // Serve runs a Call that another Node forwarded, without forwarding it
 // again: a Node that is not the owner answers not_owner with the Route.
-func (r *Router) Serve(ctx context.Context, c Call) Reply {
+func (r *Router) Serve(ctx context.Context, c Call) Reply { return r.serve(ctx, c, nil) }
+
+// ServeFile is Serve of a Call ForwardFile carried, with its file.
+func (r *Router) ServeFile(ctx context.Context, c Call, body io.Reader) Reply {
+	return r.serve(ctx, c, body)
+}
+
+func (r *Router) serve(ctx context.Context, c Call, body io.Reader) Reply {
 	target, rt, err := r.target(ctx, c)
 	var ge *garden.Error
 	switch {
@@ -127,7 +175,7 @@ func (r *Router) Serve(ctx context.Context, c Call) Reply {
 	case target != r.n.Owner().NodeID: // not this Node's to run (or to take over): the origin re-routes
 		return Reply{Err: &garden.Error{Code: garden.CodeNotOwner, Route: &rt, Message: "kit: owned elsewhere"}}
 	}
-	return r.run(ctx, c, rt)
+	return r.run(ctx, c, rt, body)
 }
 
 // target picks the Node for c: the owner last seen, or the Preferred member
@@ -152,8 +200,9 @@ func (r *Router) target(ctx context.Context, c Call) (string, garden.Route, erro
 }
 
 // run executes c on this Node, taking over first if the entity is unowned or
-// its owner is no member (this Node being the one Preferred names).
-func (r *Router) run(ctx context.Context, c Call, rt garden.Route) Reply {
+// its owner is no member (this Node being the one Preferred names), with
+// the file body stored first if there is one.
+func (r *Router) run(ctx context.Context, c Call, rt garden.Route, body io.Reader) Reply {
 	r.mu.Lock()
 	h, ok := r.ops[c.Op]
 	r.mu.Unlock()
@@ -161,7 +210,16 @@ func (r *Router) run(ctx context.Context, c Call, rt garden.Route) Reply {
 		return Reply{Err: &garden.Error{Code: garden.CodeUnsupported, Message: "kit: no handler for " + c.Op}}
 	}
 	var cb error
-	fn := func(tx *garden.Tx) ([]byte, error) { v, err := h(tx, c.Input); cb = err; return v, err }
+	var b *garden.Blob
+	fn := func(tx *garden.Tx) ([]byte, error) { v, err := h(tx, c.Input, b); cb = err; return v, err }
+	put := func(ref garden.Ref) error {
+		if body == nil {
+			return nil
+		}
+		blob, err := r.n.PutBlob(ctx, ref, body)
+		b = &blob
+		return err
+	}
 	var rep Reply
 	var err error
 	self := r.n.Owner().NodeID
@@ -169,8 +227,10 @@ func (r *Router) run(ctx context.Context, c Call, rt garden.Route) Reply {
 		return rt.Owner.NodeID != self && (rt.Owner.NodeID == "" || !slices.Contains(r.m.Members(), rt.Owner.NodeID))
 	}
 	if c.Create {
-		if rep.Ref, rep.Result, err = r.n.Create(ctx, c.Key, c.Req, fn); err == nil {
-			r.remember(c.Key, garden.Route{Ref: rep.Ref, Owner: r.n.Owner()})
+		if err = put(garden.Ref{Key: c.Key}); err == nil {
+			if rep.Ref, rep.Result, err = r.n.Create(ctx, c.Key, c.Req, fn); err == nil {
+				r.remember(c.Key, garden.Route{Ref: rep.Ref, Owner: r.n.Owner()})
+			}
 		}
 	} else {
 		if gone(rt) && rt.Epoch == 0 { // a route remembered from a reply names only its owner: observe the head first
@@ -184,6 +244,9 @@ func (r *Router) run(ctx context.Context, c Call, rt garden.Route) Reply {
 			}
 		case rt.Owner.NodeID != self: // a live member owns it after all: the origin re-routes
 			return Reply{Err: &garden.Error{Code: garden.CodeNotOwner, Route: &rt, Message: "kit: owned elsewhere"}}
+		}
+		if err == nil {
+			err = put(rt.Ref)
 		}
 		if err != nil {
 			cb = nil
