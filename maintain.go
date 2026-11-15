@@ -1,7 +1,6 @@
 package garden
 
 import (
-	"bytes"
 	"context"
 	"slices"
 	"sync/atomic"
@@ -59,10 +58,11 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 	next := *h
 	next.Revision, next.Nonce = h.Revision+1, head.NewID()
 	c := &candidate{base: h, baseETag: e.etag}
-	var buf bytes.Buffer
+	buf := n.spool()
+	defer buf.Close()
 	var ref head.Ref
 	if snapshot || e.replay() > uint64(h.PageCount)+256 {
-		snap, err := e.db.Snapshot(&buf)
+		snap, err := e.db.Snapshot(buf)
 		if err != nil || snap.Ref.PostChecksum != h.DatabaseChecksum || snap.Ref.MaxSequence != h.Sequence {
 			e.discard()
 			return false
@@ -81,11 +81,12 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 			return false
 		}
 		run := h.Deltas[i : i+fanout]
-		objs, err := n.objects(ctx, run, h, new(atomic.Uint64)) // four at a time: the gate is held
+		objs, done, err := n.objects(ctx, run, h, new(atomic.Uint64)) // four at a time: the gate is held
+		defer done()
 		if err != nil {
 			return false
 		}
-		out, err := engine.Compact(ctx, &buf, run, objs) // checks lengths, SHA-256, the chain and the span
+		out, err := engine.Compact(ctx, buf, run, objs) // checks lengths, SHA-256, the chain and the span
 		if err != nil {
 			return false
 		}
@@ -95,7 +96,7 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 		c.pages = slices.Concat(e.pages[:1+i], []uint32{out.Pages}, e.pages[1+i+fanout:])
 	}
 	failpoint("maint.put")
-	if n.putObject(ctx, ref.Key, buf.Bytes()) != nil {
+	if n.putObject(ctx, ref.Key, buf, ref.SHA256) != nil {
 		return false
 	}
 	failpoint("maint.cas")

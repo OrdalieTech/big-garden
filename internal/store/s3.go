@@ -294,10 +294,21 @@ func failed(op, key string, o Outcome, msg string) error {
 	return &Error{Outcome: o, Op: op, Key: key, Err: errors.New(msg)}
 }
 
+// sized bounds one attempt moving n bytes: the attempt timeout plus n at
+// minRate (PLAN §11.2: larger objects get bounded, size-based timeouts).
+func (s *S3) sized(ctx context.Context, n int64) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, s.attempt+time.Duration(n)*time.Second/minRate)
+}
+
+// minRate is the slowest transfer an attempt tolerates, in bytes per second.
+const minRate = 256 << 10
+
 func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
 	k := aws.String(s.prefix + key)
 	if size <= PartBytes {
 		return retry(ctx, func() error {
+			ctx, cancel := s.sized(ctx, size)
+			defer cancel()
 			_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: k, Body: io.NewSectionReader(body, 0, size),
 				ContentLength: aws.Int64(size), ChecksumSHA256: b64(sum[:]), IfNoneMatch: aws.String("*")}, s.once)
 			return s.done(opPut, int(size), 0, classify("put", key, err))
@@ -331,6 +342,8 @@ func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int
 				return
 			}
 			errs[i] = retry(ctx, func() error {
+				ctx, cancel := s.sized(ctx, part.Size())
+				defer cancel()
 				part.Seek(0, io.SeekStart)
 				out, err := s.client.UploadPart(ctx, &s3.UploadPartInput{Bucket: &s.bucket, Key: k, UploadId: up.UploadId,
 					PartNumber: aws.Int32(int32(i + 1)), Body: part, ContentLength: aws.Int64(part.Size()), ChecksumSHA256: b64(h.Sum(nil))}, s.once)
@@ -367,16 +380,30 @@ func b64(b []byte) *string { return aws.String(base64.StdEncoding.EncodeToString
 
 func (s *S3) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
 	var out *s3.GetObjectOutput
+	var cancel context.CancelFunc
 	err := retry(ctx, func() (err error) {
-		out, err = s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + key),
+		var actx context.Context
+		actx, cancel = s.sized(ctx, n) // the body is read after Open returns: Close ends the attempt
+		out, err = s.client.GetObject(actx, &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + key),
 			Range: aws.String(fmt.Sprintf("bytes=%d-%d", off, off+n-1))}, s.once)
+		if err != nil {
+			cancel()
+		}
 		return s.done(opGet, 0, int(n), classify("get", key, err))
 	})
 	if err != nil {
 		return nil, err
 	}
-	return struct {
-		io.Reader
-		io.Closer
-	}{io.LimitReader(out.Body, n), out.Body}, nil
+	return body{io.LimitReader(out.Body, n), out.Body, cancel}, nil
+}
+
+type body struct {
+	io.Reader
+	c      io.Closer
+	cancel context.CancelFunc
+}
+
+func (b body) Close() error {
+	defer b.cancel()
+	return b.c.Close()
 }

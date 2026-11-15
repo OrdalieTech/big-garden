@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"time"
@@ -223,24 +224,88 @@ func (n *Node) barrier(ctx context.Context, e *entity, t0 time.Time) (changed bo
 }
 
 // putObject writes an immutable object; an existing one must hold body.
-func (n *Node) putObject(ctx context.Context, key string, body []byte) error {
-	n.staging.Add(int64(len(body)))
-	defer n.staging.Add(-int64(len(body)))
+func (n *Node) putObject(ctx context.Context, key string, body *spool, sum [32]byte) error {
+	n.staging.Add(body.n)
+	defer n.staging.Add(-body.n)
 	failpoint("put.before")
 	failpoint("put.mid")
-	err := n.st.PutImmutable(ctx, key, body)
+	var err error
+	if body.f == nil {
+		err = n.st.PutImmutable(ctx, key, body.buf.Bytes())
+	} else {
+		err = n.st.PutFile(ctx, key, body.f, body.n, sum)
+	}
 	failpoint("put.after")
-	if store.OutcomeOf(err) == store.PreconditionFailed {
-		obj, gerr := n.st.Get(ctx, key, "", int64(len(body)))
-		if gerr == nil && !bytes.Equal(obj.Body, body) {
-			return newError(CodeCorrupt, "an object key holds other bytes", nil)
+	if store.OutcomeOf(err) == store.PreconditionFailed { // a retry that found its object: it must hold these bytes
+		r, gerr := n.st.Open(ctx, key, 0, body.n+1)
+		if err = gerr; err == nil {
+			h := sha256.New()
+			k, cerr := io.Copy(h, r)
+			r.Close()
+			if err = cerr; err == nil && (k != body.n || [32]byte(h.Sum(nil)) != sum) {
+				return newError(CodeCorrupt, "an object key holds other bytes", nil)
+			}
 		}
-		err = gerr
 	}
 	if err != nil {
 		return storeError(err)
 	}
 	return nil
+}
+
+// spool holds an object being built: in memory up to spoolMemory, then in a
+// temporary file of the session directory, so no object costs its size in
+// memory (D34). Close removes the file.
+type spool struct {
+	dir string
+	buf bytes.Buffer
+	f   *os.File
+	n   int64
+}
+
+const spoolMemory = 1 << 20
+
+func (n *Node) spool() *spool { return &spool{dir: n.dir} }
+
+func (s *spool) Write(p []byte) (int, error) {
+	if s.f == nil && s.buf.Len()+len(p) > spoolMemory {
+		f, err := os.CreateTemp(s.dir, "object-*")
+		if err != nil {
+			return 0, err
+		}
+		s.f = f
+		if _, err := f.Write(s.buf.Bytes()); err != nil {
+			return 0, err
+		}
+		s.buf = bytes.Buffer{}
+	}
+	s.n += int64(len(p))
+	if s.f != nil {
+		return s.f.Write(p)
+	}
+	return s.buf.Write(p)
+}
+
+// Bytes returns the content if it is in memory, else nil.
+func (s *spool) Bytes() []byte {
+	if s.f != nil {
+		return nil
+	}
+	return s.buf.Bytes()
+}
+
+func (s *spool) ReaderAt() io.ReaderAt {
+	if s.f != nil {
+		return s.f
+	}
+	return bytes.NewReader(s.buf.Bytes())
+}
+
+func (s *spool) Close() {
+	if s.f != nil {
+		s.f.Close()
+		os.Remove(s.f.Name())
+	}
 }
 
 // scoped wraps a callback to enforce ResultBytes and to tell its own error
@@ -480,8 +545,9 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 		}
 		e.db = db
 		op := head.OpID(req.ID)
-		var buf bytes.Buffer
-		snap, err := db.Snapshot(&buf)
+		buf := n.spool()
+		defer buf.Close()
+		snap, err := db.Snapshot(buf)
 		if err != nil {
 			e.discard()
 			return Ref{}, Result{}, engineError(err)
@@ -538,7 +604,7 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			c.next.Revision, c.next.Epoch = tomb.Revision+1, tomb.Epoch+1
 		}
 		ref.Key = head.ObjectKey(key, inc, ref.BaseRevision, head.NewID(), ref.SHA256)
-		if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
+		if err := n.putObject(ctx, ref.Key, buf, ref.SHA256); err != nil {
 			e.discard()
 			return unknown(err)
 		}
@@ -793,8 +859,9 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		n.deliver(e, batch, nil, err)
 		return Result{}, err
 	}
-	var buf bytes.Buffer
-	delta, err := e.db.Delta(&buf)
+	buf := n.spool()
+	defer func() { buf.Close() }()
+	delta, err := e.db.Delta(buf)
 	if err != nil {
 		return fail(engineError(err))
 	}
@@ -803,37 +870,39 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 	next.Revision, next.Nonce, next.Sequence, next.Schema = h.Revision+1, head.NewID(), last, schema
 	next.PageCount, next.DatabaseChecksum = delta.PageCount, delta.Ref.PostChecksum
 	if len(h.Deltas) == head.MaxDeltas || e.replay()+uint64(delta.Pages) > 2*uint64(delta.PageCount)+256 {
-		buf.Reset() // snapshot on cap (§6 step 7)
-		snap, err := e.db.Snapshot(&buf)
+		buf.Close() // snapshot on cap (§6 step 7)
+		buf = n.spool()
+		snap, err := e.db.Snapshot(buf)
 		if err != nil {
 			return fail(engineError(err))
 		}
 		ref := placed(h, snap.Ref)
 		next.Snapshot, next.Deltas, next.Tail, c.object, c.pages = ref, []head.Ref{}, nil, &ref, []uint32{snap.Pages}
-		if err := n.putObject(ctx, ref.Key, buf.Bytes()); err != nil {
+		if err := n.putObject(ctx, ref.Key, buf, ref.SHA256); err != nil {
 			return fail(err)
 		}
 	} else {
-		t, tbytes := delta, buf.Bytes()
+		t, tbuf := delta, buf
 		if h.Tail != nil {
-			var out bytes.Buffer
-			t, err = engine.Compact(ctx, &out, []head.Ref{h.Tail.Ref(), delta.Ref},
-				[]io.ReaderAt{bytes.NewReader(h.Tail.Data), bytes.NewReader(buf.Bytes())})
+			out := n.spool()
+			defer out.Close()
+			t, err = engine.Compact(ctx, out, []head.Ref{h.Tail.Ref(), delta.Ref},
+				[]io.ReaderAt{bytes.NewReader(h.Tail.Data), buf.ReaderAt()})
 			if err != nil {
 				return fail(engineError(err))
 			}
-			tbytes = out.Bytes()
+			tbuf = out
 		}
 		c.pages = append(slices.Clone(e.pages[:1+len(h.Deltas)]), t.Pages) // the tail, or the new last delta
 		uploaded := slices.ContainsFunc(links(h), func(r head.Ref) bool { return r.BaseRevision >= 1 })
 		if t.Ref.Bytes <= head.InlineBytes && uploaded {
 			r := t.Ref
 			next.Tail = &head.Tail{SHA256: r.SHA256, Bytes: r.Bytes, MinSequence: r.MinSequence, MaxSequence: r.MaxSequence,
-				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbytes}
+				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbuf.Bytes()} // in memory: within spoolMemory
 		} else {
 			ref := placed(h, t.Ref)
 			next.Deltas, next.Tail, c.object = append(slices.Clip(h.Deltas), ref), nil, &ref
-			if err := n.putObject(ctx, ref.Key, tbytes); err != nil {
+			if err := n.putObject(ctx, ref.Key, tbuf, ref.SHA256); err != nil {
 				return fail(err)
 			}
 		}

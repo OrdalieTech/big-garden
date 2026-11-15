@@ -29,7 +29,7 @@ const (
 	Format            = 1
 	Codec             = "ltx-v3"
 	PageSize          = 4096
-	MaxPages          = 256 << 20 / PageSize // 256 MiB qualified hard ceiling
+	MaxPages          = 1<<32 - 2 // SQLite's own page-count ceiling: 16 TiB (the format's, not a qualification)
 	MaxDeltas         = 32
 	MaxLevel          = 15
 	MaxKeyBytes       = 512

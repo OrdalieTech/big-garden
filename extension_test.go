@@ -314,7 +314,7 @@ func BenchmarkKNN(b *testing.B) {
 		for _, rows := range []int{10_000, 50_000} {
 			b.Run(fmt.Sprintf("d%d/n%d", dims, rows), func(b *testing.B) {
 				cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: b.TempDir(), Extend: vec.Register,
-					Limits: Limits{EntityBytes: maxEntityBytes, Recoveries: 1, CommitTimeout: time.Minute, StorageAttemptTimeout: time.Minute}}
+					Limits: Limits{EntityBytes: 256 << 20, Recoveries: 1, CommitTimeout: time.Minute, StorageAttemptTimeout: time.Minute}}
 				cfg, err := cfg.validate()
 				if err != nil {
 					b.Fatal(err)

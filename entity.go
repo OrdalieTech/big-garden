@@ -383,7 +383,8 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 		return nil
 	}
 	for {
-		objs, err := n.objects(ctx, links(h), h, &n.counters.activationBytes)
+		objs, done, err := n.objects(ctx, links(h), h, &n.counters.activationBytes)
+		defer done()
 		if err != nil && !miss(err) {
 			return storeError(err)
 		}
@@ -422,41 +423,56 @@ func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag strin
 	}
 }
 
-// objects GETs the links refs of h, four at a time, checking each one's
-// length and SHA-256; h's tail, if refs ends with it, is read from h. err is
-// the first failure, a store error before NotFound or corruption.
-func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head, downloaded *atomic.Uint64) ([]io.ReaderAt, error) {
+// objects GETs the links refs of h, four at a time, each streamed into a
+// spool (D34) and checked for its length and SHA-256. h's tail, if refs ends with it, is read from h.
+// err is the first failure, a store error before NotFound or corruption;
+// done removes the spools.
+func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head, downloaded *atomic.Uint64) (_ []io.ReaderAt, done func(), _ error) {
 	tail := h.Tail != nil && len(refs) > 0 && refs[len(refs)-1] == h.Tail.Ref()
 	if tail {
 		refs = refs[:len(refs)-1]
 	}
-	objs, errs := make([]io.ReaderAt, len(refs), len(refs)+1), make([]error, len(refs))
+	objs, errs, spools := make([]io.ReaderAt, len(refs), len(refs)+1), make([]error, len(refs)), make([]*spool, len(refs))
+	done = func() {
+		for _, s := range spools {
+			s.Close()
+		}
+	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	for i, r := range refs {
+		spools[i] = n.spool()
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			obj, err := n.st.Get(ctx, r.Key, "", int64(r.Bytes))
-			if err == nil && (uint64(len(obj.Body)) != r.Bytes || sha256.Sum256(obj.Body) != r.SHA256) {
-				err = engine.ErrCorrupt
+			body, err := n.st.Open(ctx, r.Key, 0, int64(r.Bytes))
+			if err == nil {
+				h := sha256.New()
+				var k int64
+				k, err = io.Copy(io.MultiWriter(spools[i], h), body)
+				body.Close()
+				if err != nil {
+					err = &store.Error{Outcome: store.Unknown, Op: "get", Key: r.Key, Err: err}
+				} else if uint64(k) != r.Bytes || [32]byte(h.Sum(nil)) != r.SHA256 {
+					err = engine.ErrCorrupt
+				}
+				downloaded.Add(uint64(k))
 			}
-			objs[i], errs[i] = bytes.NewReader(obj.Body), err
-			downloaded.Add(uint64(len(obj.Body)))
+			objs[i], errs[i] = spools[i].ReaderAt(), err
 		})
 	}
 	wg.Wait()
 	var err error
 	for _, e := range errs {
 		if e != nil && !miss(e) {
-			return nil, e
+			return nil, done, e
 		}
 		err = cmp.Or(err, e)
 	}
 	if tail {
 		objs = append(objs, bytes.NewReader(h.Tail.Data))
 	}
-	return objs, err
+	return objs, done, err
 }
 
 // warmStart activates e at h from its warm file, if it has one (D21): an
@@ -482,7 +498,8 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 	}
 	failpoint("warm.claim")
 	if ok && i > 0 && w.Image.Sequence <= h.Sequence {
-		objs, err := n.objects(ctx, refs[i:], h, &n.counters.activationBytes)
+		objs, done, err := n.objects(ctx, refs[i:], h, &n.counters.activationBytes)
+		defer done()
 		failpoint("warm.apply.mid")   // the kill lands inside Restore's overlay
 		if err != nil && !miss(err) { // the store, not the file: keep it for the next attempt
 			n.unclaimWarm(e.key, path, w)

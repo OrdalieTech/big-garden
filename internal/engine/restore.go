@@ -168,6 +168,9 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 		} else {
 			err = ctx.Err()
 		}
+		if snapshot && prev+1 == ltx.LockPgno(pageSize) {
+			prev++ // the lock page is never encoded
+		}
 		if err == nil && (ph.Pgno <= prev || ph.Pgno > hd.Commit || (snapshot && ph.Pgno != prev+1)) {
 			err = fmt.Errorf("%w: page %d after %d (commit %d)", ErrCorrupt, ph.Pgno, prev, hd.Commit)
 		}
@@ -186,10 +189,16 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 			grown++
 		}
 	}
+	if lock := ltx.LockPgno(pageSize); count < lock && lock <= hd.Commit {
+		grown++
+	}
 	if hd.Commit > count && grown != hd.Commit-count {
 		return img, 0, fmt.Errorf("%w: object grows to %d pages but carries %d of %d new pages", ErrCorrupt, hd.Commit, grown, hd.Commit-count)
 	}
 	for p := hd.Commit + 1; p <= count; p++ {
+		if p == ltx.LockPgno(pageSize) {
+			continue
+		}
 		if err := xorPage(&sum, f, p, old); err != nil {
 			return img, 0, err
 		}
@@ -294,7 +303,7 @@ func Compact(ctx context.Context, w io.Writer, refs []head.Ref, objs []io.Reader
 	if len(refs) < 2 || len(objs) != len(refs) {
 		return Object{}, errors.New("engine: compaction needs two or more objects")
 	}
-	var used [head.MaxPages/64 + 1]uint64 // pages carried by any input
+	var used []uint64 // pages carried by any input, a bit each
 	var commit uint32
 	inputs := make([]io.Reader, len(refs))
 	for i, ref := range refs {
@@ -320,6 +329,9 @@ func Compact(ctx context.Context, w io.Writer, refs []head.Ref, objs []io.Reader
 			}
 			if err != nil {
 				return Object{}, err
+			}
+			if w := int(ph.Pgno / 64); w >= len(used) {
+				used = append(used, make([]uint64, w+1-len(used))...)
 			}
 			used[ph.Pgno/64] |= 1 << (ph.Pgno % 64)
 		}
@@ -351,7 +363,7 @@ func Compact(ctx context.Context, w io.Writer, refs []head.Ref, objs []io.Reader
 		PostChecksum: last.PostChecksum, Bytes: uint64(out.n)}, PageCount: commit}
 	copy(o.Ref.SHA256[:], out.h.Sum(nil))
 	for p := uint32(1); p <= commit; p++ {
-		if used[p/64]&(1<<(p%64)) != 0 {
+		if int(p/64) < len(used) && used[p/64]&(1<<(p%64)) != 0 {
 			o.Pages++
 		}
 	}

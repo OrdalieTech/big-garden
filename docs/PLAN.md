@@ -679,7 +679,7 @@ A future optional extension must prove crash-safe discoverability before it ente
 
 | Field/capability | Initial default | Qualified upper bound or rule |
 |---|---:|---|
-| EntityBytes | 64 MiB | 256 MiB; larger requires separate qualification |
+| EntityBytes | 64 MiB | 16 TiB format ceiling (amended by DECISIONS D34: objects stream, the lock page is handled; qualified across 1 GiB, snapshots still stall writes in proportion to size) |
 | ResultBytes | 16 KiB | 64 KiB; receipts count against entity size |
 | SQL value/bound-argument bytes | 1 MiB | Not a document-storage API; internal control statements have separate fixed bounds |
 | HeadBytes / DeltaReferences | 64 KiB / 32 | Fixed format-1 limits |

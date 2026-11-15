@@ -45,10 +45,11 @@ type manifest struct {
 // blob collected meanwhile fails the export (not_found: export again). A
 // write error is returned as is: the partial output is not a backup.
 func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error) {
-	h, files, blobs, err := n.exportFiles(ctx, ref) // in memory: w never blocks the entity
+	h, m, snap, blobs, err := n.exportFiles(ctx, ref) // spooled: w never blocks the entity
 	if err != nil {
 		return Version{}, err
 	}
+	defer snap.Close()
 	tw := tar.NewWriter(w)
 	entry := func(name string, size int64, r io.Reader) error {
 		hdr := &tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o600, Size: size, ModTime: time.Unix(0, 0), Format: tar.FormatPAX}
@@ -61,10 +62,11 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 		_, err := io.Copy(tw, r)
 		return err
 	}
-	for i, name := range []string{"manifest.json", "snapshot.ltx"} {
-		if err := entry(name, int64(len(files[i])), bytes.NewReader(files[i])); err != nil {
-			return Version{}, err
-		}
+	if err := entry("manifest.json", int64(len(m)), bytes.NewReader(m)); err != nil {
+		return Version{}, err
+	}
+	if err := entry("snapshot.ltx", snap.n, io.NewSectionReader(snap.ReaderAt(), 0, snap.n)); err != nil {
+		return Version{}, err
 	}
 	for _, f := range blobs {
 		r, _ := n.OpenBlob(ctx, ref, blobOf(f))
@@ -83,41 +85,44 @@ func (n *Node) Export(ctx context.Context, ref Ref, w io.Writer) (Version, error
 	return Version{h.Incarnation, h.Sequence}, nil
 }
 
-// exportFiles returns the validated head of ref, the manifest and snapshot
-// of its image and the blobs it links, under the entity mutex, for an
-// Export invoked at t0.
-func (n *Node) exportFiles(ctx context.Context, ref Ref) (*head.Head, [2][]byte, []engine.File, error) {
+// exportFiles returns the validated head of ref, the manifest and spooled
+// snapshot of its image and the blobs it links, under the entity mutex, for
+// an Export invoked at t0.
+func (n *Node) exportFiles(ctx context.Context, ref Ref) (*head.Head, []byte, *spool, []engine.File, error) {
 	t0 := time.Now()
 	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil, false)
 	if err != nil {
-		return nil, [2][]byte{}, nil, err
+		return nil, nil, nil, nil, err
 	}
 	defer n.leave(e)
 	if err := n.owned(ctx, e, ref, t0); err != nil {
-		return nil, [2][]byte{}, nil, err
+		return nil, nil, nil, nil, err
 	}
-	h := e.h
-	var snap bytes.Buffer
-	o, err := e.db.Snapshot(&snap)
+	h, snap := e.h, n.spool()
+	fail := func(err error) (*head.Head, []byte, *spool, []engine.File, error) {
+		snap.Close()
+		return nil, nil, nil, nil, err
+	}
+	o, err := e.db.Snapshot(snap)
 	if err != nil {
 		e.discard()
-		return nil, [2][]byte{}, nil, engineError(err)
+		return fail(engineError(err))
 	}
 	if o.Ref.PostChecksum != h.DatabaseChecksum || o.Ref.MaxSequence != h.Sequence {
 		e.discard()
-		return nil, [2][]byte{}, nil, newError(CodeCorrupt, "snapshot differs from the head", nil)
+		return fail(newError(CodeCorrupt, "snapshot differs from the head", nil))
 	}
 	m, err := json.Marshal(manifest{head.Format, h.Namespace, h.Key, h.Incarnation, h.Sequence, h.Schema, head.Codec,
 		head.PageSize, h.PageCount, h.DatabaseChecksum, o.Ref.SHA256, o.Ref.Bytes})
 	if err != nil || len(m) > head.MaxHeadBytes {
-		return nil, [2][]byte{}, nil, newError(CodeCorrupt, "manifest", err)
+		return fail(newError(CodeCorrupt, "manifest", err))
 	}
 	linked, _, err := e.db.Files(nil)
 	if err != nil {
-		return nil, [2][]byte{}, nil, engineError(err)
+		return fail(engineError(err))
 	}
 	blobs := slices.SortedFunc(maps.Values(linked), func(a, b engine.File) int { return strings.Compare(a.Object, b.Object) })
-	return h, [2][]byte{m, snap.Bytes()}, blobs, nil
+	return h, m, snap, blobs, nil
 }
 
 // Import creates key from an Export archive (PROTOCOL §11): the archive is
@@ -130,6 +135,7 @@ func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader)
 		return Ref{}, Result{}, err
 	}
 	m, snap, spools, err := n.readArchive(r)
+	defer snap.Close()
 	defer func() {
 		for _, sp := range spools {
 			sp.file.Close()
@@ -147,7 +153,7 @@ func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader)
 			MinSequence: 1, MaxSequence: m.Sequence, PostChecksum: m.DatabaseChecksum}}
 	bound := binding(4, req.Schema, req.Schema, req.Hash)
 	return n.create(ctx, key, req, bound, func(path string, inc head.ID) (*engine.DB, []byte, error) {
-		db, _, err := engine.Restore(ctx, n.drv, path, n.maxPages(), &src, []io.ReaderAt{bytes.NewReader(snap)}, nil)
+		db, _, err := engine.Restore(ctx, n.drv, path, n.maxPages(), &src, []io.ReaderAt{snap.ReaderAt()}, nil)
 		if err != nil {
 			return nil, nil, engineError(err)
 		}
@@ -200,15 +206,17 @@ func verify(ctx context.Context, n *Node, key string, f engine.File) error {
 
 // readArchive reads exactly manifest.json then snapshot.ltx, regular files
 // within their bounds, then the end of the archive and only zero padding.
-func (n *Node) readArchive(r io.Reader) (manifest, []byte, map[string]spooled, error) {
+// The snapshot is spooled (D34): the caller closes it, also on an error.
+func (n *Node) readArchive(r io.Reader) (manifest, *spool, map[string]spooled, error) {
 	var m manifest
-	spools := map[string]spooled{}
-	bad := func(msg string) (manifest, []byte, map[string]spooled, error) {
-		return m, nil, spools, newError(CodeCorrupt, "archive: "+msg, nil)
+	spools, snap := map[string]spooled{}, n.spool()
+	bad := func(msg string) (manifest, *spool, map[string]spooled, error) {
+		return m, snap, spools, newError(CodeCorrupt, "archive: "+msg, nil)
 	}
 	cr := &counted{Reader: r}
 	tr := tar.NewReader(cr)
-	var files [2][]byte
+	var mj []byte
+	sum := sha256.New()
 	for i, name := range []string{"manifest.json", "snapshot.ltx"} {
 		limit := int64(head.MaxHeadBytes)
 		if i == 1 {
@@ -218,13 +226,20 @@ func (n *Node) readArchive(r io.Reader) (manifest, []byte, map[string]spooled, e
 		if err != nil || hdr.Name != name || hdr.Typeflag != tar.TypeReg || hdr.Size < 0 || hdr.Size > limit {
 			return bad("expected the regular file " + name)
 		}
-		if files[i], err = io.ReadAll(io.LimitReader(tr, hdr.Size)); err != nil || int64(len(files[i])) != hdr.Size {
+		var k int64
+		if i == 0 {
+			mj, err = io.ReadAll(io.LimitReader(tr, hdr.Size))
+			k = int64(len(mj))
+		} else {
+			k, err = io.Copy(io.MultiWriter(snap, sum), io.LimitReader(tr, hdr.Size))
+		}
+		if err != nil || k != hdr.Size {
 			return bad("truncated " + name)
 		}
 	}
 	// archive/tar also ends at a bare EOF or one zero block: require both end blocks
 	blocks := func(size int64) int64 { return 512 + (size+511)/512*512 }
-	want, last := blocks(int64(len(files[0])))+blocks(int64(len(files[1])))+1024, ""
+	want, last := blocks(int64(len(mj)))+blocks(snap.n)+1024, ""
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -258,23 +273,23 @@ func (n *Node) readArchive(r io.Reader) (manifest, []byte, map[string]spooled, e
 	if err != nil || len(rest) > 1<<20 || bytes.ContainsFunc(rest, func(c rune) bool { return c != 0 }) {
 		return bad("data after the end of the archive")
 	}
-	d := json.NewDecoder(bytes.NewReader(files[0]))
+	d := json.NewDecoder(bytes.NewReader(mj))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&m); err != nil {
 		return bad("manifest.json does not decode")
 	}
 	canon, _ := json.Marshal(m)
 	switch {
-	case !bytes.Equal(canon, files[0]):
+	case !bytes.Equal(canon, mj):
 		return bad("manifest.json is not canonical")
 	case m.Format != head.Format || m.Codec != head.Codec || m.PageSize != head.PageSize || m.Namespace == head.ID{} ||
 		m.Incarnation == head.ID{} || head.ValidKey(m.Key) != nil || m.Sequence == 0 || m.Sequence >= head.MaxInt ||
 		m.Schema == 0 || m.PageCount == 0 || m.PageCount > n.maxPages() || m.DatabaseChecksum&head.ChecksumFlag == 0:
 		return bad("unsupported or invalid manifest")
-	case uint64(len(files[1])) != m.Bytes || sha256.Sum256(files[1]) != m.SHA256:
+	case uint64(snap.n) != m.Bytes || [32]byte(sum.Sum(nil)) != m.SHA256:
 		return bad("snapshot.ltx differs from the manifest")
 	}
-	return m, files[1], spools, nil
+	return m, snap, spools, nil
 }
 
 // counted counts the bytes read through it.

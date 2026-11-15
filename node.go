@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -656,6 +657,15 @@ func (l limited) List(ctx context.Context, prefix, after string, limit int) (es 
 
 func (l limited) Delete(ctx context.Context, key string) error {
 	return l.do(ctx, "delete", key, func() error { return l.Store.Delete(ctx, key) })
+}
+
+func (l limited) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
+	return l.do(ctx, "put", key, func() error { return l.Store.PutFile(ctx, key, body, size, sum) })
+}
+
+func (l limited) Open(ctx context.Context, key string, off, n int64) (r io.ReadCloser, err error) {
+	err = l.do(ctx, "get", key, func() error { r, err = l.Store.Open(ctx, key, off, n); return err }) // the slot covers the request, not the body
+	return r, err
 }
 
 // Scan yields the Route of every live entity of the namespace (tombstones

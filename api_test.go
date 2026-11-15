@@ -169,7 +169,7 @@ func TestLimits(t *testing.T) {
 		"negative timeout":      {CommitTimeout: -time.Second},
 		"negative count":        {Recoveries: -1},
 		"huge count":            {PendingPerEntity: maxCount + 1},
-		"entity above ceiling":  {EntityBytes: 256<<20 + 1, CacheBytes: 1 << 40},
+		"entity above ceiling":  {EntityBytes: maxEntityBytes + 1, CacheBytes: 1 << 62},
 		"entity below one page": {EntityBytes: 100},
 		"result above 64 KiB":   {ResultBytes: 64<<10 + 1},
 		"batch above 16":        {BatchMax: 17},

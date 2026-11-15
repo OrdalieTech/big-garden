@@ -55,6 +55,9 @@ func (d *DB) Delta(w io.Writer) (Object, error) {
 				grown++
 			}
 		}
+		if lock := ltx.LockPgno(pageSize); d.pub.PageCount < lock && lock <= n {
+			grown++ // SQLite never writes the lock page (1 GiB offset); ltx excludes it
+		}
 		if n > d.pub.PageCount && grown != n-d.pub.PageCount {
 			return fmt.Errorf("%w: WAL lacks %d grown pages", ErrCorrupt, n-d.pub.PageCount-grown)
 		}
@@ -83,6 +86,9 @@ func (d *DB) Delta(w io.Writer) (Object, error) {
 			}
 		}
 		for p := n + 1; p <= d.pub.PageCount; p++ { // truncated pages
+			if p == ltx.LockPgno(pageSize) {
+				continue
+			}
 			if err := xorPage(&e.sum, d.main, p, old); err != nil {
 				return err
 			}
@@ -118,6 +124,10 @@ func (d *DB) Snapshot(w io.Writer) (Object, error) {
 			if err := rows.Scan(&p, &data); err != nil {
 				return err
 			}
+			if p == ltx.LockPgno(pageSize) && p == i {
+				o.Pages++ // counted below as present; never encoded
+				continue
+			}
 			if p != i {
 				return fmt.Errorf("engine: sqlite_dbpage returned page %d at position %d", p, i)
 			}
@@ -128,9 +138,11 @@ func (d *DB) Snapshot(w io.Writer) (Object, error) {
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		skipped := o.Pages
 		if o, err = e.close(); err != nil {
 			return err
 		}
+		o.Pages += skipped
 		if o.Pages != n {
 			return fmt.Errorf("engine: snapshot has %d of %d pages", o.Pages, n)
 		}

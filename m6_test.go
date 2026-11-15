@@ -62,6 +62,18 @@ func (p *pauseStore) Get(ctx context.Context, key, inm string, max int64) (store
 	return o, err
 }
 
+func (p *pauseStore) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	r, err := p.Store.Open(late(ctx, p.at("get", key, "before")), key, off, n)
+	p.at("get", key, "after")
+	return r, err
+}
+
+func (p *pauseStore) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
+	err := p.Store.PutFile(late(ctx, p.at("put", key, "before")), key, body, size, sum)
+	p.at("put", key, "after")
+	return err
+}
+
 func (p *pauseStore) PutImmutable(ctx context.Context, key string, body []byte) error {
 	err := p.Store.PutImmutable(late(ctx, p.at("put", key, "before")), key, body)
 	p.at("put", key, "after")
@@ -929,10 +941,11 @@ func TestImportRejectsMalformedArchives(t *testing.T) {
 	if _, err := a.Export(bg, src, &archive); err != nil {
 		t.Fatal(err)
 	}
-	m, snap, _, err := a.readArchive(bytes.NewReader(archive.Bytes()))
+	m, sp, _, err := a.readArchive(bytes.NewReader(archive.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}
+	snap := spoolBytes(sp)
 	mj, _ := json.Marshal(m)
 	withManifest := func(edit func(*manifest)) []byte {
 		m2 := m
@@ -1023,7 +1036,8 @@ func FuzzImport(f *testing.F) {
 	f.Add(tarOf(member{name: "manifest.json", body: []byte("{}")}, member{name: "snapshot.ltx", body: []byte("x")}))
 	var keys atomic.Int64
 	f.Fuzz(func(t *testing.T, b []byte) {
-		m, snap, _, err := n.readArchive(bytes.NewReader(b))
+		m, sp, _, err := n.readArchive(bytes.NewReader(b))
+		snap := spoolBytes(sp)
 		if err != nil {
 			wantCode(t, err, CodeCorrupt)
 			return
@@ -1058,6 +1072,18 @@ func (c *countStore) Get(ctx context.Context, key, inm string, max int64) (store
 	c.gets.Add(1)
 	c.getBytes.Add(int64(len(o.Body)))
 	return o, err
+}
+
+func (c *countStore) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	c.gets.Add(1)
+	c.getBytes.Add(n)
+	return c.Store.Open(ctx, key, off, n)
+}
+
+func (c *countStore) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
+	c.puts.Add(1)
+	c.putBytes.Add(size)
+	return c.Store.PutFile(ctx, key, body, size, sum)
 }
 
 func (c *countStore) PutImmutable(ctx context.Context, key string, body []byte) error {
@@ -1278,4 +1304,11 @@ func TestScan(t *testing.T) {
 	if !slices.Equal(rest, keys[10:]) {
 		t.Fatalf("resume after %s: %v, want %v", keys[9], rest, keys[10:])
 	}
+}
+
+// spoolBytes returns the bytes of s and removes it.
+func spoolBytes(s *spool) []byte {
+	defer s.Close()
+	b, _ := io.ReadAll(io.NewSectionReader(s.ReaderAt(), 0, s.n))
+	return b
 }

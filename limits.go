@@ -14,7 +14,7 @@ import (
 // rejected by Open. Protocol-format limits (64 KiB heads, 32 deltas, 4 KiB
 // pages) are fixed and not configurable here. Defaults [bounds]:
 //
-//	EntityBytes            64 MiB [4 KiB..256 MiB]  database size
+//	EntityBytes            64 MiB [4 KiB..16 TiB]   database size (qualified sizes: DECISIONS D34)
 //	CacheBytes             8 GiB  local cache; >= Recoveries*(4*EntityBytes+1 MiB)
 //	ResultBytes            4 KiB [..64 KiB]         a stored result (receipt) of Create, Update, Migrate, Import
 //	ResidentEntities       256                      open entities
@@ -36,7 +36,7 @@ type Limits struct {
 
 // Qualified upper bounds (PLAN §11.2, DECISIONS D6).
 const (
-	maxEntityBytes = head.MaxPages * head.PageSize // 256 MiB
+	maxEntityBytes = head.MaxPages * head.PageSize // 16 TiB: the format ceiling (DECISIONS D34)
 	maxResultBytes = 64 << 10
 	maxCount       = 1 << 20 // keeps every product below overflow
 	maxBatch       = 16
