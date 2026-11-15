@@ -37,6 +37,7 @@ func entityKeys(t *testing.T, st store.Store, key string) []string {
 // nothing of the old one, birth.json untouched, revision and epoch carried
 // on; the old Ref gets incarnation_mismatch; Import recreates a tombstone too.
 func TestDelete(t *testing.T) {
+	plaintextOnly(t)
 	st := newStore(t)
 	a := testNode(t, st, "a", nil)
 	b := testNode(t, st, "b", nil)

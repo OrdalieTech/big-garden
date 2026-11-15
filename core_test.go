@@ -72,10 +72,21 @@ func (l *ledger) verify(t *testing.T, st store.Store, nodeID string) {
 	}
 }
 
+// plaintextOnly skips t in the sealed lane (GARDEN_TEST_SEALED, D36): t
+// asserts inline tails, stored plaintext, or opens Nodes without the key.
+func plaintextOnly(t *testing.T) {
+	if os.Getenv("GARDEN_TEST_SEALED") != "" {
+		t.Skip("asserts inline tails or stored plaintext, or opens Nodes without the key: none apply to a sealed namespace (D36)")
+	}
+}
+
 func testNode(t *testing.T, mem store.Store, nodeID string, mod func(*Limits)) *Node {
 	t.Helper()
 	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: nodeID, CacheDir: t.TempDir(),
 		Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}
+	if os.Getenv("GARDEN_TEST_SEALED") != "" { // every test again in a sealed namespace (D36)
+		cfg.Key = bytes.Repeat([]byte{0x5e}, 32)
+	}
 	if b, err := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")); err == nil { // =1: every core test again on the unbatched path
 		cfg.Limits.BatchMax = b
 	}
@@ -266,6 +277,7 @@ func TestSessionDirCleanup(t *testing.T) {
 }
 
 func TestCreateUpdateReadLookup(t *testing.T) {
+	plaintextOnly(t)
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	l := newLedger()
@@ -1085,6 +1097,7 @@ func TestResolveBranches(t *testing.T) {
 // and before resolve reads the head another owner advances the expiry floor
 // past the ID, pruning the receipt. Resolve must not call it not committed.
 func TestResolvePrunedReceipt(t *testing.T) {
+	plaintextOnly(t)
 	mem := newStore(t)
 	n := testNode(t, mem, "a", nil)
 	other := testNode(t, mem, "b", nil)
@@ -1330,6 +1343,7 @@ func TestResolveObjectBranch(t *testing.T) {
 }
 
 func TestResolveHydrationFailureIsUnknown(t *testing.T) {
+	plaintextOnly(t)
 	mem := newStore(t)
 	n := testNode(t, mem, "a", func(l *Limits) { l.CommitTimeout = 500 * time.Millisecond })
 	l := newLedger()

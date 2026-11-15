@@ -61,6 +61,8 @@ type Config struct {
 	Logger		*slog.Logger
 
 	Extend	func(*sqlite.Driver) error
+
+	Key	[]byte
 }
 type Error struct {
 	Code		Code

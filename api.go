@@ -97,6 +97,14 @@ type Config struct {
 	// connection hooks and names replacing a built-in function or module
 	// are refused. An error fails Open with invalid_argument.
 	Extend func(*sqlite.Driver) error
+
+	// Key, if not nil, is the 32-byte secret that encrypts the namespace at
+	// rest (DECISIONS D36): every LTX object and blob is sealed with
+	// AES-256-GCM before it leaves the Node. A namespace is created sealed or
+	// not, for good: namespace.json records a check of the key, and Open
+	// refuses a Config whose Key does not match it (invalid_argument). Heads,
+	// births and the namespace descriptor stay readable, as do local caches.
+	Key []byte
 }
 
 // Tx is the scoped SQL handle of a mutation callback. It is invalid after the

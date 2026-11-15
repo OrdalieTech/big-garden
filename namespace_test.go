@@ -28,6 +28,7 @@ func (s *listHook) List(ctx context.Context, prefix, after string, limit int) ([
 // b's namespace, not report state_missing (found on Scaleway, where the
 // window between the GET and the LIST is tens of milliseconds).
 func TestConcurrentFirstOpen(t *testing.T) {
+	plaintextOnly(t)
 	mem := storetest.NewMem()
 	var b *Node
 	hook := &listHook{Store: mem, f: func() {

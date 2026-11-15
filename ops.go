@@ -242,7 +242,7 @@ func (n *Node) putObject(ctx context.Context, key string, body *spool, sum [32]b
 			h := sha256.New()
 			k, cerr := io.Copy(h, r)
 			r.Close()
-			if err = cerr; err == nil && (k != body.n || [32]byte(h.Sum(nil)) != sum) {
+			if err = cerr; errors.Is(err, store.ErrSealBroken) || err == nil && (k != body.n || [32]byte(h.Sum(nil)) != sum) {
 				return newError(CodeCorrupt, "an object key holds other bytes", nil)
 			}
 		}
@@ -908,7 +908,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		}
 		c.pages = append(slices.Clone(e.pages[:1+len(h.Deltas)]), t.Pages) // the tail, or the new last delta
 		uploaded := slices.ContainsFunc(links(h), func(r head.Ref) bool { return r.BaseRevision >= 1 })
-		if t.Ref.Bytes <= head.InlineBytes && uploaded {
+		if t.Ref.Bytes <= head.InlineBytes && uploaded && n.cfg.Key == nil { // a head never carries sealed data (D36)
 			r := t.Ref
 			next.Tail = &head.Tail{SHA256: r.SHA256, Bytes: r.Bytes, MinSequence: r.MinSequence, MaxSequence: r.MaxSequence,
 				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbuf.buf.Bytes()} // in memory: within spoolMemory

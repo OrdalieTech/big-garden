@@ -452,9 +452,12 @@ func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head, downl
 				var k int64
 				k, err = io.Copy(io.MultiWriter(spools[i], h), body)
 				body.Close()
-				if err != nil {
+				switch {
+				case errors.Is(err, store.ErrSealBroken):
+					err = engine.ErrCorrupt
+				case err != nil:
 					err = &store.Error{Outcome: store.Unknown, Op: "get", Key: r.Key, Err: err}
-				} else if uint64(k) != r.Bytes || [32]byte(h.Sum(nil)) != r.SHA256 {
+				case uint64(k) != r.Bytes || [32]byte(h.Sum(nil)) != r.SHA256:
 					err = engine.ErrCorrupt
 				}
 				downloaded.Add(uint64(k))

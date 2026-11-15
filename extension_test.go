@@ -168,6 +168,7 @@ func (x *extEntity) verify(t *testing.T, n *Node, ref Ref) {
 // cache, a takeover by another node, Export and Import; a node without the
 // extension activates the entity and gets SQLite's error from vec only.
 func TestExtensionsDurable(t *testing.T) {
+	plaintextOnly(t)
 	st := newStore(t)
 	a := extNode(t, st, "a")
 	x := &extEntity{}

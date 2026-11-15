@@ -518,3 +518,31 @@ func TestFilesInCreate(t *testing.T) {
 		t.Fatalf("an unused spool survived its window: %v", err)
 	}
 }
+
+// A sequential read whose first chunks come from the chunk cache still
+// fetches the rest (the readahead window never drops to zero).
+func TestFilesReadAfterCachedChunks(t *testing.T) {
+	mem := storetest.NewMem()
+	a, b := testNode(t, mem, "a", nil), testNode(t, mem, "b", nil)
+	ref, _, err := a.Create(bg, "doc", newReq(t, "create", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := random(3<<20 + 3)
+	bl, err := a.PutBlob(bg, ref, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Update(bg, ref, newReq(t, "link", 1), setFile("f", &bl)); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := fileOf(t, b, ref, "f")
+	if _, err := readBlob(t, b, ref, f, 1<<20-5, 10); err != nil { // chunks 0 and 1 now cached
+		t.Fatal(err)
+	}
+	r, _ := b.OpenBlob(bg, ref, f)
+	defer r.Close()
+	if got, err := io.ReadAll(r); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("sequential read after cached chunks: %d bytes, %v", len(got), err)
+	}
+}

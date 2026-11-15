@@ -97,9 +97,10 @@ func unhex(dst, t []byte) error {
 
 // Namespace is the immutable namespace.json descriptor.
 type Namespace struct {
-	Format       uint32 `json:"format"`
-	Namespace    ID     `json:"namespace"`
-	EntityFormat uint32 `json:"entity_format"`
+	Format       uint32  `json:"format"`
+	Namespace    ID      `json:"namespace"`
+	EntityFormat uint32  `json:"entity_format"`
+	KeyCheck     *Digest `json:"key_check,omitempty"` // a sealed namespace's key check (DECISIONS D36)
 }
 
 // Birth is the immutable birth.json descriptor written once per incarnation.

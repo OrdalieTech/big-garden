@@ -3,6 +3,8 @@ package garden
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -64,8 +66,23 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 	return open(ctx, cfg, store.NewS3(cfg.S3, cfg.Bucket, cfg.Prefix, cfg.Limits.StorageAttemptTimeout))
 }
 
+// keyCheck is the namespace's check of a sealing key (D36): it proves the key
+// without revealing it.
+func keyCheck(key []byte, ns head.ID) *head.Digest {
+	if key == nil {
+		return nil
+	}
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte("big-garden key check " + ns.String()))
+	d := head.Digest(m.Sum(nil))
+	return &d
+}
+
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
+	if cfg.Key != nil {
+		st, _ = store.Sealed(st, cfg.Key) // validated: 32 bytes
+	}
 	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]time.Time{}, offGate: 16 << 20 / head.PageSize, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
@@ -344,7 +361,8 @@ func (n *Node) namespace(ctx context.Context) error {
 			}
 			return newError(CodeStateMissing, "entities exist without namespace.json", nil)
 		}
-		body, _ := head.Namespace{Format: head.Format, Namespace: head.NewID(), EntityFormat: head.Format}.Encode()
+		id := head.NewID()
+		body, _ := head.Namespace{Format: head.Format, Namespace: id, EntityFormat: head.Format, KeyCheck: keyCheck(n.cfg.Key, id)}.Encode()
 		err = n.st.PutImmutable(ctx, head.NamespaceKey, body)
 		if o := store.OutcomeOf(err); o != store.OK && o != store.PreconditionFailed && o != store.Unknown {
 			return storeError(err)
@@ -364,6 +382,9 @@ func (n *Node) readNamespace(ctx context.Context) (bool, error) {
 	ns, err := head.DecodeNamespace(obj.Body)
 	if err != nil {
 		return false, newError(CodeCorrupt, "namespace.json: "+err.Error(), nil)
+	}
+	if want := keyCheck(n.cfg.Key, ns.Namespace); (want == nil) != (ns.KeyCheck == nil) || want != nil && !hmac.Equal(want[:], ns.KeyCheck[:]) {
+		return false, invalid("Config.Key does not match the namespace's (sealed or not: DECISIONS D36)")
 	}
 	n.ns = ns.Namespace
 	return true, nil

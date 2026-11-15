@@ -299,7 +299,7 @@ func (r *blobReader) chunk(i int64) ([]byte, error) {
 		}
 		r.window = 1
 		if i == r.last+1 { // sequential: read further ahead each time
-			r.window = min(2*r.prev, maxWindow)
+			r.window = max(1, min(2*r.prev, maxWindow)) // at least one: the chunks before may have come from the cache
 		}
 		r.prev = r.window
 		count := (r.f.Size + engine.FileChunk - 1) / engine.FileChunk
@@ -318,6 +318,9 @@ func (r *blobReader) chunk(i int64) ([]byte, error) {
 	if _, err := io.ReadFull(r.body, b); err != nil {
 		r.body.Close()
 		r.body = nil
+		if errors.Is(err, store.ErrSealBroken) {
+			return nil, newError(CodeCorrupt, "a blob chunk fails its sealing", err)
+		}
 		return nil, newError(CodeUnavailable, "blob read", err)
 	}
 	if r.next, r.last = r.next+1, i; r.next == r.end {

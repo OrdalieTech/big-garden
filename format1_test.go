@@ -30,6 +30,7 @@ func format1Rows() map[string]string {
 // import with this binary. A change that breaks them breaks every deployed
 // namespace and every backup.
 func TestFormat1Frozen(t *testing.T) {
+	plaintextOnly(t)
 	dir := filepath.Join("testdata", "format1")
 	if *updateFormat1 {
 		mem := storetest.NewMem()

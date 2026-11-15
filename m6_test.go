@@ -310,6 +310,7 @@ func requireReferenced(t *testing.T, st store.Store, key string) *head.Head {
 // entity to another node: the resumed Collect works from the old head and
 // must delete nothing a newer head references.
 func TestCollectPausedAfterHead(t *testing.T) {
+	plaintextOnly(t)
 	for _, snapshot := range []bool{false, true} {
 		t.Run(fmt.Sprint("snapshot=", snapshot), func(t *testing.T) {
 			st := newStore(t)
@@ -520,6 +521,7 @@ func corruptFixture(t *testing.T) (*storetest.Mem, Ref, *ledger, *head.Head) {
 // (empty cache) fails closed with corrupt or state_missing, never serves and
 // never reinitializes; once the fault is gone everything acknowledged reads.
 func TestCorruptRetainedObjects(t *testing.T) {
+	plaintextOnly(t)
 	type target struct {
 		name string
 		key  func(*head.Head) string
@@ -643,6 +645,7 @@ func requireHeadUnchanged(t *testing.T, mem *storetest.Mem, h *head.Head) {
 // TestCorruptBirthAndNamespace: a damaged birth.json or namespace.json
 // fails closed; nothing is reinitialized empty.
 func TestCorruptBirthAndNamespace(t *testing.T) {
+	plaintextOnly(t)
 	flip := func(b []byte) []byte { b = bytes.Clone(b); b[len(b)/2] ^= 0x10; return b }
 	trunc := func(b []byte) []byte { return b[:len(b)-1] }
 	for name, f := range map[string]func([]byte) []byte{"flip": flip, "truncate": trunc} {
@@ -1173,6 +1176,7 @@ func TestAmplification(t *testing.T) {
 // TestSnapshotErases (D22): after a deleting Update and Snapshot, no stored
 // object of the entity holds the deleted bytes, and the head has no deltas.
 func TestSnapshotErases(t *testing.T) {
+	plaintextOnly(t)
 	mem := storetest.NewMem()
 	n := testNode(t, mem, "a", nil)
 	ref, _, err := n.Create(bg, "k", newReq(t, "c", 1), createKV)

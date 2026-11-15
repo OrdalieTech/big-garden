@@ -96,6 +96,8 @@ func (c Config) validate() (Config, error) {
 		return c, invalid("Config.Prefix must be 1..256 bytes of UTF-8 '/'-separated segments, none empty, '.' or '..'")
 	case c.CacheDir == "":
 		return c, invalid("Config.CacheDir is required")
+	case c.Key != nil && len(c.Key) != 32:
+		return c, invalid("Config.Key must have 32 bytes")
 	}
 	if err = head.ValidNode(c.NodeID); err != nil {
 		return c, invalid(err.Error())
