@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -404,4 +405,43 @@ func TestFilesExportImport(t *testing.T) {
 	tw.Close()
 	_, _, err = b.Import(bg, "short", newReq(t, "short", 1), bytes.NewReader(short.Bytes()))
 	wantCode(t, err, CodeCorrupt)
+}
+
+// A callback copies a file under another name without moving bytes, and
+// the copy outlives the original name.
+func TestFilesRename(t *testing.T) {
+	mem := storetest.NewMem()
+	n := testNode(t, mem, "a", nil)
+	ref, _, err := n.Create(bg, "doc", newReq(t, "create", 1), createKV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := random(300 << 10)
+	b, err := n.PutBlob(bg, ref, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Update(bg, ref, newReq(t, "current", 1), setFile("crdt/current", &b)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Update(bg, ref, newReq(t, "checkpoint", 1), func(tx *Tx) ([]byte, error) {
+		f, ok, err := tx.File(bg, "crdt/current")
+		if err != nil || !ok {
+			return nil, fmt.Errorf("file: %v %v", ok, err)
+		}
+		return nil, errors.Join(tx.SetFile("crdt/trail/1", &f), tx.SetFile("crdt/current", nil))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.now = func() time.Time { return time.Now().Add(blobLinkWindow + time.Minute) } // only the image protects it now
+	if err := n.sweep(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	f, ok := fileOf(t, n, ref, "crdt/trail/1")
+	if got, err := readBlob(t, n, ref, f, 0, f.Size); !ok || err != nil || !bytes.Equal(got, data) || len(blobKeys(t, mem, ref)) != 1 {
+		t.Fatalf("renamed file: %v %v", ok, err)
+	}
+	if _, ok := fileOf(t, n, ref, "crdt/current"); ok {
+		t.Fatal("the old name survived")
+	}
 }

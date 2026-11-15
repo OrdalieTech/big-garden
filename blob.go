@@ -195,8 +195,18 @@ func (t *Tx) SetFile(name string, b *Blob) error {
 // File returns the file name of the image read. Application SQL may also
 // read _state_blobs (name, object, size, sha256, chunks, inline) and join
 // it with its own tables; only SetFile writes it.
-func (v *View) File(ctx context.Context, name string) (b Blob, ok bool, err error) {
-	err = v.Query(ctx, "SELECT coalesce(object, ''), size, sha256, chunks, inline FROM _state_blobs WHERE name = ?", []any{name},
+func (v *View) File(ctx context.Context, name string) (Blob, bool, error) {
+	return file(ctx, v.Query, name)
+}
+
+// File returns the file name as this mutation sees it, so a callback can
+// give it another name with SetFile: a copy inside the entity, no bytes moved.
+func (t *Tx) File(ctx context.Context, name string) (Blob, bool, error) {
+	return file(ctx, t.Query, name)
+}
+
+func file(ctx context.Context, query func(context.Context, string, []any, func(*sql.Rows) error) error, name string) (b Blob, ok bool, err error) {
+	err = query(ctx, "SELECT coalesce(object, ''), size, sha256, chunks, inline FROM _state_blobs WHERE name = ?", []any{name},
 		func(rows *sql.Rows) error {
 			if !rows.Next() {
 				return nil

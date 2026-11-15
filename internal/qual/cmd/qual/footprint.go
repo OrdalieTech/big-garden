@@ -28,7 +28,7 @@ func footprint(args []string) error {
 	maxDirect := fs.Int("max-direct-modules", 5, "")
 	maxRuntime := fs.Int("max-runtime-modules", 30, "")
 	maxTypes := fs.Int("max-exported-types", 18, "")
-	maxCallables := fs.Int("max-exported-callables", 30, "")
+	maxCallables := fs.Int("max-exported-callables", 31, "") // 30, plus Tx.File (DECISIONS D33)
 	maxBinary := fs.Int64("max-binary-mib", 35, "stripped consumer binary target")
 	out := fs.String("out", "artifacts/footprint", "")
 	if err := fs.Parse(args); err != nil {

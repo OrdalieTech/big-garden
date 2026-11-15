@@ -799,7 +799,7 @@ File sizes above approximately 500 executable lines and functions above approxim
 
 ### 12.2 API and dependency budgets
 
-Target at most 18 exported types, 30 exported functions/methods, and the 16 listed error codes. Exported fields are documented configuration/data contracts, not a loophole for a second API. A public API snapshot generated from `go/types` must detect additions and signature changes in CI.
+Target at most 18 exported types, 31 exported functions/methods (30, amended by DECISIONS D33 for `Tx.File`), and the 16 listed error codes. Exported fields are documented configuration/data contracts, not a loophole for a second API. A public API snapshot generated from `go/types` must detect additions and signature changes in CI.
 
 Runtime direct modules: at most five, as listed in §1.3. Target at most 30 modules in the transitive **runtime import closure**, reported separately from the module graph including tests/tools. The full module graph, licenses and checksums remain visible. Every addition must identify the invariant or measured capability it supplies. No framework, RPC stack, metrics server, cloud multi-provider facade, general scheduler or dependency-injection container is allowed by default.
 
@@ -1182,7 +1182,7 @@ go test -count=1 ./...
 go run ./internal/qual/cmd/qual footprint \
   --max-production-files=25 --max-production-loc=6000 \
   --max-direct-modules=5 --max-runtime-modules=30 \
-  --max-exported-types=18 --max-exported-callables=30 \
+  --max-exported-types=18 --max-exported-callables=31 \
   --out=artifacts/footprint.json
 
 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false \
