@@ -32,6 +32,7 @@ type entity struct {
 	db         *engine.DB
 	unresolved *candidate
 	pages      []uint32
+	snap       *snapJob // an off-mutex snapshot in flight (D35), under mu
 	qmu        sync.Mutex
 	queue      []*waiter    // Updates waiting on mu that a batch may take (PROTOCOL §6 Batches)
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)

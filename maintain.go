@@ -2,6 +2,7 @@ package garden
 
 import (
 	"context"
+	"os"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -27,13 +28,25 @@ func (n *Node) maintainLater(e *entity) {
 		defer n.wg.Done()
 		e.mu.Lock()
 		var ref, sweep *Ref
+		var job *snapJob
 		if !n.isClosed() && e.unresolved == nil && e.db != nil && e.h != nil && n.mine(e.h) {
 			if e.db.SweepDue {
 				sweep = &Ref{e.key, e.h.Incarnation}
 			}
+			had := e.snap
 			if n.maintain(e, false) {
 				ref = &Ref{e.key, e.h.Incarnation}
 			}
+			if e.snap != had {
+				job = e.snap
+			}
+		}
+		if job != nil { // off the mutex, still holding e (D35)
+			e.mu.Unlock()
+			if n.runSnapshot(e, job) {
+				ref = &Ref{e.key, job.inc}
+			}
+			e.mu.Lock()
 		}
 		n.leave(e)
 		ctx, cancel := n.commitContext()
@@ -61,6 +74,17 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 	buf := n.spool()
 	defer buf.Close()
 	var ref head.Ref
+	switch {
+	case h.Pending != nil && e.snap == nil && !snapshot: // a snapshot nobody here runs (a crash, another session): drop the intent
+		next.Pending = nil
+		c.next, c.pages = next, e.pages
+		_, err := n.publish(e, c)
+		return err == nil
+	case h.Pending != nil && !snapshot: // no compaction across the snapshot's sequence
+		return false
+	case !snapshot && e.replay() > uint64(h.PageCount)+256 && h.PageCount >= n.offGate && len(h.Deltas) < head.MaxDeltas:
+		return n.startSnapshot(ctx, e)
+	}
 	if snapshot || e.replay() > uint64(h.PageCount)+256 {
 		snap, err := e.db.Snapshot(buf)
 		if err != nil || snap.Ref.PostChecksum != h.DatabaseChecksum || snap.Ref.MaxSequence != h.Sequence {
@@ -68,7 +92,7 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 			return false
 		}
 		ref = placed(h, snap.Ref)
-		next.Snapshot, next.Deltas, next.Tail, c.pages = ref, []head.Ref{}, nil, []uint32{snap.Pages}
+		next.Snapshot, next.Deltas, next.Tail, next.Pending, c.pages = ref, []head.Ref{}, nil, nil, []uint32{snap.Pages}
 	} else {
 		i := 0
 		for ; i+fanout <= len(h.Deltas); i++ {
@@ -104,6 +128,125 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 	_, err := n.publish(e, c) // not committed: the object is abandoned to collection
 	failpoint("maint.done")
 	return err == nil
+}
+
+// snapJob is an off-mutex snapshot (D35): announced in the head of revision
+// rev, encoded from file, a copy of the image img.
+type snapJob struct {
+	attempt head.ID
+	inc     head.ID
+	rev     uint64
+	file    *os.File
+	img     engine.Image
+}
+
+// startSnapshot announces an off-mutex snapshot and copies the image, under
+// the mutex: the tail first becomes a delta, so that no later write merges
+// across the snapshot's sequence. It reports whether it committed a head.
+func (n *Node) startSnapshot(ctx context.Context, e *entity) bool {
+	h, attempt := e.h, head.NewID()
+	next := *h
+	next.Revision, next.Nonce = h.Revision+1, head.NewID()
+	next.Pending = &head.Pending{Attempt: attempt, Revision: next.Revision}
+	c := &candidate{base: h, baseETag: e.etag, pages: e.pages}
+	if h.Tail != nil {
+		tail := n.spool()
+		defer tail.Close()
+		tail.Write(h.Tail.Data)
+		ref := placed(h, h.Tail.Ref())
+		if n.putObject(ctx, ref.Key, tail, ref.SHA256) != nil {
+			return false
+		}
+		next.Deltas, next.Tail, c.object = append(slices.Clip(h.Deltas), ref), nil, &ref
+	}
+	c.next = next
+	if _, err := n.publish(e, c); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(n.dir, "image-*")
+	if err != nil {
+		return true // the intent is dropped by a later step
+	}
+	img, err := e.db.CopyImage(f)
+	if err != nil || img.Sequence != e.h.Sequence {
+		f.Close()
+		os.Remove(f.Name())
+		return true
+	}
+	e.snap = &snapJob{attempt, e.h.Incarnation, next.Revision, f, img}
+	return true
+}
+
+// runSnapshot encodes and uploads job's snapshot without the mutex, then
+// takes it to replace the head's snapshot and the deltas it covers, keeping
+// those written since; anything else (the intent gone, ownership lost, a
+// newer snapshot, an object straddling its sequence) abandons it: the
+// intent is dropped and the object deleted. It reports whether it
+// committed a head.
+func (n *Node) runSnapshot(e *entity, job *snapJob) bool {
+	defer os.Remove(job.file.Name())
+	defer job.file.Close()
+	ctx, cancel := context.WithCancel(context.Background()) // the upload may outlast CommitTimeout; Close ends it
+	defer cancel()
+	go func() {
+		select {
+		case <-n.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	buf := n.spool()
+	defer buf.Close()
+	snap, err := engine.SnapshotFile(buf, job.file, job.img)
+	ref := snap.Ref
+	ref.Key, ref.BaseRevision = head.ObjectKey(e.key, job.inc, job.rev, job.attempt, ref.SHA256), job.rev
+	failpoint("snap.put")
+	if err == nil {
+		err = n.putObject(ctx, ref.Key, buf, ref.SHA256)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.snap = nil
+	h := e.h
+	abandon := func() bool {
+		committed := false
+		if h != nil && h.Pending != nil && h.Pending.Attempt == job.attempt && e.unresolved == nil && n.mine(h) {
+			next := *h
+			next.Revision, next.Nonce, next.Pending = h.Revision+1, head.NewID(), nil
+			_, perr := n.publish(e, &candidate{base: h, baseETag: e.etag, next: next, pages: e.pages})
+			committed = perr == nil
+		}
+		dctx, dcancel := n.commitContext()
+		n.st.Delete(dctx, ref.Key) // never referenced: no head took it
+		dcancel()
+		return committed
+	}
+	if err != nil || n.isClosed() || e.unresolved != nil || e.db == nil || h == nil || !n.mine(h) ||
+		h.Pending == nil || h.Pending.Attempt != job.attempt || h.Snapshot.MaxSequence > job.img.Sequence {
+		return abandon()
+	}
+	s0 := job.img.Sequence
+	next := *h
+	next.Revision, next.Nonce, next.Snapshot, next.Deltas, next.Pending = h.Revision+1, head.NewID(), ref, []head.Ref{}, nil
+	pages := []uint32{snap.Pages}
+	for i, d := range h.Deltas {
+		switch {
+		case d.MaxSequence <= s0: // covered by the snapshot
+		case d.MinSequence > s0:
+			next.Deltas, pages = append(next.Deltas, d), append(pages, e.pages[1+i])
+		default:
+			return abandon()
+		}
+	}
+	if h.Tail != nil {
+		if h.Tail.MinSequence <= s0 {
+			return abandon()
+		}
+		pages = append(pages, e.pages[len(e.pages)-1])
+	}
+	failpoint("snap.cas")
+	_, err = n.publish(e, &candidate{base: h, baseETag: e.etag, next: next, object: &ref, pages: pages})
+	return err == nil // not committed: resolution decided, the object is collected unless a head holds it
 }
 
 // placed keys r as a new object based on h's revision.
@@ -159,6 +302,10 @@ func (n *Node) reap(ctx context.Context, h *head.Head) error {
 	for _, r := range links(h) {
 		live[r.Key] = !h.Deleted
 	}
+	pending := func(k string) bool { // an off-mutex snapshot's object, maybe not uploaded yet (D35)
+		_, attempt, _, err := head.ParseObjectKey(head.ObjectPrefix(h.Key, h.Incarnation), k)
+		return err == nil && h.Pending != nil && attempt == h.Pending.Attempt
+	}
 	prefix, blobs := head.ObjectPrefix(h.Key, h.Incarnation), head.BlobPrefix(h.Key, h.Incarnation)
 	for after := ""; ; {
 		page, more, err := n.st.List(ctx, prefix, after, 1000)
@@ -168,7 +315,7 @@ func (n *Node) reap(ctx context.Context, h *head.Head) error {
 		for _, o := range page {
 			after = o.Key
 			base, _, _, err := head.ParseObjectKey(prefix, o.Key)
-			if prefix == blobs || err == nil && base < h.Revision && !live[o.Key] { // a tombstone's blobs all go (D33)
+			if prefix == blobs || err == nil && base < h.Revision && !live[o.Key] && !pending(o.Key) { // a tombstone's blobs all go (D33)
 				failpoint("collect.del")
 				switch err := n.st.Delete(ctx, o.Key); store.OutcomeOf(err) {
 				case store.OK:

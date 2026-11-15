@@ -106,7 +106,7 @@ func (n *Node) Release(ctx context.Context, ref Ref) error {
 		return nil
 	}
 	next := *e.h
-	next.Owner, next.Epoch, next.Revision, next.Nonce = nil, next.Epoch+1, next.Revision+1, head.NewID()
+	next.Owner, next.Epoch, next.Revision, next.Nonce, next.Pending = nil, next.Epoch+1, next.Revision+1, head.NewID(), nil // an off-mutex snapshot ends with the ownership (D35)
 	_, err = n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next})
 	if err == nil {
 		e.discard()
@@ -136,7 +136,7 @@ func (n *Node) Delete(ctx context.Context, ref Ref) error {
 	var tomb *head.Head
 	if err = n.ownedHead(ctx, e, ref, time.Time{}); err == nil { // a zero t0: a write, owner only; no activation
 		next := *e.h
-		next.Owner, next.Tail, next.Deleted = nil, nil, true
+		next.Owner, next.Tail, next.Deleted, next.Pending = nil, nil, true, nil
 		next.Epoch, next.Revision, next.Nonce = next.Epoch+1, next.Revision+1, head.NewID()
 		if _, err = n.publish(e, &candidate{base: e.h, baseETag: e.etag, next: next}); err == nil && e.h.Deleted && e.h.Incarnation == ref.Incarnation {
 			tomb = e.h // the settled head: a later tombstone if resolution found one

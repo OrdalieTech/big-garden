@@ -49,6 +49,7 @@ type Node struct {
 	counters        counters
 	wg              sync.WaitGroup // maintenance steps in flight
 	skipMaintenance bool           // tests of the §6.7 cap only
+	offGate         uint32         // pages from which maintenance snapshots off the mutex (D35)
 }
 
 // Open validates cfg and opens a Node on its namespace (PROTOCOL §8). It
@@ -65,7 +66,7 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 
 // open runs PROTOCOL §8 steps 2–4 for a validated cfg on st.
 func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]time.Time{}, now: time.Now,
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]time.Time{}, offGate: 16 << 20 / head.PageSize, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {

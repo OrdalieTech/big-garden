@@ -133,9 +133,21 @@ type Head struct {
 	Snapshot         Ref      `json:"snapshot"`
 	Deltas           []Ref    `json:"deltas"`
 	Tail             *Tail    `json:"tail"`
+	// Pending, if not nil, announces a snapshot being encoded and uploaded
+	// off the entity mutex (DECISIONS D35); absent from heads without one.
+	Pending *Pending `json:"pending,omitempty"`
 	// Deleted marks a tombstone (Delete): no owner, no tail, refs and data
 	// fields as they were; only a recreation may replace it (DECISIONS D25).
 	Deleted bool `json:"deleted"`
+}
+
+// Pending is the intent of an off-mutex snapshot (D35): collection keeps
+// every object of Attempt, and the snapshot, produced under Revision (the
+// first head carrying this intent), may enter a later head that still
+// carries it.
+type Pending struct {
+	Attempt  ID     `json:"attempt"`
+	Revision uint64 `json:"revision"`
 }
 
 // Owner identifies the session allowed to publish; nil in a Head means
@@ -305,8 +317,11 @@ func (h *Head) Validate() error {
 	if err := ValidKey(h.Key); err != nil {
 		return err
 	}
-	if h.Deleted && (h.Owner != nil || h.Tail != nil) {
-		return errors.New("tombstone with an owner or a tail")
+	if h.Deleted && (h.Owner != nil || h.Tail != nil || h.Pending != nil) {
+		return errors.New("tombstone with an owner, a tail or a pending snapshot")
+	}
+	if p := h.Pending; p != nil && (p.Attempt == (ID{}) || p.Revision == 0 || p.Revision > h.Revision) {
+		return errors.New("pending snapshot with a zero attempt or a revision not up to the head's")
 	}
 	if h.Owner != nil {
 		if err := ValidNode(h.Owner.Node); err != nil {
@@ -432,6 +447,12 @@ func Successor(prev, next *Head) error {
 	case next.Sequence > prev.Sequence && (!sameOwner || next.Owner == nil):
 		return errors.New("data changed by a non-owner")
 	}
+	switch p, q := prev.Pending, next.Pending; {
+	case q == nil, p != nil && *q == *p: // cleared, consumed or carried
+	case p == nil && q.Revision == next.Revision: // announced in the head that first carries it
+	default:
+		return errors.New("a pending snapshot is announced only by the head that first carries it")
+	}
 	old := make(map[string]Ref, 1+len(prev.Deltas))
 	for _, r := range append([]Ref{prev.Snapshot}, prev.Deltas...) {
 		old[r.Key] = r
@@ -440,11 +461,21 @@ func Successor(prev, next *Head) error {
 		if o, ok := old[r.Key]; ok && o == r {
 			continue
 		}
-		if r.BaseRevision != prev.Revision {
+		if r.BaseRevision != prev.Revision && !prev.PendingObject(r) {
 			return fmt.Errorf("ref %s is neither carried over nor new at base %d", r.Key, prev.Revision)
 		}
 	}
 	return nil
+}
+
+// PendingObject reports whether r is an object of h's pending snapshot:
+// its attempt, produced under the revision that announced it (D35).
+func (h *Head) PendingObject(r Ref) bool {
+	if h.Pending == nil {
+		return false
+	}
+	base, attempt, _, err := ParseObjectKey(ObjectPrefix(h.Key, h.Incarnation), r.Key)
+	return err == nil && attempt == h.Pending.Attempt && base == h.Pending.Revision
 }
 
 // Object keys, relative to the namespace prefix.

@@ -286,14 +286,6 @@ func (s *spool) Write(p []byte) (int, error) {
 	return s.buf.Write(p)
 }
 
-// Bytes returns the content if it is in memory, else nil.
-func (s *spool) Bytes() []byte {
-	if s.f != nil {
-		return nil
-	}
-	return s.buf.Bytes()
-}
-
 func (s *spool) ReaderAt() io.ReaderAt {
 	if s.f != nil {
 		return s.f
@@ -919,7 +911,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		if t.Ref.Bytes <= head.InlineBytes && uploaded {
 			r := t.Ref
 			next.Tail = &head.Tail{SHA256: r.SHA256, Bytes: r.Bytes, MinSequence: r.MinSequence, MaxSequence: r.MaxSequence,
-				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbuf.Bytes()} // in memory: within spoolMemory
+				PreChecksum: r.PreChecksum, PostChecksum: r.PostChecksum, Data: tbuf.buf.Bytes()} // in memory: within spoolMemory
 		} else {
 			ref := placed(h, t.Ref)
 			next.Deltas, next.Tail, c.object = append(slices.Clip(h.Deltas), ref), nil, &ref

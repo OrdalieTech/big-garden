@@ -280,3 +280,49 @@ func (hw *hashWriter) Write(b []byte) (int, error) {
 	hw.n += int64(n)
 	return n, err
 }
+
+// CopyImage copies the published image (the main file) to dst. The caller
+// excludes checkpoints (the entity mutex); copy_file_range lets btrfs and
+// xfs share the extents instead of copying them (D35).
+func (d *DB) CopyImage(dst *os.File) (Image, error) {
+	src, err := os.OpenFile(d.path, os.O_RDONLY|NoFollow, 0)
+	if err != nil {
+		return Image{}, err
+	}
+	defer src.Close()
+	n := int64(d.pub.PageCount) * pageSize
+	if k, err := io.Copy(dst, io.LimitReader(src, n)); err != nil || k != n {
+		return Image{}, fmt.Errorf("engine: image copy of %d of %d bytes: %v", k, n, err)
+	}
+	return d.pub, nil
+}
+
+// SnapshotFile encodes the image img held by f (a CopyImage) as a snapshot
+// covering 1..img.Sequence, and checks it ends at img's checksum.
+func SnapshotFile(w io.Writer, f io.ReaderAt, img Image) (Object, error) {
+	e, err := newEncoder(w, img.PageCount, 1, img.Sequence, 0)
+	if err != nil {
+		return Object{}, err
+	}
+	buf, skipped := make([]byte, pageSize), uint32(0)
+	for p := uint32(1); p <= img.PageCount; p++ {
+		if p == ltx.LockPgno(pageSize) {
+			skipped++ // never written by SQLite, never encoded
+			continue
+		}
+		if _, err := f.ReadAt(buf, int64(p-1)*pageSize); err != nil {
+			return Object{}, err
+		}
+		if err := e.page(p, buf); err != nil {
+			return Object{}, err
+		}
+	}
+	o, err := e.close()
+	if err != nil {
+		return Object{}, err
+	}
+	if o.Pages += skipped; o.Ref.PostChecksum != img.Checksum {
+		return Object{}, fmt.Errorf("%w: the image copy does not end at its checksum", ErrCorrupt)
+	}
+	return o, nil
+}

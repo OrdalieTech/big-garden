@@ -24,7 +24,7 @@ import (
 func footprint(args []string) error {
 	fs := flag.NewFlagSet("footprint", flag.ContinueOnError)
 	maxFiles := fs.Int("max-production-files", 25, "")
-	maxLOC := fs.Int("max-production-loc", 6000, "")
+	maxLOC := fs.Int("max-production-loc", 6500, "") // 6,000, amended by DECISIONS D35
 	maxDirect := fs.Int("max-direct-modules", 5, "")
 	maxRuntime := fs.Int("max-runtime-modules", 30, "")
 	maxTypes := fs.Int("max-exported-types", 18, "")

@@ -793,7 +793,7 @@ The following is a budget, not permission to create empty files. Combine or spli
 | doc.go | Package contract/examples metadata | 60 |
 | **Total** | **25 production files** | **5,730** |
 
-The 270-line remainder is contingency, not an invitation to omit validation. At each milestone, print actual and projected totals. If correctness needs more than 6,000 lines, first remove a nonessential capability or duplication. If that is insufficient, submit an evidence-based budget amendment showing the invariant, tests and measured benefit. Do not compress unrelated logic onto one line, hide implementation in tests, or remove checks to satisfy a counter.
+The 270-line remainder is contingency, not an invitation to omit validation. At each milestone, print actual and projected totals. If correctness needs more than 6,000 lines (6,500 since DECISIONS D35), first remove a nonessential capability or duplication. If that is insufficient, submit an evidence-based budget amendment showing the invariant, tests and measured benefit. Do not compress unrelated logic onto one line, hide implementation in tests, or remove checks to satisfy a counter.
 
 File sizes above approximately 500 executable lines and functions above approximately 20 cyclomatic branches trigger review, not automated code contortions. An immutable protocol switch can justify complexity; a generalized repository/strategy framework cannot justify itself merely by being reusable.
 
@@ -1180,7 +1180,7 @@ go vet ./...
 go test -count=1 ./...
 
 go run ./internal/qual/cmd/qual footprint \
-  --max-production-files=25 --max-production-loc=6000 \
+  --max-production-files=25 --max-production-loc=6500 \
   --max-direct-modules=5 --max-runtime-modules=30 \
   --max-exported-types=18 --max-exported-callables=31 \
   --out=artifacts/footprint.json

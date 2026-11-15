@@ -60,10 +60,20 @@ func TestEntityAcrossLockPage(t *testing.T) {
 	}
 	fill("below", 1, 2000) // about 1,004 MiB: below the lock page
 	fill("across", 2001, 2200)
+	if _, err := a.Update(bg, ref, newReq(t, "rewrite", 1), func(tx *Tx) ([]byte, error) {
+		_, err := tx.Exec(bg, "UPDATE t SET v = zeroblob(1 << 18) WHERE id <= 300") // replay above the image: a snapshot is due
+		return nil, err
+	}); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	a.wg.Wait() // maintenance: an off-mutex snapshot from the image copy, across the lock page (D35)
+	if h, _ := headAt(t, mem, "big"); h.Pending != nil || h.Snapshot.MaxSequence < 3 {
+		t.Fatalf("maintenance left pending %v, snapshot to %d", h.Pending, h.Snapshot.MaxSequence)
+	}
 	if _, err := a.Snapshot(bg, ref); err != nil { // the whole image as one object
 		t.Fatalf("snapshot above 1 GiB: %v", err)
 	}
-	if rows, n := count(b, ref); rows != 2200 || n != 2200<<19 { // cold activation of the snapshot
+	if rows, n := count(b, ref); rows != 2200 || n != 1900<<19+300<<18 { // cold activation of the snapshot
 		t.Fatalf("b reads %d rows, %d bytes", rows, n)
 	}
 	if _, err := a.Update(bg, ref, newReq(t, "shrink", 1), func(tx *Tx) ([]byte, error) {
@@ -87,7 +97,7 @@ func TestEntityAcrossLockPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	if rows, n := count(a, dst); rows != 2200 || n != 2200<<19 {
+	if rows, n := count(a, dst); rows != 2200 || n != 1900<<19+300<<18 {
 		t.Fatalf("the import reads %d rows, %d bytes", rows, n)
 	}
 	t.Logf("peak RSS %s for a 1.1 GiB entity; archive %d bytes", peakRSS(), archive.Len())
