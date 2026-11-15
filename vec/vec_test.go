@@ -1,11 +1,13 @@
 package vec_test
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,7 +18,7 @@ import (
 
 var drivers atomic.Int64
 
-func open(t *testing.T) *sql.DB {
+func open(t testing.TB) *sql.DB {
 	t.Helper()
 	d := &sqlite.Driver{}
 	if err := vec.Register(d); err != nil {
@@ -131,5 +133,105 @@ func TestVolatileArgs(t *testing.T) {
 	var id int
 	if err := db.QueryRow("SELECT id FROM v ORDER BY vec_distance_l2(e, vec_f32('[41.2, 1]')) LIMIT 1").Scan(&id); err != nil || id != 41 {
 		t.Fatalf("nearest %d: %v", id, err)
+	}
+}
+
+// TestBinary checks vec_quantize_binary against the layout it promises,
+// vec_distance_hamming against a bit count, and their errors.
+func TestBinary(t *testing.T) {
+	db := open(t)
+	r := rand.New(rand.NewPCG(5, 6))
+	for _, dims := range []int{8, 64, 384, 1024} {
+		a, b := make([]float32, dims), make([]float32, dims)
+		for i := range dims {
+			a[i], b[i] = r.Float32()*2-1, r.Float32()*2-1
+		}
+		a[0] = 0 // zero is not above zero
+		var qa, qb []byte
+		var d int64
+		if err := db.QueryRow("SELECT vec_quantize_binary(?1), vec_quantize_binary(?2), vec_distance_hamming(vec_quantize_binary(?1), vec_quantize_binary(?2))",
+			blob(a), blob(b)).Scan(&qa, &qb, &d); err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		for i := range dims {
+			if (qa[i/8]>>(i%8)&1 == 1) != (a[i] > 0) || (qb[i/8]>>(i%8)&1 == 1) != (b[i] > 0) {
+				t.Fatalf("dims %d: bit %d does not say whether the element is above zero", dims, i)
+			}
+			if (a[i] > 0) != (b[i] > 0) {
+				want++
+			}
+		}
+		if len(qa) != dims/8 || int(d) != want || !bytes.Equal(qa, vec.Quantize(blob(a))) {
+			t.Fatalf("dims %d: %d bytes, hamming %d, want %d", dims, len(qa), d, want)
+		}
+	}
+	var n sql.NullInt64
+	if err := db.QueryRow("SELECT vec_distance_hamming(NULL, x'00')").Scan(&n); err != nil || n.Valid {
+		t.Fatalf("NULL: %v %v", n, err)
+	}
+	for _, q := range []string{"SELECT vec_quantize_binary(vec_f32('[1, 2, 3]'))", "SELECT vec_distance_hamming(x'00', x'0000')",
+		"SELECT vec_distance_hamming(x'', x'')", "SELECT vec_distance_hamming('ab', 'ab')"} {
+		var v any
+		if err := db.QueryRow(q).Scan(&v); err == nil {
+			t.Fatalf("%s: no error", q)
+		}
+	}
+}
+
+// TestNearest compares Nearest with a full sort of every slot's distance.
+func TestNearest(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 8))
+	for _, c := range []struct{ slots, size, k int }{{0, 8, 3}, {5, 8, 10}, {1000, 48, 10}, {1000, 1, 50}, {300, 16, 1}} {
+		packed := make([]byte, c.slots*c.size)
+		for i := range packed {
+			packed[i] = byte(r.Uint32())
+		}
+		q := make([]byte, c.size)
+		for i := range q {
+			q[i] = byte(r.Uint32())
+		}
+		type sd struct{ s, d int }
+		var all []sd
+		for s := range c.slots {
+			d := 0
+			for i := range c.size {
+				d += popcount(packed[s*c.size+i] ^ q[i])
+			}
+			all = append(all, sd{s, d})
+		}
+		sort.SliceStable(all, func(i, j int) bool { return all[i].d < all[j].d })
+		got := vec.Nearest(packed, q, c.k)
+		if len(got) != min(c.k, c.slots) {
+			t.Fatalf("%+v: %d slots", c, len(got))
+		}
+		for i, s := range got {
+			if s != all[i].s {
+				t.Fatalf("%+v: rank %d is slot %d, want %d", c, i, s, all[i].s)
+			}
+		}
+	}
+}
+
+func popcount(b byte) (n int) {
+	for ; b != 0; b &= b - 1 {
+		n++
+	}
+	return n
+}
+
+func BenchmarkDot384(b *testing.B) {
+	db := open(b)
+	x, y := make([]float32, 384), make([]float32, 384)
+	for i := range x {
+		x[i], y[i] = float32(i), float32(384-i)
+	}
+	st, err := db.Prepare("SELECT vec_dot(?, ?)")
+	if err != nil {
+		b.Fatal(err)
+	}
+	var d float64
+	for b.Loop() {
+		st.QueryRow(blob(x), blob(y)).Scan(&d)
 	}
 }

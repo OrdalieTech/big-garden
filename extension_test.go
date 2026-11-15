@@ -377,3 +377,170 @@ func BenchmarkKNN(b *testing.B) {
 		}
 	}
 }
+
+// twoStage is the two-stage search of D19 on one entity: items keep their
+// float32 vectors, chunks keep the binary quantizations of 1,024 items each
+// (48 bytes per 384-d vector, updated in place); a query scans every chunk
+// with vec.Nearest for r candidates and reranks them by cosine.
+type twoStage struct {
+	n    *Node
+	ref  Ref
+	dims int
+}
+
+const chunkSlots = 1024
+
+func newTwoStage(t testing.TB, rows, dims int, gen func(int) []float32) *twoStage {
+	t.Helper()
+	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "a", CacheDir: t.TempDir(), Extend: vec.Register,
+		Limits: Limits{EntityBytes: 512 << 20, Recoveries: 1, CommitTimeout: time.Minute, StorageAttemptTimeout: time.Minute}}
+	cfg, err := cfg.validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := open(bg, cfg, storetest.NewMem())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.Close(bg) })
+	id, _ := NewMutationID(time.Now())
+	ref, _, err := n.Create(bg, "v", Request{ID: id, Hash: [32]byte{1}, Schema: 1}, func(tx *Tx) ([]byte, error) {
+		_, err := tx.Exec(bg, `CREATE TABLE items(id INTEGER PRIMARY KEY, emb BLOB NOT NULL);
+			CREATE TABLE chunks(id INTEGER PRIMARY KEY, bits BLOB NOT NULL)`)
+		return nil, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	size := dims / 8
+	for start := 0; start < rows; start += 5000 {
+		id, _ := NewMutationID(time.Now())
+		if _, err := n.Update(bg, ref, Request{ID: id, Hash: [32]byte{byte(start / 5000), 2}, Schema: 1}, func(tx *Tx) ([]byte, error) {
+			for i := start; i < min(rows, start+5000); i++ {
+				v := f32blob(gen(i))
+				if _, err := tx.Exec(bg, `INSERT INTO items VALUES (?1, ?2);
+					INSERT OR IGNORE INTO chunks VALUES (?3, zeroblob(?4));
+					UPDATE chunks SET bits = CAST(substr(bits, 1, ?5) || vec_quantize_binary(?2) || substr(bits, ?5 + ?6 + 1) AS BLOB) WHERE id = ?3`,
+					i, v, i/chunkSlots, chunkSlots*size, i%chunkSlots*size, size); err != nil {
+					return nil, err
+				}
+			}
+			return nil, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n.wg.Wait()
+	return &twoStage{n, ref, dims}
+}
+
+func (s *twoStage) search(t testing.TB, q []float32, k, r int) []int64 {
+	var got []int64
+	if _, err := s.n.Read(bg, s.ref, 1, func(v *View) ([]byte, error) {
+		var packed []byte
+		var first []int64 // first slot's id of each chunk, in packed order
+		if err := v.Query(bg, "SELECT id, bits FROM chunks ORDER BY id", nil, func(rows *sql.Rows) error {
+			for rows.Next() {
+				var c int64
+				var b sql.RawBytes
+				if err := rows.Scan(&c, &b); err != nil {
+					return err
+				}
+				packed, first = append(packed, b...), append(first, c*chunkSlots)
+			}
+			return rows.Err()
+		}); err != nil {
+			return nil, err
+		}
+		qb := vec.Quantize(f32blob(q))
+		var cands []string
+		for _, slot := range vec.Nearest(packed, qb, r) {
+			cands = append(cands, fmt.Sprint(first[slot/chunkSlots]+int64(slot%chunkSlots)))
+		}
+		var err error
+		got, err = ints(v, "SELECT id FROM items WHERE id IN ("+strings.Join(cands, ",")+") ORDER BY vec_distance_cosine(emb, ?) LIMIT "+fmt.Sprint(k), f32blob(q))
+		return nil, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func (s *twoStage) brute(t testing.TB, q []float32, k int) []int64 {
+	var got []int64
+	if _, err := s.n.Read(bg, s.ref, 1, func(v *View) (_ []byte, err error) {
+		got, err = ints(v, "SELECT id FROM items ORDER BY vec_distance_cosine(emb, ?) LIMIT "+fmt.Sprint(k), f32blob(q))
+		return nil, err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// lowRank returns vectors of an intrinsic dimension 32 plus noise, closer to
+// real embeddings than uniform noise, on which no index works well.
+func lowRank(dims int, seed uint64) func(int) []float32 {
+	r := rand.New(rand.NewPCG(seed, 1))
+	basis := make([][]float32, 32)
+	for i := range basis {
+		basis[i] = make([]float32, dims)
+		for d := range basis[i] {
+			basis[i][d] = float32(r.NormFloat64())
+		}
+	}
+	return func(int) []float32 {
+		v := make([]float32, dims)
+		for i := range basis {
+			z := float32(r.NormFloat64())
+			for d := range v {
+				v[d] += z * basis[i][d]
+			}
+		}
+		for d := range v {
+			v[d] += 0.5 * float32(r.NormFloat64())
+		}
+		return v
+	}
+}
+
+// TestTwoStageKNN measures recall@10 of the two-stage search against the
+// exact scan on 30,000 low-rank 384-d vectors: at r = 500 candidates it must
+// find at least 95% of the exact neighbors.
+func TestTwoStageKNN(t *testing.T) {
+	gen := lowRank(384, 11)
+	s := newTwoStage(t, 30_000, 384, gen)
+	found, total := 0, 0
+	var tTwo, tBrute time.Duration
+	for range 20 {
+		q := gen(0)
+		t0 := time.Now()
+		exact := s.brute(t, q, 10)
+		t1 := time.Now()
+		got := s.search(t, q, 10, 500)
+		t2 := time.Now()
+		tBrute, tTwo = tBrute+t1.Sub(t0), tTwo+t2.Sub(t1)
+		for _, id := range got {
+			if slices.Contains(exact, id) {
+				found++
+			}
+		}
+		total += len(exact)
+	}
+	recall := float64(found) / float64(total)
+	t.Logf("recall@10 %.3f; %v per exact query, %v per two-stage query", recall, tBrute/20, tTwo/20)
+	if recall < 0.95 {
+		t.Fatalf("recall@10 %.3f below 0.95", recall)
+	}
+}
+
+// BenchmarkTwoStageKNN: the two-stage search at r = 500 on 100k low-rank
+// 384-d vectors, to compare with BenchmarkKNN.
+func BenchmarkTwoStageKNN(b *testing.B) {
+	gen := lowRank(384, 12)
+	s := newTwoStage(b, 100_000, 384, gen)
+	q := gen(0)
+	for b.Loop() {
+		s.search(b, q, 10, 500)
+	}
+	b.ReportMetric(float64(b.Elapsed().Microseconds())/1000/float64(b.N), "ms/query")
+}
