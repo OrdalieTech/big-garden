@@ -263,3 +263,36 @@ func TestRouterFiles(t *testing.T) {
 		t.Fatalf("a file handler without a file: %q, %v", res.Value, err)
 	}
 }
+
+// failingSeek seeks once, as the first attempt does, then fails.
+type failingSeek struct {
+	*bytes.Reader
+	seeks int
+}
+
+func (f *failingSeek) Seek(off int64, whence int) (int64, error) {
+	if f.seeks++; f.seeks > 1 {
+		return 0, errors.New("seek")
+	}
+	return f.Reader.Seek(off, whence)
+}
+
+// TestRouterFileLossIsUnknown: a file whose forward failed, and whose body
+// then cannot be read again, is still outcome_unknown for its ID.
+func TestRouterFileLossIsUnknown(t *testing.T) {
+	c := newCluster(t, "a", "b")
+	key := "k"
+	if _, _, err := c.routers["a"].Mutate(bg, Call{Op: "create", Key: key, Req: req(t, "create"), Create: true}); err != nil {
+		t.Fatal(err)
+	}
+	pref, _ := garden.Preferred(key, c.Members())
+	c.mu.Lock()
+	c.down[pref] = true
+	c.mu.Unlock()
+	r := req(t, "lost")
+	_, _, err := c.routers[map[string]string{"a": "b", "b": "a"}[pref]].MutateFile(bg, Call{Op: "incr", Key: key, Req: r}, &failingSeek{Reader: bytes.NewReader([]byte("x"))})
+	var ge *garden.Error
+	if !errors.As(err, &ge) || ge.Code != garden.CodeOutcomeUnknown || ge.Operation != r.ID {
+		t.Fatalf("got %v, want outcome_unknown for the request", err)
+	}
+}

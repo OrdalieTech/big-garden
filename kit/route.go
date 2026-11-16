@@ -22,7 +22,8 @@ type Membership interface{ Members() []string }
 type Transport interface {
 	Forward(ctx context.Context, node string, c Call) (Reply, error)
 	// ForwardFile is Forward of a Call carrying a file (Router.MutateFile):
-	// the receiving side calls Router.ServeFile with c and body.
+	// the receiving side calls Router.ServeFile with c and body. It must not
+	// close body, which the next attempt reads again from its start.
 	ForwardFile(ctx context.Context, node string, c Call, body io.Reader) (Reply, error)
 }
 
@@ -121,8 +122,8 @@ func (r *Router) mutate(ctx context.Context, c Call, body io.ReadSeeker) (garden
 		var rep Reply
 		var in io.Reader
 		if body != nil {
-			if _, err := body.Seek(0, io.SeekStart); err != nil {
-				return garden.Result{}, garden.Ref{}, err
+			if _, serr := body.Seek(0, io.SeekStart); serr != nil { // keeps an earlier outcome_unknown
+				return garden.Result{}, garden.Ref{}, errors.Join(err, serr)
 			}
 			in = body
 		}
