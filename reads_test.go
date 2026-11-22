@@ -972,3 +972,89 @@ func (s *headBlockingStore) Get(ctx context.Context, key, ifNoneMatch string, ma
 	}
 	return s.Store.Get(ctx, key, ifNoneMatch, max)
 }
+
+// TestReadStaleCrashSalvage verifies that when a follower process dies without
+// calling Close (as under SIGKILL or OOM), the restarted Node salvages every
+// settled database file from the dead session directory and serves them
+// immediately with zero object downloads from S3.
+func TestReadStaleCrashSalvage(t *testing.T) {
+	mem := storetest.NewMem()
+	writer := testNode(t, mem, "writer", func(l *Limits) {
+		l.EntityBytes, l.CacheBytes, l.Recoveries = 8<<20, 64<<20, 1
+	})
+	keys := []string{"sources/a", "sources/b", "index/c"}
+	for i, k := range keys {
+		if _, err := writer.Write(bg, k, 1, func(tx *Tx) error {
+			if _, err := tx.Exec(bg, "CREATE TABLE kv(k TEXT PRIMARY KEY, v INT)"); err != nil {
+				return err
+			}
+			_, err := tx.Exec(bg, "INSERT INTO kv VALUES('x', ?)", i+1)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cacheDir := t.TempDir()
+	openFollower := func() *Node {
+		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir,
+			Limits: Limits{EntityBytes: 8 << 20, CacheBytes: 64 << 20, Recoveries: 1,
+				StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
+		cfg, err := cfg.validate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := open(bg, cfg, mem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	const maxAge = 50 * time.Millisecond
+	f1 := openFollower()
+	for i, k := range keys {
+		var v int
+		if _, err := f1.ReadKey(bg, k, 1, 0, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='x'", nil, &v)
+		}); err != nil || v != i+1 {
+			t.Fatalf("initial read %s: v=%d err=%v", k, v, err)
+		}
+		// Serve at least one ReadStale so the read-only pool is opened too.
+		if _, err := f1.ReadKey(bg, k, 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='x'", nil, &v)
+		}); err != nil || v != i+1 {
+			t.Fatalf("stale read %s: v=%d err=%v", k, v, err)
+		}
+	}
+	// Simulate SIGKILL: release the session dir flock and stop sweeper WITHOUT calling Close/park.
+	close(f1.done)
+	f1.lock.Close()
+	f1.lock = nil
+
+	seq := lastSeq(mem)
+	f2 := openFollower()
+	defer f2.Close(bg)
+	if s := f2.Stats(); s.WarmEntities != int64(len(keys)) {
+		t.Fatalf("salvaged WarmEntities = %d, want %d", s.WarmEntities, len(keys))
+	}
+	for i, k := range keys {
+		var v int
+		t0 := time.Now()
+		res, err := f2.ReadKey(bg, k, 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='x'", nil, &v)
+		})
+		if err != nil || v != i+1 || res.Syncing {
+			t.Fatalf("post-crash read %s: v=%d res=%+v err=%v", k, v, res, err)
+		}
+		if elapsed := time.Since(t0); elapsed > 100*time.Millisecond {
+			t.Fatalf("post-crash read %s took %v", k, elapsed)
+		}
+	}
+	if gets := objectGets(mem, seq); gets != 0 {
+		t.Fatalf("post-crash restart downloaded %d objects, want 0", gets)
+	}
+	if s := f2.Stats(); s.WarmHits != uint64(len(keys)) || s.ActivationBytes != 0 {
+		t.Fatalf("post-crash stats = %+v, want WarmHits=%d ActivationBytes=0", s, len(keys))
+	}
+}

@@ -519,6 +519,7 @@ func (n *Node) attachWarm(ctx context.Context, e *entity, ref Ref) bool {
 	e.bytes.Store(db.Bytes())
 	e.touch()
 	e.rw.Unlock()
+	n.writeSidecar(e)
 	n.counters.warmHits.Add(1)
 	n.claimWarm(e.key, "")
 	return true
@@ -630,6 +631,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 		e.behindSince.Store(0)
 		e.setValid(issued)
 		e.rw.Unlock()
+		n.writeSidecar(e)
 		return nil
 	}
 	if oldDB != nil {
@@ -651,6 +653,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 				oerr = engine.CheckObjects(refs[i:], objs)
 			}
 			if oerr == nil {
+				n.removeSidecar(oldDB)
 				e.rw.Lock()
 				newPages, cerr := oldDB.CatchUp(ctx, n.maxPages(), cur, refs[i:], objs)
 				if cerr == nil {
@@ -666,6 +669,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 					n.counters.activations.Add(1)
 					n.counters.catchUps.Add(1)
 					e.rw.Unlock()
+					n.writeSidecar(e)
 					done()
 					<-n.recoveries
 					return nil
@@ -700,6 +704,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 	e.setValid(issued)
 	e.bytes.Store(db.Bytes())
 	e.rw.Unlock()
+	n.writeSidecar(e)
 	return nil
 }
 
@@ -1125,6 +1130,7 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 				e.mutating = false
 				e.rw.Unlock()
 			}()
+			n.removeSidecar(e.db)
 			floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
 			failpoint("sql.before")
 			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor), Fresh: n.fresh(e)},
@@ -1352,6 +1358,7 @@ func (n *Node) collect(e *entity) (batch []*waiter, err error) {
 			m.res, m.err = *cmp.Or(res, &Result{}), verdict
 			continue
 		}
+		n.removeSidecar(e.db)
 		var cb error
 		floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
 		result, seq, err := e.db.Mutate(engine.Commit{ID: head.OpID(m.req.ID), Bound: m.bound, Schema: m.req.Schema, FloorMs: uint64(floor), Fresh: n.fresh(e)},

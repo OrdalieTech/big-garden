@@ -108,10 +108,10 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 		return nil, err
 	}
 	n.self = head.Owner{Node: cfg.NodeID, Session: head.NewID()}
-	if err := n.sessionDir(); err != nil {
+	if err := n.warmIndex(); err != nil {
 		return nil, err
 	}
-	if err := n.warmIndex(); err != nil {
+	if err := n.sessionDir(); err != nil {
 		return nil, err
 	}
 	if err := n.openChunks(); err != nil {
@@ -309,9 +309,115 @@ func (n *Node) park(e *entity) {
 		e.clearLocked()
 		return
 	}
+	if n.cfg.Logger != nil {
+		n.cfg.Logger.Warn("garden: park failed", "key", e.key, "err", err)
+	}
 	os.Remove(name + ".db")
 	os.Remove(name + ".json")
 	e.discardLocked()
+}
+
+// writeSidecar atomically persists e's settled warm metadata next to e.db.Path()
+// so a subsequent process can salvage the database file even after SIGKILL or crash.
+// Caller holds e.mu.
+func (n *Node) writeSidecar(e *entity) {
+	e.rw.RLock()
+	if e.db == nil || e.h == nil || e.unresolved != nil || e.db.Published() != imageOf(e.h) {
+		e.rw.RUnlock()
+		return
+	}
+	path := e.db.Path()
+	h := *e.h
+	refs := links(e.h)
+	w := warmFile{Key: e.key, Head: &h, ETag: e.etag, Image: imageOf(e.h), Pages: map[head.Digest]uint32{}, used: e.lastUsed()}
+	if len(e.pages) == len(refs) {
+		for i, r := range refs {
+			w.Pages[r.SHA256] = e.pages[i]
+		}
+	}
+	e.rw.RUnlock()
+	b, err := json.Marshal(w)
+	if err != nil {
+		return
+	}
+	tmp := path + ".warm.tmp"
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		if os.Rename(tmp, path+".warm.json") != nil {
+			os.Remove(tmp)
+		}
+	}
+}
+
+// removeSidecar deletes the crash-salvage sidecar before in-place file modification.
+func (n *Node) removeSidecar(db *engine.DB) {
+	if db != nil {
+		os.Remove(db.Path() + ".warm.json")
+	}
+}
+
+// salvageSession rescues settled database files (those with a valid .warm.json
+// sidecar and no non-empty WAL) from a dead session directory into n.warmDir
+// before the old session directory is removed.
+func (n *Node) salvageSession(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, d := range entries {
+		if !strings.HasSuffix(d.Name(), ".db.warm.json") {
+			continue
+		}
+		jsonPath := filepath.Join(dir, d.Name())
+		dbPath := strings.TrimSuffix(jsonPath, ".warm.json")
+		b, err := os.ReadFile(jsonPath)
+		if err != nil {
+			continue
+		}
+		var w warmFile
+		if json.Unmarshal(b, &w) != nil || w.Key == "" || w.Head == nil ||
+			w.Head.Namespace != n.ns || w.Head.Key != w.Key || w.Head.Deleted ||
+			head.ValidKey(w.Key) != nil || w.Head.Validate() != nil {
+			continue
+		}
+		st, err := os.Lstat(dbPath)
+		if err != nil || !st.Mode().IsRegular() || st.Size() != int64(w.Head.PageCount)*head.PageSize {
+			continue
+		}
+		if wst, werr := os.Stat(dbPath + "-wal"); werr == nil && wst.Size() > 0 {
+			continue // uncheckpointed WAL from a crash mid-mutation: never salvage
+		}
+		hash := filepath.Base(head.EntityDir(w.Key))
+		dst := filepath.Join(n.warmDir, hash)
+		n.wmu.Lock()
+		prev, exists := n.warm[hash]
+		if exists && prev.Head != nil && prev.Head.Incarnation == w.Head.Incarnation && prev.Head.Revision >= w.Head.Revision {
+			n.wmu.Unlock()
+			continue
+		}
+		if err := os.Rename(dbPath, dst+".db"); err != nil {
+			n.wmu.Unlock()
+			continue
+		}
+		if err := os.Rename(jsonPath, dst+".json"); err != nil {
+			if os.WriteFile(dst+".json", b, 0o600) != nil {
+				os.Remove(dst + ".db")
+				n.wmu.Unlock()
+				continue
+			}
+		}
+		w.bytes, w.used = st.Size()+int64(len(b)), st.ModTime()
+		n.warmPut(hash, w)
+		n.wmu.Unlock()
+		n.setRef(w.Key, Ref{Key: w.Key, Incarnation: w.Head.Incarnation})
+	}
+}
+
+// warmSize returns the warm-tier bytes held for key (0 if absent).
+func (n *Node) warmSize(key string) int64 {
+	hash := filepath.Base(head.EntityDir(key))
+	n.wmu.Lock()
+	defer n.wmu.Unlock()
+	return n.warm[hash].bytes
 }
 
 // hasWarmHead reports whether key has a warm-tier file whose recorded head
@@ -496,6 +602,7 @@ func (n *Node) sessionDir() error {
 		}
 		path := filepath.Join(n.cfg.CacheDir, d.Name())
 		if f, ok := lockDir(path, 0); ok {
+			n.salvageSession(path)
 			os.RemoveAll(path)
 			f.Close()
 		}
@@ -623,9 +730,10 @@ func (n *Node) cacheFor(ctx context.Context, e *entity, need int64) error {
 func (n *Node) fitFor(self *entity, need int64) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	selfWarm := n.warmSize(self.key)
 	for {
 		_, used, lru := n.scan(time.Time{}, self)
-		if n.reserved+used+n.warmBytes()+n.staging.Load()+need <= n.cfg.Limits.CacheBytes {
+		if n.reserved+used+n.warmBytes()-selfWarm+n.staging.Load()+need <= n.cfg.Limits.CacheBytes {
 			n.reserved += need
 			return true
 		}
@@ -707,7 +815,9 @@ func (n *Node) Close(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.lock != nil {
-		os.RemoveAll(n.dir)
+		if !unknown {
+			os.RemoveAll(n.dir)
+		}
 		n.lock.Close()
 		n.lock = nil
 	}

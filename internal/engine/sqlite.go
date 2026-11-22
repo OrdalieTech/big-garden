@@ -348,6 +348,9 @@ func (d *DB) setup(maxPages uint32) error {
 	return d.setMode(library)
 }
 
+// Path returns the filesystem path of the main SQLite database file.
+func (d *DB) Path() string { return d.path }
+
 // Published returns the image of the main file: the last checkpointed state.
 func (d *DB) Published() Image { return d.pub }
 
@@ -884,7 +887,7 @@ func withCleanup(err error, cleanup ...error) error {
 
 func removeFiles(path string) error {
 	var errs []error
-	for _, s := range []string{"", "-wal", "-shm"} {
+	for _, s := range []string{"", "-wal", "-shm", ".warm.json", ".warm.tmp"} {
 		if err := os.Remove(path + s); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}

@@ -322,6 +322,7 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string, issu
 	}
 	e.rw.Unlock()
 	if e.db != nil {
+		n.writeSidecar(e)
 		n.trimCache(e, min(n.cfg.Limits.EntityBytes, 1<<20))
 	}
 }
@@ -456,6 +457,7 @@ func (n *Node) activateMode(ctx context.Context, e *entity, h *head.Head, etag s
 	}
 	e.bytes.Store(db.Bytes())
 	e.rw.Unlock()
+	n.writeSidecar(e)
 	return nil
 }
 
