@@ -117,6 +117,7 @@ type Route struct {
 	Owner		Owner
 	Epoch		uint64
 	Revision	uint64
+	Bytes		int64
 }
 type Stats struct {
 	Reads, Mutations, Commits, Replays, Expired, Conflicts		uint64

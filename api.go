@@ -33,6 +33,7 @@ type Route struct {
 	Owner    Owner // zero Owner means unowned, not nonexistent
 	Epoch    uint64
 	Revision uint64
+	Bytes    int64 // logical database size in bytes (PageCount * PageSize)
 }
 
 // MutationID is 8-byte big-endian Unix ms + 16 cryptographic random bytes.

@@ -192,7 +192,7 @@ func (n *Node) decodeHead(b []byte, key string, inc head.ID) (*head.Head, error)
 }
 
 func routeOf(h *head.Head) *Route {
-	r := &Route{Ref: Ref{Key: h.Key, Incarnation: h.Incarnation}, Epoch: h.Epoch, Revision: h.Revision}
+	r := &Route{Ref: Ref{Key: h.Key, Incarnation: h.Incarnation}, Epoch: h.Epoch, Revision: h.Revision, Bytes: int64(h.PageCount) * head.PageSize}
 	if h.Owner != nil {
 		r.Owner = Owner{NodeID: h.Owner.Node, Session: h.Owner.Session}
 	}
