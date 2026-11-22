@@ -15,7 +15,9 @@ import (
 // pages) are fixed and not configurable here. Defaults [bounds]:
 //
 //	EntityBytes            64 MiB [4 KiB..16 TiB]   database size (qualified sizes: DECISIONS D34)
-//	CacheBytes             8 GiB  local cache; >= Recoveries*(4*EntityBytes+1 MiB)
+//	CacheBytes             8 GiB  local cache; >= Recoveries*(EntityBytes+1 MiB)
+//	SQLiteCacheBytes       0      per-connection SQLite page cache (0: 1 MiB)
+//	MmapBytes              0      read-only connection mmap size (0: disabled)
 //	ResultBytes            4 KiB [..64 KiB]         a stored result (receipt) of Create, Update, Migrate, Import
 //	ResidentEntities       256                      open entities
 //	InflightStorage        64                       concurrent storage requests
@@ -28,6 +30,7 @@ import (
 //	ReceiptRetention       1h [1h..720h]            receipts kept; older IDs get id_expired
 type Limits struct {
 	EntityBytes, CacheBytes                        int64
+	SQLiteCacheBytes, MmapBytes                    int64
 	ResultBytes, ResidentEntities, InflightStorage int
 	PendingPerEntity, Recoveries, BatchMax         int
 	StorageAttemptTimeout, CommitTimeout           time.Duration
@@ -44,7 +47,7 @@ const (
 
 // resolve returns l with defaults applied, or an invalid_argument Error.
 func (l Limits) resolve() (Limits, error) {
-	for _, v := range []int64{l.EntityBytes, l.CacheBytes, int64(l.StorageAttemptTimeout),
+	for _, v := range []int64{l.EntityBytes, l.CacheBytes, l.SQLiteCacheBytes, l.MmapBytes, int64(l.StorageAttemptTimeout),
 		int64(l.CommitTimeout), int64(l.IdleTimeout), int64(l.ReceiptRetention)} {
 		if v < 0 {
 			return l, invalid("limits must not be negative")
@@ -78,7 +81,7 @@ func (l Limits) resolve() (Limits, error) {
 		return l, invalid("CommitTimeout must be at least StorageAttemptTimeout")
 	case l.ReceiptRetention < time.Hour || l.ReceiptRetention > 720*time.Hour:
 		return l, invalid("ReceiptRetention must be within 1h..720h")
-	case l.CacheBytes/int64(l.Recoveries) < 4*l.EntityBytes+1<<20: // buildBytes: database + download + deltas below 2x live (§9.1)
+	case l.CacheBytes/int64(l.Recoveries) < l.EntityBytes+1<<20:
 		return l, invalid("CacheBytes cannot hold Recoveries concurrent activations of EntityBytes")
 	}
 	return l, nil

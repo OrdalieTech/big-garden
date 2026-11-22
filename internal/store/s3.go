@@ -130,11 +130,11 @@ func (s *S3) get(ctx context.Context, key, ifNoneMatch string, max int64) (Objec
 	body, err := io.ReadAll(io.LimitReader(out.Body, max+1))
 	switch {
 	case err != nil: // truncated body, checksum mismatch, deadline
-		return Object{}, s.done(opGet, 0, len(body), &Error{Outcome: Unknown, Op: "get", Key: key, Err: err})
+		return Object{}, s.done(opGet, 0, int64(len(body)), &Error{Outcome: Unknown, Op: "get", Key: key, Err: err})
 	case int64(len(body)) != *out.ContentLength:
-		return Object{}, s.done(opGet, 0, len(body), failed("get", key, Unknown, "body length differs from Content-Length"))
+		return Object{}, s.done(opGet, 0, int64(len(body)), failed("get", key, Unknown, "body length differs from Content-Length"))
 	}
-	return Object{Body: body, ETag: *out.ETag}, s.done(opGet, 0, len(body), nil)
+	return Object{Body: body, ETag: *out.ETag}, s.done(opGet, 0, int64(len(body)), nil)
 }
 
 func (s *S3) PutImmutable(ctx context.Context, key string, body []byte) error {
@@ -175,9 +175,9 @@ func (s *S3) put(ctx context.Context, op, key string, body []byte, ifMatch strin
 		s.cas[2].Add(1)
 	}
 	if err != nil {
-		return "", s.done(opPut, len(body), 0, err)
+		return "", s.done(opPut, int64(len(body)), 0, err)
 	}
-	return aws.ToString(out.ETag), s.done(opPut, len(body), 0, nil)
+	return aws.ToString(out.ETag), s.done(opPut, int64(len(body)), 0, nil)
 }
 
 func (s *S3) List(ctx context.Context, prefix, after string, limit int) ([]Entry, bool, error) {
@@ -227,7 +227,7 @@ func (s *S3) Delete(ctx context.Context, key string) error {
 }
 
 // done counts one physical attempt and returns err.
-func (s *S3) done(op, up, down int, err error) error {
+func (s *S3) done(op int, up, down int64, err error) error {
 	n := &s.n[op]
 	n.attempts.Add(1)
 	n.up.Add(uint64(up))
@@ -303,6 +303,18 @@ func (s *S3) sized(ctx context.Context, n int64) (context.Context, context.Cance
 // minRate is the slowest transfer an attempt tolerates, in bytes per second.
 const minRate = 256 << 10
 
+// partSizeFor picks a multipart part size at least PartBytes that keeps the
+// part count at or below 500 (well under S3 providers' 1,000-part limit for
+// multi-GiB objects).
+func partSizeFor(size int64) int64 {
+	const maxParts = 500
+	part := int64(PartBytes)
+	if minPart := (size + maxParts - 1) / maxParts; minPart > part {
+		part = (minPart + (1 << 20) - 1) &^ ((1 << 20) - 1)
+	}
+	return part
+}
+
 func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int64, sum [32]byte) error {
 	k := aws.String(s.prefix + key)
 	if size <= PartBytes {
@@ -311,7 +323,7 @@ func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int
 			defer cancel()
 			_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: k, Body: io.NewSectionReader(body, 0, size),
 				ContentLength: aws.Int64(size), ChecksumSHA256: b64(sum[:]), IfNoneMatch: aws.String("*")}, s.once)
-			return s.done(opPut, int(size), 0, classify("put", key, err))
+			return s.done(opPut, size, 0, classify("put", key, err))
 		})
 	}
 	var up *s3.CreateMultipartUploadOutput
@@ -328,15 +340,16 @@ func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int
 			s.client.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{Bucket: &s.bucket, Key: k, UploadId: up.UploadId})
 		}
 	}()
-	parts := make([]types.CompletedPart, (size+PartBytes-1)/PartBytes)
+	partSize := partSizeFor(size)
+	parts := make([]types.CompletedPart, (size+partSize-1)/partSize)
 	errs := make([]error, len(parts))
 	sem, wg := make(chan struct{}, 4), sync.WaitGroup{}
 	for i := range parts {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			off := int64(i) * PartBytes
-			part := io.NewSectionReader(body, off, min(PartBytes, size-off))
+			off := int64(i) * partSize
+			part := io.NewSectionReader(body, off, min(partSize, size-off))
 			h := sha256.New()
 			if _, errs[i] = io.Copy(h, part); errs[i] != nil {
 				return
@@ -350,7 +363,7 @@ func (s *S3) PutFile(ctx context.Context, key string, body io.ReaderAt, size int
 				if err == nil {
 					parts[i] = types.CompletedPart{ETag: out.ETag, PartNumber: aws.Int32(int32(i + 1)), ChecksumSHA256: out.ChecksumSHA256}
 				}
-				return s.done(opPut, int(part.Size()), 0, classify("put", key, err))
+				return s.done(opPut, part.Size(), 0, classify("put", key, err))
 			})
 		})
 	}
@@ -389,7 +402,7 @@ func (s *S3) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser,
 		if err != nil {
 			cancel()
 		}
-		return s.done(opGet, 0, int(n), classify("get", key, err))
+		return s.done(opGet, 0, n, classify("get", key, err))
 	})
 	if err != nil {
 		return nil, err

@@ -366,3 +366,148 @@ func TestHundredReaders(t *testing.T) {
 		t.Fatalf("%d read rejections, %d head GETs", s.ReadRejections, headGets(st, "k", from))
 	}
 }
+
+// TestReadStaleConcurrentAndCatchUp (D40): 8 concurrent ReadStale callers on a
+// follower read without waiting on S3 while fresh, never observe failed or
+// mixed reads across owner updates and snapshots, catch up in place by
+// downloading only changed LTX deltas, and recover cleanly after cache loss.
+func TestReadStaleConcurrentAndCatchUp(t *testing.T) {
+	st := newStore(t)
+	owner := testNode(t, st, "owner", nil)
+	dir := t.TempDir()
+	follower := warmNode(t, st, "follower", dir, func(l *Limits) {
+		l.SQLiteCacheBytes = 4 << 20
+		l.MmapBytes = 16 << 20
+	})
+	ref, _, err := owner.Create(bg, "big", newReq(t, "c0", 1), func(tx *Tx) ([]byte, error) {
+		if _, err := tx.Exec(bg, "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT, gen INTEGER NOT NULL)"); err != nil {
+			return nil, err
+		}
+		stmt, err := tx.Prepare(bg, "INSERT INTO kv(k, v, gen) VALUES (?, ?, 0)")
+		if err != nil {
+			return nil, err
+		}
+		for i := range 400 {
+			if _, err := stmt.Exec(bg, fmt.Sprintf("k%04d", i), randText(512)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, stmt.Close()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readConsistent := func(n *Node, maxAge time.Duration) (int, uint64, error) {
+		var minGen, maxGen int
+		res, err := n.ReadStale(bg, ref, 1, maxAge, func(v *View) ([]byte, error) {
+			return nil, v.Query(bg, "SELECT MIN(gen), MAX(gen) FROM kv WHERE k < 'k0020'", nil, func(r *sql.Rows) error {
+				if r.Next() {
+					return r.Scan(&minGen, &maxGen)
+				}
+				return r.Err()
+			})
+		})
+		if err != nil {
+			return 0, 0, err
+		}
+		if minGen != maxGen {
+			return 0, res.Version.Sequence, fmt.Errorf("mixed read: minGen=%d maxGen=%d at seq %d", minGen, maxGen, res.Version.Sequence)
+		}
+		return minGen, res.Version.Sequence, nil
+	}
+	// Cold activation on follower.
+	gen, seq0, err := readConsistent(follower, 200*time.Millisecond)
+	if err != nil || gen != 0 {
+		t.Fatalf("initial ReadStale: gen=%d seq=%d err=%v", gen, seq0, err)
+	}
+	// Fresh reads make zero S3 requests.
+	from := len(st.Journal())
+	for range 16 {
+		if g, _, err := readConsistent(follower, time.Hour); err != nil || g != 0 {
+			t.Fatalf("fresh ReadStale: gen=%d err=%v", g, err)
+		}
+	}
+	if gets := headGets(st, "big", from); gets != 0 {
+		t.Fatalf("fresh ReadStale made %d head GETs, want 0", gets)
+	}
+	// 8 concurrent readers while owner performs 12 updates (including a snapshot).
+	stop := make(chan struct{})
+	var readCount atomic.Int64
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			var lastSeq uint64
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, seq, err := readConsistent(follower, 40*time.Millisecond)
+				if err != nil {
+					t.Errorf("concurrent ReadStale: %v", err)
+					return
+				}
+				if seq < lastSeq {
+					t.Errorf("ReadStale sequence went backwards: %d < %d", seq, lastSeq)
+					return
+				}
+				lastSeq = seq
+				readCount.Add(1)
+			}
+		})
+	}
+	actBytesBefore := follower.Stats().ActivationBytes
+	for g := 1; g <= 12; g++ {
+		if _, err := owner.Update(bg, ref, newReq(t, fmt.Sprintf("u%d", g), 1), func(tx *Tx) ([]byte, error) {
+			_, err := tx.Exec(bg, "UPDATE kv SET gen = ? WHERE k < 'k0020'", g)
+			return nil, err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if g == 6 {
+			if _, err := owner.Snapshot(bg, ref); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	// Wait for follower to observe gen=12 within bounded staleness.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		g, _, err := readConsistent(follower, 40*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g == 12 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("follower stayed at gen=%d, want 12", g)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	if readCount.Load() == 0 {
+		t.Fatal("no concurrent reads completed")
+	}
+	// In-place catch-up downloaded deltas, far less than 12 full snapshots.
+	h, _ := headAt(t, st, "big")
+	fullSize := uint64(h.PageCount) * head.PageSize
+	deltaBytes := follower.Stats().ActivationBytes - actBytesBefore
+	if deltaBytes >= 3*fullSize {
+		t.Fatalf("catch-up downloaded %d bytes across 12 small updates (db size %d)", deltaBytes, fullSize)
+	}
+	if follower.Stats().CatchUps == 0 {
+		t.Fatalf("want CatchUps > 0, got %+v", follower.Stats())
+	}
+	// Reopen on empty cache dir: follower recovers from S3 on its own.
+	if err := follower.Close(bg); err != nil {
+		t.Fatal(err)
+	}
+	fresh := warmNode(t, st, "follower2", t.TempDir(), nil)
+	if g, _, err := readConsistent(fresh, time.Second); err != nil || g != 12 {
+		t.Fatalf("fresh follower after cache wipe: gen=%d err=%v", g, err)
+	}
+}

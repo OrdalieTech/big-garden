@@ -89,6 +89,7 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {
 		return nil, invalid("Config.Extend: " + err.Error())
 	}
+	n.drv.SetOptions(engine.Options{CacheBytes: cfg.Limits.SQLiteCacheBytes, MmapBytes: cfg.Limits.MmapBytes})
 	if err := n.namespace(ctx); err != nil {
 		return nil, err
 	}
@@ -190,13 +191,13 @@ func (n *Node) scan(cutoff time.Time, self *entity) (resident int, used int64, l
 			}
 			continue
 		}
-		if e.db != nil && e.unresolved == nil && e.used.Before(cutoff) {
+		if e.refs == 0 && e.db != nil && e.unresolved == nil && e.lastUsed().Before(cutoff) {
 			n.park(e)
 		}
 		if e.db != nil { // its bytes as of its last publication (entity.go): no stat per resident under n.mu
 			resident, used = resident+1, used+e.bytes.Load()
-			if e.unresolved == nil && (lru == nil || e.used.Before(at)) {
-				lru, at = e, e.used
+			if e.refs == 0 && e.unresolved == nil && (lru == nil || e.lastUsed().Before(at)) {
+				lru, at = e, e.lastUsed()
 			}
 		}
 		n.forget(e)
@@ -211,7 +212,7 @@ func (n *Node) shed(lru *entity) bool {
 		return false
 	}
 	defer lru.mu.Unlock()
-	if lru.db == nil || lru.unresolved != nil {
+	if lru.refs != 0 || lru.db == nil || lru.unresolved != nil {
 		return false
 	}
 	n.park(lru)
@@ -258,14 +259,18 @@ func (n *Node) warmIndex() error {
 // e keeps nothing. Anything unsettled, or any failure, deletes the file as
 // discard does.
 func (n *Node) park(e *entity) {
-	if e.db == nil || e.h == nil || e.unresolved != nil || e.db.Published() != imageOf(e.h) || len(e.pages) != len(links(e.h)) {
-		e.discard()
+	e.rw.Lock()
+	defer e.rw.Unlock()
+	if e.db == nil || e.h == nil || e.unresolved != nil || e.db.Published() != imageOf(e.h) {
+		e.discardLocked()
 		return
 	}
 	refs := links(e.h)
-	w := warmFile{Image: imageOf(e.h), Pages: map[head.Digest]uint32{}, used: e.used}
-	for i, r := range refs {
-		w.Pages[r.SHA256] = e.pages[i]
+	w := warmFile{Image: imageOf(e.h), Pages: map[head.Digest]uint32{}, used: e.lastUsed()}
+	if len(e.pages) == len(refs) {
+		for i, r := range refs {
+			w.Pages[r.SHA256] = e.pages[i]
+		}
 	}
 	b, _ := json.Marshal(w)
 	hash := filepath.Base(head.EntityDir(e.key))
@@ -282,12 +287,12 @@ func (n *Node) park(e *entity) {
 		w.bytes = size + int64(len(b)) // the hint counts too: 100,000 of them are megabytes
 		os.Chtimes(name+".db", w.used, w.used)
 		n.warmPut(hash, w)
-		e.clear()
+		e.clearLocked()
 		return
 	}
 	os.Remove(name + ".db")
 	os.Remove(name + ".json")
-	e.discard()
+	e.discardLocked()
 }
 
 // claimWarm moves key's warm file, if any, to path and returns its hint;
@@ -534,19 +539,33 @@ func (n *Node) isClosed() bool {
 	return n.closed
 }
 
-// buildBytes is the cache reserve of one activation or genesis build.
-func (n *Node) buildBytes() int64 { return 4*n.cfg.Limits.EntityBytes + 1<<20 }
+// buildBytes is the cache reserve of one genesis build.
+func (n *Node) buildBytes() int64 { return n.cfg.Limits.EntityBytes + 1<<20 }
+
+// activationBytes is the cache reserve of activating h: its live database
+// file plus the encoded links it may download, plus 1 MiB headroom.
+func (n *Node) activationBytes(h *head.Head) int64 {
+	need := int64(h.PageCount)*head.PageSize + 1<<20
+	for _, r := range links(h) {
+		need += int64(r.Bytes)
+	}
+	return need
+}
 
 // cache makes room for e to become resident and reserves buildBytes for
 // building its file (PROTOCOL §4 step 1, §7 cache policy); the caller
 // releases the reserve with unreserve once the file is built.
 func (n *Node) cache(ctx context.Context, e *entity) error {
+	return n.cacheFor(ctx, e, n.buildBytes())
+}
+
+func (n *Node) cacheFor(ctx context.Context, e *entity, need int64) error {
 	for i := 0; !n.room(e); i++ { // wait briefly while every resident entity is busy
 		if i == 100 || pause(ctx, 10*time.Millisecond) != nil {
 			return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
 		}
 	}
-	for i := 0; !n.fit(e); i++ { // wait briefly for pinned entities
+	for i := 0; !n.fitFor(e, need); i++ { // wait briefly for pinned entities
 		if i == 100 || pause(ctx, 10*time.Millisecond) != nil {
 			n.mu.Lock()
 			e.building = false
@@ -557,20 +576,20 @@ func (n *Node) cache(ctx context.Context, e *entity) error {
 	return nil
 }
 
-// fit reserves buildBytes for self if it fits in CacheBytes beside the other
+// fitFor reserves need bytes for self if it fits in CacheBytes beside the other
 // reserves, the files of the other resident entities, the warm tier and the
 // spools of objects and blobs in flight (D37),
 // deleting warm files then parking idle, settled entities, least recently
 // used first, until it does. A busy
 // entity is pinned and counts with its last seen size. It never blocks on an
 // entity mutex.
-func (n *Node) fit(self *entity) bool {
+func (n *Node) fitFor(self *entity, need int64) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for {
 		_, used, lru := n.scan(time.Time{}, self)
-		if n.reserved+used+n.warmBytes()+n.staging.Load()+n.buildBytes() <= n.cfg.Limits.CacheBytes {
-			n.reserved += n.buildBytes()
+		if n.reserved+used+n.warmBytes()+n.staging.Load()+need <= n.cfg.Limits.CacheBytes {
+			n.reserved += need
 			return true
 		}
 		if !n.evictWarm(self.key) && !n.shed(lru) {
@@ -579,9 +598,37 @@ func (n *Node) fit(self *entity) bool {
 	}
 }
 
-func (n *Node) unreserve(e *entity) {
+// trimCache evicts warm files and parks idle resident entities (other than
+// self) until accounted cache bytes plus headroom fit within CacheBytes.
+func (n *Node) trimCache(self *entity, headroom int64) {
 	n.mu.Lock()
-	n.reserved -= n.buildBytes()
+	defer n.mu.Unlock()
+	for {
+		_, used, lru := n.scan(time.Time{}, self)
+		if self != nil {
+			used += self.bytes.Load()
+		}
+		if n.reserved+used+n.warmBytes()+n.staging.Load()+headroom <= n.cfg.Limits.CacheBytes {
+			return
+		}
+		if !n.evictWarm(selfKey(self)) && !n.shed(lru) {
+			return
+		}
+	}
+}
+
+func selfKey(e *entity) string {
+	if e == nil {
+		return ""
+	}
+	return e.key
+}
+
+func (n *Node) unreserve(e *entity) { n.unreserveFor(e, n.buildBytes()) }
+
+func (n *Node) unreserveFor(e *entity, need int64) {
+	n.mu.Lock()
+	n.reserved -= need
 	e.building = false
 	n.mu.Unlock()
 }

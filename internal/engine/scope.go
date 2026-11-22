@@ -27,8 +27,10 @@ const (
 // commit on its own (for instance in autocommit after SQLite rolled back the
 // library transaction). Re-registering the authorizer expires every prepared
 // statement, so nothing prepared under one mode runs under another.
-func (d *DB) setMode(m mode) error {
-	return d.conn.Raw(func(dc any) error {
+func (d *DB) setMode(m mode) error { return setConnMode(d.conn, m, d.modules) }
+
+func setConnMode(conn *sql.Conn, m mode, modules map[string]bool) error {
+	return conn.Raw(func(dc any) error {
 		c, ok := dc.(interface {
 			sqlite.AuthorizerRegisterer
 			sqlite.HookRegisterer
@@ -41,7 +43,7 @@ func (d *DB) setMode(m mode) error {
 		} else {
 			c.RegisterCommitHook(func() int32 { return 1 })
 		}
-		return c.RegisterAuthorizer(policy(m, d.modules))
+		return c.RegisterAuthorizer(policy(m, modules))
 	})
 }
 
@@ -76,12 +78,13 @@ func reserved(name string) bool {
 }
 
 // policy is the authorizer of mode m. Application modes allow an explicit
-// list of actions on the main database and deny everything else: transaction
-// control, ATTACH/DETACH, pragmas other than introspection, temporary
-// objects, virtual tables of modules outside modules, extension loading,
-// reserved objects and unknown actions. Statements a virtual table runs on
-// its shadow tables are authorized like application statements; defensive
-// mode keeps the shadow tables read-only to application SQL (DECISIONS D19).
+// list of actions on the main database (and connection-local temp tables,
+// indexes, views and triggers in mutation mode, dropped at the end of every
+// mutation) and deny everything else: transaction control, ATTACH/DETACH,
+// pragmas other than introspection, virtual tables of modules outside modules,
+// extension loading, reserved objects and unknown actions. Statements a virtual
+// table runs on its shadow tables are authorized like application statements;
+// defensive mode keeps the shadow tables read-only to application SQL (DECISIONS D19).
 func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 	if m == library {
 		return func(sqlite.AuthorizerActionCode, string, string, string, string) sqlite.AuthorizerReturnCode {
@@ -89,9 +92,6 @@ func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 		}
 	}
 	return func(a sqlite.AuthorizerActionCode, arg1, arg2, db, _ string) sqlite.AuthorizerReturnCode {
-		// ALTER TABLE ... RENAME rewrites the temp schema too, which stays
-		// empty: temporary objects are denied.
-		tempSchema := db == "temp" && arg1 == "sqlite_temp_master" && (a == sqlite.AuthRead || a == sqlite.AuthUpdate)
 		if a == sqlite.AuthAlterTable { // arg1 is the database; DROP COLUMN passes the column as db
 			db = arg1
 		}
@@ -101,7 +101,7 @@ func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 		if a == sqlite.AuthRead && strings.EqualFold(arg1, "_state_blobs") && (db == "" || db == "main") {
 			return sqlite.AuthorizerOK // readable, never writable (D33)
 		}
-		if (db != "" && db != "main" && !tempSchema) || reserved(arg1) {
+		if (db != "" && db != "main" && !(db == "temp" && m == mutation)) || reserved(arg1) {
 			return sqlite.AuthorizerDeny
 		}
 		switch a {
@@ -114,11 +114,14 @@ func policy(m mode, modules map[string]bool) sqlite.AuthorizerFn {
 		case sqlite.AuthInsert, sqlite.AuthUpdate, sqlite.AuthDelete:
 			return allow(m == mutation || rtreeShadow(arg1)) // read mode runs with query_only=ON
 		case sqlite.AuthCreateTable, sqlite.AuthCreateView,
-			sqlite.AuthDropTable, sqlite.AuthDropView, sqlite.AuthReindex: // CREATE INDEX authorizes a REINDEX
+			sqlite.AuthDropTable, sqlite.AuthDropView, sqlite.AuthReindex,
+			sqlite.AuthCreateTempTable, sqlite.AuthCreateTempView,
+			sqlite.AuthDropTempTable, sqlite.AuthDropTempView:
 			return allow(m == mutation)
-		case sqlite.AuthCreateVTable, sqlite.AuthDropVTable: // arg2 is the module
-			return allow(m == mutation && modules[strings.ToLower(arg2)])
+		case sqlite.AuthCreateVTable, sqlite.AuthDropVTable: // arg2 is the module; main only
+			return allow(m == mutation && (db == "" || db == "main") && modules[strings.ToLower(arg2)])
 		case sqlite.AuthCreateIndex, sqlite.AuthCreateTrigger, sqlite.AuthDropIndex, sqlite.AuthDropTrigger,
+			sqlite.AuthCreateTempIndex, sqlite.AuthCreateTempTrigger, sqlite.AuthDropTempIndex, sqlite.AuthDropTempTrigger,
 			sqlite.AuthAlterTable: // arg2 is the table
 			return allow(m == mutation && !reserved(arg2))
 		}
@@ -176,7 +179,84 @@ func (s *scope) Query(ctx context.Context, q string, args []any, fn func(*sql.Ro
 // Tx is the scoped SQL handle of a mutation callback.
 type Tx struct {
 	scope
-	files []fileOp
+	files   []fileOp
+	stmtsMu sync.Mutex
+	stmts   []*sql.Stmt
+}
+
+// Stmt is a scoped prepared statement valid only until its Tx callback returns.
+type Stmt struct {
+	s    *scope
+	stmt *sql.Stmt
+}
+
+// Prepare compiles q once for repeated execution inside the callback. Every
+// prepared statement is closed automatically when the callback returns.
+func (t *Tx) Prepare(ctx context.Context, q string) (*Stmt, error) {
+	if err := t.enter(); err != nil {
+		return nil, err
+	}
+	defer t.mu.RUnlock()
+	st, err := t.conn.PrepareContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	t.stmtsMu.Lock()
+	t.stmts = append(t.stmts, st)
+	t.stmtsMu.Unlock()
+	return &Stmt{s: &t.scope, stmt: st}, nil
+}
+
+// Exec runs the prepared statement.
+func (s *Stmt) Exec(ctx context.Context, args ...any) (sql.Result, error) {
+	if err := s.s.enter(); err != nil {
+		return nil, err
+	}
+	defer s.s.mu.RUnlock()
+	return s.stmt.ExecContext(ctx, args...)
+}
+
+// Query runs the prepared statement, passes the rows to fn and closes them.
+func (s *Stmt) Query(ctx context.Context, args []any, fn func(*sql.Rows) error) (err error) {
+	if err := s.s.enter(); err != nil {
+		return err
+	}
+	defer s.s.mu.RUnlock()
+	rows, err := s.stmt.QueryContext(ctx, args...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	if fn != nil {
+		if err := fn(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// Close closes the prepared statement early.
+func (s *Stmt) Close() error {
+	if err := s.s.enter(); err != nil {
+		return err
+	}
+	defer s.s.mu.RUnlock()
+	return s.stmt.Close()
+}
+
+func (t *Tx) closeStmts() error {
+	t.stmtsMu.Lock()
+	defer t.stmtsMu.Unlock()
+	var errs []error
+	for _, st := range t.stmts {
+		errs = append(errs, st.Close())
+	}
+	t.stmts = nil
+	return errors.Join(errs...)
 }
 
 // SetFile sets (or with f nil deletes) the named file when the callback

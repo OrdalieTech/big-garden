@@ -55,9 +55,10 @@ func TestAuthorizerBypass(t *testing.T) {
 		"SELECT data FROM sqlite_dbpage WHERE pgno = 1", "SELECT * FROM sqlite_dbpage('main')",
 		"UPDATE sqlite_dbpage SET data = zeroblob(4096) WHERE pgno = 1", "INSERT INTO sqlite_dbpage VALUES (1, zeroblob(4096))",
 		"DELETE FROM sqlite_dbpage", "SELECT * FROM dbstat",
-		// connection-wide objects
-		"CREATE TEMP TABLE t(a)", "CREATE TEMP VIEW v AS SELECT 1", "CREATE TEMP TRIGGER tt AFTER INSERT ON app BEGIN SELECT 1; END",
-		"CREATE TABLE temp.t(a)", "CREATE VIRTUAL TABLE temp.f USING fts5(x)",
+		// temp virtual tables and reserved temp names stay denied
+		"CREATE VIRTUAL TABLE temp.f USING fts5(x)", "CREATE TEMP TABLE _state_t(a)",
+		"CREATE TEMP TRIGGER _state_tt AFTER INSERT ON app BEGIN SELECT 1; END",
+		"CREATE TEMP TRIGGER tt_meta AFTER INSERT ON _state_meta BEGIN SELECT 1; END",
 		// virtual tables of modules outside the allowlist or with reserved names (D19)
 		"CREATE VIRTUAL TABLE f USING dbstat", "CREATE VIRTUAL TABLE f USING sqlite_dbpage",
 		"CREATE VIRTUAL TABLE f USING nosuchmodule(x)", "CREATE VIRTUAL TABLE _state_f USING fts5(x)",
@@ -126,9 +127,10 @@ func TestAuthorizerBypass(t *testing.T) {
 		t.Logf("%.30s: create=%v use=%v", p[0], createErr, useErr)
 	}
 
-	// Read mode refuses every write, schema change and transaction control.
+	// Read mode refuses every write, schema change, temp object and transaction control.
 	for _, q := range []string{"INSERT INTO app(v) VALUES ('r')", "UPDATE app SET v = 'r'", "DELETE FROM app",
 		"CREATE TABLE z(a)", "DROP TABLE app", "CREATE INDEX zi ON app(v)", "ALTER TABLE app ADD COLUMN z",
+		"CREATE TEMP TABLE rt(a)", "CREATE TEMP VIEW rv AS SELECT 1",
 		"COMMIT", "ROLLBACK", "BEGIN", "INSERT INTO app(v) VALUES ('r') RETURNING id", "SELECT * FROM _state_meta",
 		"PRAGMA user_version=3", "SELECT data FROM sqlite_dbpage", "SELECT * FROM vw", "SELECT * FROM vw2"} {
 		if _, err := f.d.Read(func(v *View) ([]byte, error) { return nil, v.Query(bg, q, nil, nil) }); err == nil {

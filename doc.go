@@ -14,9 +14,14 @@
 // corrupt state fails closed and is never recreated empty.
 //
 // Not provided: cross-entity transactions, durable timers, exactly-once
-// callback execution, sandboxing of callbacks, or reads without a storage
-// round trip. Callbacks are trusted, synchronous and must not cause external
-// effects; a callback may run again after an unacknowledged attempt.
+// callback execution, or sandboxing of callbacks. Callbacks are trusted,
+// synchronous and must not cause external effects; a callback may run again
+// after an unacknowledged attempt.
+//
+// Read is linearizable (one head check per call or shared group); ReadStale
+// serves concurrent reads directly from a node's resident image without
+// waiting on S3 while the image is within maxAge, revalidating asynchronously
+// and catching up in place from LTX deltas when the head advances.
 //
 // # Extensions
 //

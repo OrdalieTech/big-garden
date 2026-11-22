@@ -26,6 +26,7 @@ import (
 // pages of PROTOCOL §6 step 7 and §9); it is derived from h and reset with it.
 type entity struct {
 	mu         gate
+	rw         sync.RWMutex // separates concurrent ReadStale (RLock) from file/head swaps and mutations (Lock); always acquired inside mu
 	key        string
 	h          *head.Head
 	etag       string
@@ -33,9 +34,12 @@ type entity struct {
 	unresolved *candidate
 	pages      []uint32
 	snap       *snapJob // an off-mutex snapshot in flight (D35), under mu
+	mutating   bool     // under rw: local SQLite mutation in flight
 	qmu        sync.Mutex
 	queue      []*waiter    // Updates waiting on mu that a batch may take (PROTOCOL §6 Batches)
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	usedUnix   atomic.Int64 // unix nanos of last ReadStale hit
+	refreshing atomic.Bool  // background ReadStale revalidation in flight
 	building   bool         // under Node.mu: between room and unreserve, counted as resident
 	tried      time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
 	valid      time.Time    // issue time of the request that last proved h current: a GET, 304 or CAS (D23)
@@ -85,16 +89,46 @@ type candidate struct {
 
 // discard closes and deletes the cache file and drops the cached head (D10).
 func (e *entity) discard() {
+	e.rw.Lock()
+	defer e.rw.Unlock()
+	e.discardLocked()
+}
+
+func (e *entity) discardLocked() {
 	if e.db != nil {
 		e.db.Discard()
 	}
-	e.clear()
+	e.clearLocked()
 }
 
 // clear drops the local image (closed) and the cached head.
 func (e *entity) clear() {
+	e.rw.Lock()
+	defer e.rw.Unlock()
+	e.clearLocked()
+}
+
+func (e *entity) clearLocked() {
 	e.db, e.h, e.etag, e.pages, e.valid = nil, nil, "", nil, time.Time{}
 	e.bytes.Store(0)
+}
+
+func (e *entity) touch() { e.usedUnix.Store(time.Now().UnixNano()) }
+
+func (e *entity) lastUsed() time.Time {
+	if u := e.usedUnix.Load(); u > 0 {
+		if t := time.Unix(0, u); t.After(e.used) {
+			return t
+		}
+	}
+	return e.used
+}
+
+// roReady reports whether e holds a settled, verified local image matching
+// ref that concurrent ReadStale calls can query directly; caller holds rw.RLock.
+func (e *entity) roReady(ref Ref) bool {
+	return !e.mutating && e.unresolved == nil && e.db != nil && e.h != nil && !e.h.Deleted &&
+		e.h.Incarnation == ref.Incarnation && e.db.Published() == imageOf(e.h)
 }
 
 // current reports whether a request issued after t0 proved e.h current and
@@ -114,7 +148,12 @@ func links(h *head.Head) []head.Ref {
 }
 
 // resolved clears the unresolved candidate and its since.
-func (e *entity) resolved() { e.unresolved = nil; e.since.Store(0) }
+func (e *entity) resolved() {
+	e.rw.Lock()
+	e.unresolved = nil
+	e.rw.Unlock()
+	e.since.Store(0)
+}
 
 func imageOf(h *head.Head) engine.Image {
 	return engine.Image{Sequence: h.Sequence, PageCount: h.PageCount, Checksum: h.DatabaseChecksum}
@@ -199,7 +238,10 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 	}
 	ctx, cancel := n.commitContext()
 	defer cancel()
-	e.unresolved, c.nonces = c, []head.ID{c.next.Nonce}
+	e.rw.Lock()
+	e.unresolved = c
+	e.rw.Unlock()
+	c.nonces = []head.ID{c.next.Nonce}
 	issued := time.Now()
 	e.since.Store(issued.UnixNano())
 	etag, unsure, err := n.cas(ctx, e, c)
@@ -240,21 +282,27 @@ func (n *Node) publish(e *entity, c *candidate) (rec *engine.Receipt, err error)
 // local image is checkpointed if it is the candidate's, and discarded if it
 // is not cur's. issued is when the request that returned cur was sent.
 func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string, issued time.Time) {
-	e.resolved()
+	e.rw.Lock()
+	e.unresolved = nil
+	e.since.Store(0)
 	n.countCommit(c)
 	if e.db != nil && slices.Contains(c.nonces, cur.Nonce) {
 		e.pages = c.pages
 		if e.db.Published() != imageOf(cur) && e.db.Checkpoint(imageOf(cur)) != nil {
-			e.discard()
+			e.discardLocked()
 		}
 	}
 	if e.db != nil && e.db.Published() != imageOf(cur) {
-		e.discard()
+		e.discardLocked()
 	}
 	h := *cur                               // a copy: cur may be &c.next, and c.base chains every earlier head
 	e.h, e.etag, e.valid = &h, etag, issued // kept even without a local image: the next access activates or revalidates it
 	if e.db != nil {
 		e.bytes.Store(e.db.Bytes())
+	}
+	e.rw.Unlock()
+	if e.db != nil {
+		n.trimCache(e, min(n.cfg.Limits.EntityBytes, 1<<20))
 	}
 }
 
@@ -370,57 +418,88 @@ func opOf(c *candidate) MutationID {
 // activate restores exactly h into a new cache file (PROTOCOL §4), restarting
 // with the current head if an object vanished or changed under it.
 func (n *Node) activate(ctx context.Context, e *entity, h *head.Head, etag string) error {
+	return n.activateMode(ctx, e, h, etag, false)
+}
+
+func (n *Node) activateMode(ctx context.Context, e *entity, h *head.Head, etag string, forRead bool) error {
+	db, cur, curTag, curIssued, pages, err := n.restoreNew(ctx, e, h, etag, true, forRead)
+	if err != nil {
+		return err
+	}
+	e.rw.Lock()
+	if e.db != nil {
+		e.db.Discard()
+	}
+	e.db, e.h, e.etag, e.pages = db, cur, curTag, pages
+	if curTag != etag {
+		e.valid = curIssued
+	}
+	e.bytes.Store(db.Bytes())
+	e.rw.Unlock()
+	return nil
+}
+
+// restoreNew builds a verified *engine.DB for h (or a newer head if an object
+// was collected meanwhile) in a fresh cache file, without holding e.rw so
+// concurrent ReadStale calls on an existing image stay unblocked.
+func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag string, tryWarm, forRead bool) (
+	*engine.DB, *head.Head, string, time.Time, []uint32, error) {
 	select {
 	case n.recoveries <- struct{}{}:
 		defer func() { <-n.recoveries }()
 	case <-ctx.Done():
-		return newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
+		return nil, nil, "", time.Time{}, nil, newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
 	}
-	if err := n.cache(ctx, e); err != nil {
-		return err
+	need := n.activationBytes(h)
+	if err := n.cacheFor(ctx, e, need); err != nil {
+		return nil, nil, "", time.Time{}, nil, err
 	}
-	defer n.unreserve(e)
-	if n.warmStart(ctx, e, h, etag) {
-		return nil
+	defer n.unreserveFor(e, need)
+	if tryWarm {
+		if db, pages, ok := n.warmRestore(ctx, e, h, forRead); ok {
+			return db, h, etag, time.Time{}, pages, nil
+		}
 	}
+	var issued time.Time
 	for {
 		objs, done, err := n.objects(ctx, links(h), h, &n.counters.activationBytes)
-		defer done()
 		if err != nil && !miss(err) {
-			return storeError(err)
+			done()
+			return nil, nil, "", time.Time{}, nil, storeError(err)
 		}
 		if err != nil { // collection race, or a missing or corrupt object
+			done()
+			issued = time.Now()
 			obj, gerr := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 			switch store.OutcomeOf(gerr) {
 			case store.OK:
 				if h, gerr = n.decodeHead(obj.Body, e.key, h.Incarnation); gerr != nil {
-					return gerr
+					return nil, nil, "", time.Time{}, nil, gerr
 				}
 				if h.Deleted { // deleted meanwhile: its refs are the dead incarnation's (D25)
-					return n.deleted(e)
+					return nil, nil, "", time.Time{}, nil, n.deleted(e)
 				}
-				etag, e.valid = obj.ETag, time.Time{} // h is no longer the head e.valid proved
+				etag = obj.ETag
 				continue
 			case store.NotModified:
 				if errors.Is(err, engine.ErrCorrupt) {
-					return newError(CodeCorrupt, "object differs from its reference", nil)
+					return nil, nil, "", time.Time{}, nil, newError(CodeCorrupt, "object differs from its reference", nil)
 				}
-				return newError(CodeStateMissing, "an object of the head is missing", nil)
+				return nil, nil, "", time.Time{}, nil, newError(CodeStateMissing, "an object of the head is missing", nil)
 			case store.NotFound:
-				return n.missing(ctx, e.key)
+				return nil, nil, "", time.Time{}, nil, n.missing(ctx, e.key)
 			}
-			return storeError(gerr)
+			return nil, nil, "", time.Time{}, nil, storeError(gerr)
 		}
 		path := filepath.Join(n.dir, head.NewID().String()+".db")
 		db, pages, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs, nil)
+		done()
 		if err != nil {
 			n.counters.activationFailures.Add(1)
-			return engineError(err)
+			return nil, nil, "", time.Time{}, nil, engineError(err)
 		}
 		n.counters.activations.Add(1)
-		e.db, e.h, e.etag, e.pages = db, h, etag, pages
-		e.bytes.Store(db.Bytes())
-		return nil
+		return db, h, etag, issued, pages, nil
 	}
 }
 
@@ -479,15 +558,15 @@ func (n *Node) objects(ctx context.Context, refs []head.Ref, h *head.Head, downl
 	return objs, done, err
 }
 
-// warmStart activates e at h from its warm file, if it has one (D21): an
+// warmRestore activates h from its warm file, if it has one (D21): an
 // unchanged file only passes the checksum gate of a cold restore; one behind
 // h gets the links after it, the first overlaid. The file leaves the warm
 // tier either way; false means activate cold.
-func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag string) bool {
+func (n *Node) warmRestore(ctx context.Context, e *entity, h *head.Head, forRead bool) (*engine.DB, []uint32, bool) {
 	path := filepath.Join(n.dir, head.NewID().String()+".db")
 	w, ok := n.claimWarm(e.key, path)
 	if !ok {
-		return false
+		return nil, nil, false
 	}
 	refs := links(h)
 	i := slices.IndexFunc(refs, func(r head.Ref) bool { return r.MaxSequence > w.Image.Sequence })
@@ -495,11 +574,13 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 		i = len(refs)
 	}
 	var pages []uint32
+	pagesOK := true
 	for _, r := range refs[:i] {
 		p, known := w.Pages[r.SHA256]
-		ok = ok && known
+		pagesOK = pagesOK && known
 		pages = append(pages, p)
 	}
+	ok = pagesOK || forRead
 	failpoint("warm.claim")
 	if ok && i > 0 && w.Image.Sequence <= h.Sequence {
 		objs, done, err := n.objects(ctx, refs[i:], h, &n.counters.activationBytes)
@@ -507,7 +588,7 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 		failpoint("warm.apply.mid")   // the kill lands inside Restore's overlay
 		if err != nil && !miss(err) { // the store, not the file: keep it for the next attempt
 			n.unclaimWarm(e.key, path, w)
-			return false
+			return nil, nil, false
 		}
 		if err == nil {
 			db, p, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs, &w.Image)
@@ -518,16 +599,18 @@ func (n *Node) warmStart(ctx context.Context, e *entity, h *head.Head, etag stri
 				} else {
 					n.counters.catchUps.Add(1)
 				}
-				e.db, e.h, e.etag, e.pages = db, h, etag, append(pages, p...)
-				e.bytes.Store(db.Bytes())
+				var allPages []uint32
+				if pagesOK {
+					allPages = append(pages, p...)
+				}
 				n.claimWarm(e.key, "")
-				return true
+				return db, allPages, true
 			}
 		}
 	}
 	os.Remove(path)
 	n.claimWarm(e.key, "")
-	return false
+	return nil, nil, false
 }
 
 // miss reports a missing or corrupt object, as opposed to a store failure.

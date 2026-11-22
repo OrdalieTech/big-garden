@@ -159,7 +159,7 @@ func (n *Node) Import(ctx context.Context, key string, req Request, r io.Reader)
 			MinSequence: 1, MaxSequence: m.Sequence, PostChecksum: m.DatabaseChecksum}}
 	bound := binding(4, req.Schema, req.Schema, req.Hash)
 	return n.create(ctx, key, req, bound, func(path string, inc head.ID) (*engine.DB, []byte, error) {
-		db, _, err := engine.Restore(ctx, n.drv, path, n.maxPages(), &src, []io.ReaderAt{snap.ReaderAt()}, nil)
+		db, _, err := engine.RestoreChecked(ctx, n.drv, path, n.maxPages(), &src, []io.ReaderAt{snap.ReaderAt()})
 		if err != nil {
 			return nil, nil, engineError(err)
 		}

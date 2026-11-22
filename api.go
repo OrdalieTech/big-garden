@@ -130,6 +130,28 @@ func NewMutationID(t time.Time) (MutationID, error) {
 	return id, nil
 }
 
+// Stmt is a scoped prepared statement created by Tx.Prepare. It is invalid
+// after the mutation callback returns.
+type Stmt struct{ s *engine.Stmt }
+
+func (t *Tx) Prepare(ctx context.Context, q string) (*Stmt, error) {
+	s, err := t.t.Prepare(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return &Stmt{s}, nil
+}
+
+func (s *Stmt) Exec(ctx context.Context, args ...any) (sql.Result, error) {
+	return s.s.Exec(ctx, args...)
+}
+
+func (s *Stmt) Query(ctx context.Context, args []any, fn func(*sql.Rows) error) error {
+	return s.s.Query(ctx, args, fn)
+}
+
+func (s *Stmt) Close() error { return s.s.Close() }
+
 func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
 	return v.v.Query(ctx, q, args, fn)
 }

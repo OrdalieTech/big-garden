@@ -200,7 +200,7 @@ func TestWarmTier(t *testing.T) {
 func TestWarmBudget(t *testing.T) {
 	mem := storetest.NewMem()
 	n := warmNode(t, mem, "a", t.TempDir(), func(l *Limits) {
-		l.EntityBytes, l.CacheBytes, l.ResidentEntities, l.Recoveries = 1<<20, 6<<20, 2, 1
+		l.EntityBytes, l.CacheBytes, l.ResidentEntities, l.Recoveries = 1<<20, 2<<20+512<<10, 2, 1
 	})
 	var refs []Ref
 	for i := range 20 {
@@ -212,7 +212,7 @@ func TestWarmBudget(t *testing.T) {
 		refs = append(refs, ref)
 	}
 	s := n.Stats()
-	if s.WarmEntities == 0 || s.WarmEvictions == 0 || s.CacheBytes > 6<<20 {
+	if s.WarmEntities == 0 || s.WarmEvictions == 0 || s.CacheBytes > 2<<20+512<<10 {
 		t.Fatalf("want parked and evicted entities within the budget: %+v", s)
 	}
 	var lru Ref // the least recently used warm entity: fit must not evict its own file to activate it

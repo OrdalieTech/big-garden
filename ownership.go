@@ -19,7 +19,9 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
+		e.rw.Lock()
 		e.valid = issued
+		e.rw.Unlock()
 		return nil
 	case store.OK:
 	case store.NotFound:
@@ -39,10 +41,15 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	if cur.Deleted {
 		return n.deleted(e)
 	}
-	if e.db != nil && (e.db.Published() != imageOf(cur) || !slices.Equal(links(e.h), links(cur))) {
+	if e.db != nil && (e.db.Published() != imageOf(cur) || (n.mine(cur) && !slices.Equal(links(e.h), links(cur)))) {
 		n.park(e) // the file of the previous head: a base for catching up later
 	}
+	e.rw.Lock()
+	if e.db != nil && e.h != nil && !slices.Equal(links(e.h), links(cur)) {
+		e.pages = nil
+	}
 	e.h, e.etag, e.valid = cur, obj.ETag, issued
+	e.rw.Unlock()
 	return nil
 }
 

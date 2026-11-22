@@ -60,12 +60,26 @@ func (n *Node) maintainLater(e *entity) {
 	}()
 }
 
+// lifeContext returns a context canceled when the Node closes, for long
+// background uploads and compactions that may outlast CommitTimeout.
+func (n *Node) lifeContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-n.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // maintain publishes a snapshot when the replay pages exceed page_count+256
 // (or always with snapshot), else compacts the oldest run of fanout
 // same-level deltas (PROTOCOL §9), and reports whether it committed one. A
 // failure abandons the step: nothing acknowledged depends on it.
 func (n *Node) maintain(e *entity, snapshot bool) bool {
-	ctx, cancel := n.commitContext()
+	ctx, cancel := n.lifeContext()
 	defer cancel()
 	h := e.h
 	next := *h
@@ -123,6 +137,7 @@ func (n *Node) maintain(e *entity, snapshot bool) bool {
 	if n.putObject(ctx, ref.Key, buf, ref.SHA256) != nil {
 		return false
 	}
+	buf.Close()
 	failpoint("maint.cas")
 	c.next, c.object = next, &ref
 	_, err := n.publish(e, c) // not committed: the object is abandoned to collection
@@ -188,15 +203,8 @@ func (n *Node) runSnapshot(e *entity, job *snapJob) bool {
 	defer os.Remove(job.file.Name())
 	defer job.file.Close()
 	defer n.staging.Add(-int64(job.img.PageCount) * head.PageSize)
-	ctx, cancel := context.WithCancel(context.Background()) // the upload may outlast CommitTimeout; Close ends it
+	ctx, cancel := n.lifeContext()
 	defer cancel()
-	go func() {
-		select {
-		case <-n.done:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
 	buf := n.spool()
 	defer buf.Close()
 	snap, err := engine.SnapshotFile(buf, job.file, job.img)
@@ -206,6 +214,7 @@ func (n *Node) runSnapshot(e *entity, job *snapJob) bool {
 	if err == nil {
 		err = n.putObject(ctx, ref.Key, buf, ref.SHA256)
 	}
+	buf.Close()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.snap = nil

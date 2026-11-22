@@ -109,8 +109,8 @@ func TestAPIFrozen(t *testing.T) {
 			callables++
 		}
 	}
-	if types > 18 || callables > 31 { // 30, plus Tx.File (DECISIONS D33)
-		t.Fatalf("API budget exceeded: %d types (max 18), %d functions/methods (max 31)", types, callables)
+	if types > 18 || callables > 36 { // 30, plus Tx.File (D33), ReadStale/Tx.Prepare/Stmt (D39, D40)
+		t.Fatalf("API budget exceeded: %d types (max 18), %d functions/methods (max 36)", types, callables)
 	}
 }
 
@@ -176,8 +176,8 @@ func TestLimits(t *testing.T) {
 		"retention below 1h":    {ReceiptRetention: 59 * time.Minute},
 		"retention above 720h":  {ReceiptRetention: 721 * time.Hour},
 		"commit below attempt":  {StorageAttemptTimeout: 20 * time.Second},
-		"cache too small":       {CacheBytes: 1 << 30},
-		"256 MiB default cache": {EntityBytes: 256 << 20},
+		"cache too small":       {CacheBytes: 500 << 20},
+		"1 GiB default cache":   {EntityBytes: 1<<30 + 1<<20},
 	}
 	for name, l := range bad {
 		var e *Error

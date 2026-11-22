@@ -1,6 +1,6 @@
 module github.com/OrdalieTech/big-garden
 
-go 1.27.3
+go 1.26.0
 
 require (
 	github.com/anishathalye/porcupine v1.3.1

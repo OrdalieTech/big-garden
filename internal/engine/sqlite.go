@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/superfly/ltx"
@@ -77,14 +78,24 @@ type Commit struct {
 	Fresh   func(object string) bool // whether a blob the image does not link yet may be linked (D33)
 }
 
+// Options tunes per-connection SQLite memory for a Driver's databases.
+type Options struct {
+	CacheBytes int64 // per-connection SQLite page cache (0 = 1 MiB)
+	MmapBytes  int64 // read-only pool mmap_size (0 = disabled)
+}
+
 // DB is one exclusively owned SQLite cache file.
 type DB struct {
 	path    string
+	drv     *Driver
 	db      *sql.DB
 	conn    *sql.Conn
 	modules map[string]bool // virtual table modules application SQL may use
 	main    *os.File        // read-only; holds the published image between checkpoints
 	pub     Image           // image of the main file (the last checkpointed, published state)
+
+	roMu sync.Mutex
+	ro   *sql.DB // concurrent read-only connection pool (opened lazily for ReadConcurrent)
 
 	SweepDue bool // a mutation changed files, or the epoch changed: Node.Sweep has work (D33)
 }
@@ -134,7 +145,12 @@ type fileOp struct {
 type Driver struct {
 	sqlite  *sqlite.Driver
 	modules map[string]bool
+	opts    Options
 }
+
+// SetOptions configures SQLite page cache and read-only mmap size for
+// connections opened through d. Call before opening any database.
+func (d *Driver) SetOptions(opts Options) { d.opts = opts }
 
 // NewDriver returns a Driver on which extend (if not nil) has registered
 // functions and virtual table modules. The modules it added are allowed to
@@ -260,7 +276,7 @@ func open(ctx context.Context, drv *Driver, path string, maxPages uint32) (*DB, 
 	}
 	db := sql.OpenDB(connector{drv.sqlite, fileDSN(path, "rw")})
 	db.SetMaxOpenConns(1)
-	d := &DB{path: path, db: db, modules: drv.modules}
+	d := &DB{path: path, drv: drv, db: db, modules: drv.modules}
 	var err error
 	if d.conn, err = db.Conn(ctx); err == nil {
 		err = d.setup(maxPages)
@@ -278,7 +294,15 @@ func fileDSN(path, mode string) string {
 	return (&url.URL{Scheme: "file", OmitHost: true, Path: path, RawQuery: "mode=" + mode + "&_defensive=1"}).String()
 }
 
+func (d *DB) cacheKB() int64 {
+	if d.drv != nil && d.drv.opts.CacheBytes > 0 {
+		return max(1024, d.drv.opts.CacheBytes/1024)
+	}
+	return 1024
+}
+
 func (d *DB) setup(maxPages uint32) error {
+	cache := fmt.Sprintf("-%d", d.cacheKB())
 	settings := []struct{ set, get, want string }{
 		{"PRAGMA page_size=4096", "PRAGMA page_size", "4096"},
 		{"PRAGMA auto_vacuum=FULL", "PRAGMA auto_vacuum", "1"},
@@ -288,7 +312,7 @@ func (d *DB) setup(maxPages uint32) error {
 		{"PRAGMA trusted_schema=OFF", "PRAGMA trusted_schema", "0"},
 		{"PRAGMA foreign_keys=ON", "PRAGMA foreign_keys", "1"},
 		{"PRAGMA secure_delete=FAST", "PRAGMA secure_delete", "2"}, // deleted bytes leave the image at once (with auto_vacuum=FULL)
-		{"PRAGMA cache_size=-1024", "PRAGMA cache_size", "-1024"},
+		{"PRAGMA cache_size=" + cache, "PRAGMA cache_size", cache},
 		{"PRAGMA busy_timeout=1000", "PRAGMA busy_timeout", "1000"},
 		{fmt.Sprintf("PRAGMA max_page_count=%d", maxPages), "PRAGMA max_page_count", fmt.Sprint(maxPages)},
 	}
@@ -341,7 +365,7 @@ func (d *DB) inTx(fn func() error) (err error) {
 	committed := false
 	defer func() { // also runs on a callback panic
 		if !committed {
-			err = withCleanup(err, d.setMode(library), d.rollback())
+			err = withCleanup(err, d.setMode(library), d.rollback(), d.dropTemp())
 		}
 	}()
 	if err = fn(); err == nil {
@@ -447,10 +471,19 @@ func (d *DB) Mutate(c Commit, fn func(*Tx) ([]byte, error)) (result []byte, seq 
 			return err
 		}
 		tx := &Tx{scope: scope{conn: d.conn}}
-		if result, err = runScoped(&tx.scope, func() ([]byte, error) { return fn(tx) }); err != nil {
-			return err
+		var cbErr error
+		result, cbErr = runScoped(&tx.scope, func() ([]byte, error) { return fn(tx) })
+		closeErr := tx.closeStmts()
+		if cbErr != nil {
+			return withCleanup(cbErr, closeErr)
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 		if err := d.setMode(library); err != nil {
+			return err
+		}
+		if err := d.dropTemp(); err != nil {
 			return err
 		}
 		if err := d.applyFiles(tx.files, c.Fresh); err != nil {
@@ -580,6 +613,117 @@ func (d *DB) Files(sum *[32]byte) (linked map[string]File, same *File, err error
 	return linked, same, rows.Err()
 }
 
+// dropTemp drops every temp object on the connection so nothing created during
+// a mutation persists across transactions or leaks into reads.
+func (d *DB) dropTemp() error {
+	rows, err := d.conn.QueryContext(context.Background(),
+		"SELECT type, name FROM sqlite_temp_schema WHERE type IN ('trigger','view','table') AND name NOT LIKE 'sqlite_%'")
+	if err != nil {
+		return err
+	}
+	type item struct{ typ, name string }
+	var items []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.typ, &it.name); err != nil {
+			rows.Close()
+			return err
+		}
+		items = append(items, it)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, kind := range []string{"trigger", "view", "table"} {
+		for _, it := range items {
+			if it.typ == kind {
+				q := `DROP ` + strings.ToUpper(kind) + ` IF EXISTS temp."` + strings.ReplaceAll(it.name, `"`, `""`) + `"`
+				if err := d.exec(q); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// roConnector opens read-only connections on path with query_only=ON,
+// trusted_schema=OFF, cache_size and optional mmap_size.
+type roConnector struct {
+	d   *sqlite.Driver
+	dsn string
+}
+
+func (c roConnector) Connect(context.Context) (driver.Conn, error) {
+	dc, err := c.d.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	h, ok := dc.(sqlite.HookRegisterer)
+	if !ok {
+		dc.Close()
+		return nil, errors.New("engine: driver connection lacks hooks")
+	}
+	h.RegisterCommitHook(func() int32 { return 1 })
+	return dc, nil
+}
+
+func (c roConnector) Driver() driver.Driver { return c.d }
+
+func (d *DB) readPool() *sql.DB {
+	d.roMu.Lock()
+	defer d.roMu.Unlock()
+	if d.ro != nil {
+		return d.ro
+	}
+	q := fmt.Sprintf("mode=ro&_defensive=1&_pragma=busy_timeout(1000)&_pragma=query_only(1)&_pragma=trusted_schema(0)&_pragma=cache_size(-%d)", d.cacheKB())
+	if d.drv != nil && d.drv.opts.MmapBytes > 0 {
+		q += fmt.Sprintf("&_pragma=mmap_size(%d)", d.drv.opts.MmapBytes)
+	}
+	dsn := (&url.URL{Scheme: "file", OmitHost: true, Path: d.path, RawQuery: q}).String()
+	ro := sql.OpenDB(roConnector{d: d.drv.sqlite, dsn: dsn})
+	ro.SetMaxOpenConns(8)
+	ro.SetMaxIdleConns(8)
+	d.ro = ro
+	return ro
+}
+
+// CloseReaders closes the concurrent read-only pool so no connection or mmap
+// holds the file across a mutation, checkpoint, catch-up or close.
+func (d *DB) CloseReaders() error {
+	d.roMu.Lock()
+	ro := d.ro
+	d.ro = nil
+	d.roMu.Unlock()
+	if ro == nil {
+		return nil
+	}
+	return ro.Close()
+}
+
+// ReadConcurrent runs fn on a pooled read-only connection inside a read
+// transaction. Safe for concurrent calls while no mutation or catch-up runs.
+func (d *DB) ReadConcurrent(ctx context.Context, fn func(*View) ([]byte, error)) (result []byte, err error) {
+	conn, err := d.readPool().Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return nil, err
+	}
+	defer func() {
+		merr := setConnMode(conn, library, d.modules)
+		_, rerr := conn.ExecContext(context.Background(), "ROLLBACK")
+		err = withCleanup(err, merr, rerr)
+	}()
+	if err := setConnMode(conn, read, d.modules); err != nil {
+		return nil, err
+	}
+	v := &View{scope{conn: conn}}
+	return runScoped(&v.scope, func() ([]byte, error) { return fn(v) })
+}
+
 // Read runs fn in a read-only scope inside a library read transaction, with
 // query_only=ON besides the read-mode authorizer.
 func (d *DB) Read(fn func(*View) ([]byte, error)) (result []byte, err error) {
@@ -663,12 +807,20 @@ func (d *DB) Discard() error {
 
 func (d *DB) close() error {
 	var errs []error
+	if err := d.CloseReaders(); err != nil {
+		errs = append(errs, err)
+	}
 	if d.conn != nil {
 		errs = append(errs, d.conn.Close())
+		d.conn = nil
 	}
-	errs = append(errs, d.db.Close())
+	if d.db != nil {
+		errs = append(errs, d.db.Close())
+		d.db = nil
+	}
 	if d.main != nil {
 		errs = append(errs, d.main.Close())
+		d.main = nil
 	}
 	return errors.Join(errs...)
 }

@@ -30,6 +30,7 @@ func (*Node) OpenBlob(context.Context, Ref, Blob) (io.ReadSeekCloser, error)
 func (*Node) Owner() Owner
 func (*Node) PutBlob(context.Context, Ref, io.Reader) (Blob, error)
 func (*Node) Read(context.Context, Ref, uint32, func(*View) ([]byte, error)) (Result, error)
+func (*Node) ReadStale(context.Context, Ref, uint32, time.Duration, func(*View) ([]byte, error)) (Result, error)
 func (*Node) Release(context.Context, Ref) error
 func (*Node) Resolve(context.Context, string) (Route, error)
 func (*Node) Scan(context.Context, string) iter.Seq2[Route, error]
@@ -37,8 +38,12 @@ func (*Node) Snapshot(context.Context, Ref) (Version, error)
 func (*Node) Stats() Stats
 func (*Node) Takeover(context.Context, Route) (Route, error)
 func (*Node) Update(context.Context, Ref, Request, func(*Tx) ([]byte, error)) (Result, error)
+func (*Stmt) Close() error
+func (*Stmt) Exec(context.Context, ...any) (sql.Result, error)
+func (*Stmt) Query(context.Context, []any, func(*sql.Rows) error) error
 func (*Tx) Exec(context.Context, string, ...any) (sql.Result, error)
 func (*Tx) File(context.Context, string) (Blob, bool, error)
+func (*Tx) Prepare(context.Context, string) (*Stmt, error)
 func (*Tx) Query(context.Context, string, []any, func(*sql.Rows) error) error
 func (*Tx) SetFile(string, *Blob) error
 func (*View) File(context.Context, string) (Blob, bool, error)
@@ -74,6 +79,7 @@ type Error struct {
 }
 type Limits struct {
 	EntityBytes, CacheBytes				int64
+	SQLiteCacheBytes, MmapBytes			int64
 	ResultBytes, ResidentEntities, InflightStorage	int
 	PendingPerEntity, Recoveries, BatchMax		int
 	StorageAttemptTimeout, CommitTimeout		time.Duration
@@ -127,6 +133,7 @@ type Stats struct {
 		Time				time.Duration
 	}
 }
+type Stmt struct{}
 type Tx struct {
 }
 type Version struct {

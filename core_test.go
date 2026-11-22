@@ -1969,7 +1969,8 @@ func TestCacheBytes(t *testing.T) {
 	if s := n.Stats(); s.ResidentEntities != 1 || s.CacheBytes > n.cfg.Limits.CacheBytes {
 		t.Fatalf("stats %+v", s)
 	}
-	readAll(t, n, ref0) // activation evicts e1
+	n.cfg.Limits.CacheBytes = 1<<20 + size + size/2 // one activation, and no other resident entity beside it
+	readAll(t, n, ref0)                             // activation evicts e1
 	if s := n.Stats(); s.ResidentEntities != 1 {
 		t.Fatalf("stats %+v", s)
 	}

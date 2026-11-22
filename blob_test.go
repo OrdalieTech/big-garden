@@ -551,21 +551,21 @@ func TestFilesReadAfterCachedChunks(t *testing.T) {
 // in StagingBytes and takes room an activation needs, until it is used.
 func TestSpoolsCountInCacheBytes(t *testing.T) {
 	mem := storetest.NewMem()
-	small := func(l *Limits) { l.EntityBytes, l.Recoveries, l.CacheBytes = 1<<20, 1, 6<<20 } // one activation: 5 MiB
+	small := func(l *Limits) { l.EntityBytes, l.Recoveries, l.CacheBytes = 1<<20, 1, 6<<20 }
 	a := testNode(t, mem, "a", small)
 	b := testNode(t, mem, "b", nil)
 	ref, _, err := b.Create(bg, "other", newReq(t, "other", 1), createKV)
 	if err != nil {
 		t.Fatal(err)
 	}
-	blob, err := a.PutBlob(bg, Ref{Key: "doc"}, bytes.NewReader(random(2<<20)))
+	blob, err := a.PutBlob(bg, Ref{Key: "doc"}, bytes.NewReader(random(5<<20)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := a.Stats().StagingBytes; s != 2<<20 {
-		t.Fatalf("staging %d, want the spool's 2 MiB", s)
+	if s := a.Stats().StagingBytes; s != 5<<20 {
+		t.Fatalf("staging %d, want the spool's 5 MiB", s)
 	}
-	_, err = a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil }) // 5 MiB more do not fit in 6
+	_, err = a.Read(bg, ref, 1, func(*View) ([]byte, error) { return nil, nil }) // >1 MiB activation does not fit beside 5 MiB spool in 6 MiB
 	wantCode(t, err, CodeCapacity)
 	if _, _, err := a.Create(bg, "doc", newReq(t, "doc", 1), func(tx *Tx) ([]byte, error) {
 		if _, err := createKV(tx); err != nil {

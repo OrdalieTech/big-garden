@@ -152,10 +152,16 @@ func (n *Node) enter(ctx context.Context, key string, id *MutationID, m *waiter,
 // a head proven current after t0 (D23), else the conditional GET, and an
 // image exactly that head, owned or not (D24): it publishes nothing.
 func (n *Node) owned(ctx context.Context, e *entity, ref Ref, t0 time.Time) error {
-	if err := n.ownedHead(ctx, e, ref, t0); err != nil || e.db != nil {
+	if err := n.ownedHead(ctx, e, ref, t0); err != nil {
 		return err
 	}
-	if err := n.activate(ctx, e, e.h, e.etag); err != nil {
+	if t0.IsZero() && e.db != nil && e.pages == nil { // follower image lacks replay counts for mutation maintenance
+		n.park(e)
+	}
+	if e.db != nil {
+		return nil
+	}
+	if err := n.activateMode(ctx, e, e.h, e.etag, !t0.IsZero()); err != nil {
 		return err
 	}
 	if t0.IsZero() && !n.mine(e.h) {
@@ -211,7 +217,9 @@ func (n *Node) barrier(ctx context.Context, e *entity, t0 time.Time) (changed bo
 	_, err = n.st.Get(ctx, head.HeadKey(e.key), e.etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
+		e.rw.Lock()
 		e.valid = issued
+		e.rw.Unlock()
 		return false, nil
 	case store.OK:
 		e.discard()
@@ -297,6 +305,7 @@ func (s *spool) Close() {
 	if s.f != nil {
 		s.f.Close()
 		os.Remove(s.f.Name())
+		s.f = nil
 	}
 }
 
@@ -381,6 +390,213 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 		return Result{}, callbackError(err, cb)
 	}
 	return Result{Value: v, Version: Version{e.h.Incarnation, e.h.Sequence}}, nil
+}
+
+// ReadStale runs fn on a local read-only snapshot of ref whose head was proven
+// current within maxAge, without waiting on S3 when fresh and without taking
+// ownership. Concurrent ReadStale calls execute in parallel on a read-only
+// SQLite connection pool. When half of maxAge has elapsed, a single background
+// revalidation checks S3 and, if the head moved, downloads only the new deltas
+// before briefly pausing readers to apply them in place. A maxAge <= 0 runs a
+// strong Read.
+func (n *Node) ReadStale(ctx context.Context, ref Ref, schema uint32, maxAge time.Duration, fn func(*View) ([]byte, error)) (res Result, err error) {
+	if maxAge <= 0 {
+		return n.Read(ctx, ref, schema, fn)
+	}
+	defer func() { n.observe(ref.Key, true, res, err) }()
+	if err := head.ValidKey(ref.Key); err != nil {
+		return Result{}, invalid(err.Error())
+	}
+	e, err := n.entity(ref.Key)
+	if err != nil {
+		return Result{}, err
+	}
+	defer n.drop(e)
+	for range 3 {
+		e.rw.RLock()
+		if e.roReady(ref) {
+			age := time.Since(e.valid)
+			if age < maxAge {
+				if age >= maxAge/2 {
+					n.refreshAsync(e, ref)
+				}
+				if e.h.Schema != schema {
+					ver, got := Version{e.h.Incarnation, e.h.Sequence}, e.h.Schema
+					e.rw.RUnlock()
+					return Result{}, &Error{Code: CodeSchemaMismatch, At: ver, Schema: got, Message: "stored schema differs"}
+				}
+				db, ver := e.db, Version{e.h.Incarnation, e.h.Sequence}
+				e.touch()
+				var cb error
+				v, err := db.ReadConcurrent(ctx, scoped(math.MaxInt, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
+				e.rw.RUnlock()
+				if err != nil {
+					return Result{}, callbackError(err, cb)
+				}
+				return Result{Value: v, Version: ver}, nil
+			}
+		}
+		e.rw.RUnlock()
+		if err := n.refreshSync(ctx, ref, maxAge); err != nil {
+			return Result{}, err
+		}
+	}
+	return Result{}, newError(CodeUnavailable, "entity changed repeatedly during read", nil)
+}
+
+func (n *Node) refreshSync(ctx context.Context, ref Ref, maxAge time.Duration) error {
+	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil, true)
+	if err != nil {
+		return err
+	}
+	defer n.leave(e)
+	e.rw.RLock()
+	fresh := e.roReady(ref) && time.Since(e.valid) < maxAge
+	e.rw.RUnlock()
+	if fresh {
+		return nil
+	}
+	return n.syncFollower(ctx, e, ref)
+}
+
+func (n *Node) refreshAsync(e *entity, ref Ref) {
+	if !e.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		e.refreshing.Store(false)
+		return
+	}
+	n.wg.Add(1)
+	e.refs++
+	n.mu.Unlock()
+	go func() {
+		defer n.wg.Done()
+		defer e.refreshing.Store(false)
+		ctx, cancel := n.lifeContext()
+		defer cancel()
+		if e.mu.lock(ctx) != nil {
+			n.drop(e)
+			return
+		}
+		defer n.leave(e)
+		if !n.isClosed() && e.unresolved == nil {
+			_ = n.syncFollower(ctx, e, ref)
+		}
+	}()
+}
+
+// syncFollower revalidates e's head and catches its local file up to cur
+// while keeping e.rw unlocked during all S3 downloads and cold restores so
+// concurrent ReadStale callers never wait on S3. Caller holds e.mu.
+func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
+	e.rw.RLock()
+	oldH, oldTag, oldDB := e.h, e.etag, e.db
+	e.rw.RUnlock()
+	issued := time.Now()
+	obj, err := n.st.Get(ctx, head.HeadKey(e.key), oldTag, head.MaxHeadBytes)
+	switch store.OutcomeOf(err) {
+	case store.NotModified:
+		if oldDB != nil && oldH != nil && oldH.Incarnation == ref.Incarnation && !oldH.Deleted && oldDB.Published() == imageOf(oldH) {
+			e.rw.Lock()
+			e.valid = issued
+			e.rw.Unlock()
+			return nil
+		}
+		// Cached head without a matching local DB: re-fetch full head.
+		issued = time.Now()
+		obj, err = n.st.Get(ctx, head.HeadKey(e.key), "", head.MaxHeadBytes)
+		if err != nil {
+			if store.OutcomeOf(err) == store.NotFound {
+				e.discard()
+				return n.missing(ctx, e.key)
+			}
+			return storeError(err)
+		}
+	case store.OK:
+	case store.NotFound:
+		e.discard()
+		return n.missing(ctx, e.key)
+	default:
+		return storeError(err)
+	}
+	cur, err := n.decodeHead(obj.Body, e.key, ref.Incarnation)
+	if err != nil {
+		return err
+	}
+	if oldH != nil && cur.Revision < oldH.Revision {
+		n.counters.staleHeads.Add(1)
+		return newError(CodeUnavailable, "the store returned an older head than one already seen", nil)
+	}
+	if cur.Deleted {
+		return n.deleted(e)
+	}
+	// Case A: data unchanged (only owner/compaction changed).
+	if oldDB != nil && oldDB.Published() == imageOf(cur) {
+		e.rw.Lock()
+		if oldH != nil && !slices.Equal(links(oldH), links(cur)) {
+			e.pages = nil
+		}
+		e.h, e.etag, e.valid = cur, obj.ETag, issued
+		e.rw.Unlock()
+		return nil
+	}
+	// Case B: resident DB behind cur; download only the new delta suffix outside
+	// e.rw, then take e.rw briefly to apply pages in place.
+	if oldDB != nil && oldDB.Published().Sequence < cur.Sequence {
+		refs := links(cur)
+		i := slices.IndexFunc(refs, func(r head.Ref) bool { return r.MaxSequence > oldDB.Published().Sequence })
+		if i > 0 && i < len(refs) {
+			objs, done, oerr := n.objects(ctx, refs[i:], cur, &n.counters.activationBytes)
+			if oerr == nil {
+				oerr = engine.CheckObjects(refs[i:], objs)
+			}
+			if oerr == nil {
+				e.rw.Lock()
+				newPages, cerr := oldDB.CatchUp(ctx, n.maxPages(), cur, refs[i:], objs)
+				if cerr == nil {
+					if e.pages != nil && oldH != nil && len(links(oldH)) >= i && slices.Equal(links(oldH)[:i], refs[:i]) {
+						e.pages = append(slices.Clone(e.pages[:i]), newPages...)
+					} else {
+						e.pages = nil
+					}
+					e.h, e.etag, e.valid = cur, obj.ETag, issued
+					e.bytes.Store(oldDB.Bytes())
+					n.counters.activations.Add(1)
+					n.counters.catchUps.Add(1)
+					e.rw.Unlock()
+					done()
+					return nil
+				}
+				// CatchUp already removed the dirty file.
+				e.clearLocked()
+				oldDB = nil
+				e.rw.Unlock()
+			}
+			done()
+			if oerr != nil && !miss(oerr) {
+				return storeError(oerr)
+			}
+		}
+	}
+	// Case C: cold or warm restore into a fresh file outside e.rw, then swap.
+	db, gotH, gotTag, gotIssued, pages, err := n.restoreNew(ctx, e, cur, obj.ETag, oldDB == nil, true)
+	if err != nil {
+		return err
+	}
+	if !gotIssued.IsZero() {
+		issued = gotIssued
+	}
+	e.rw.Lock()
+	if e.db != nil {
+		e.db.Discard()
+	}
+	e.db, e.h, e.etag, e.valid, e.pages = db, gotH, gotTag, issued, pages
+	e.bytes.Store(db.Bytes())
+	e.rw.Unlock()
+	return nil
 }
 
 // Lookup returns the stored outcome of id in freshly validated state, on
@@ -555,7 +771,15 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 		if err != nil {
 			return Ref{}, Result{}, err
 		}
+		e.rw.Lock()
 		e.db = db
+		e.mutating = true
+		e.rw.Unlock()
+		defer func() {
+			e.rw.Lock()
+			e.mutating = false
+			e.rw.Unlock()
+		}()
 		op := head.OpID(req.ID)
 		buf := n.spool()
 		defer buf.Close()
@@ -620,6 +844,7 @@ func (n *Node) create(ctx context.Context, key string, req Request, bound head.D
 			e.discard()
 			return unknown(err)
 		}
+		buf.Close()
 		self := n.self
 		c.next = head.Head{Format: head.Format, Namespace: n.ns, Key: key, Incarnation: inc, Revision: c.next.Revision, Nonce: head.NewID(),
 			Owner: &self, Epoch: c.next.Epoch, Sequence: snap.Ref.MaxSequence, Schema: req.Schema, Codec: head.Codec, PageSize: head.PageSize,
@@ -787,6 +1012,15 @@ func (n *Node) mutate(ctx context.Context, ref Ref, req Request, kind byte, to u
 		var seq uint64
 		var result []byte
 		if verdict == nil && res == nil {
+			e.rw.Lock()
+			e.db.CloseReaders()
+			e.mutating = true
+			e.rw.Unlock()
+			defer func() {
+				e.rw.Lock()
+				e.mutating = false
+				e.rw.Unlock()
+			}()
 			floor := n.now().Add(-n.cfg.Limits.ReceiptRetention).UnixMilli()
 			failpoint("sql.before")
 			result, seq, err = e.db.Mutate(engine.Commit{ID: head.OpID(req.ID), Bound: bound, Schema: to, FloorMs: uint64(floor), Fresh: n.fresh(e)},
@@ -893,6 +1127,7 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 		if err := n.putObject(ctx, ref.Key, buf, ref.SHA256); err != nil {
 			return fail(err)
 		}
+		buf.Close()
 	} else {
 		t, tbuf := delta, buf
 		if h.Tail != nil {
@@ -917,6 +1152,8 @@ func (n *Node) publishUpdate(ctx context.Context, e *entity, req Request, bound 
 			if err := n.putObject(ctx, ref.Key, tbuf, ref.SHA256); err != nil {
 				return fail(err)
 			}
+			tbuf.Close()
+			buf.Close()
 		}
 	}
 	c.next = next

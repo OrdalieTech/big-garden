@@ -546,7 +546,71 @@ func TestOldReceiptsLayoutRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Discard()
-	if err := d.check(&head.Head{Namespace: ns, Key: "key", Incarnation: inc, Schema: 1}); !errors.Is(err, ErrCorrupt) {
+	if err := d.check(&head.Head{Namespace: ns, Key: "key", Incarnation: inc, Schema: 1}, true); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("old receipts layout: %v, want ErrCorrupt", err)
+	}
+}
+
+func TestTempPrepareAndCatchUp(t *testing.T) {
+	f := newFixture(t, 4000)
+	f.mutate(t, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+	f.publish(t, true)
+	// Temp table + temp trigger + prepared statement inside Mutate, cleaned up on exit.
+	f.n++
+	if _, _, err := f.d.Mutate(commit(f.n), func(tx *Tx) ([]byte, error) {
+		if _, err := tx.Exec(bg, `CREATE TEMP TABLE inc(id INTEGER PRIMARY KEY, v TEXT);
+			CREATE TEMP TABLE log(id INTEGER);
+			CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO temp.log VALUES(NEW.id); END`); err != nil {
+			return nil, err
+		}
+		st, err := tx.Prepare(bg, "INSERT INTO temp.inc VALUES(?, ?)")
+		if err != nil {
+			return nil, err
+		}
+		for i := 1; i <= 5; i++ {
+			if _, err := st.Exec(bg, i, fmt.Sprintf("v%d", i)); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := tx.Exec(bg, "INSERT INTO main.t SELECT id, v FROM temp.inc"); err != nil {
+			return nil, err
+		}
+		var n int
+		if err := tx.Query(bg, "SELECT count(*) FROM temp.log", nil, func(r *sql.Rows) error {
+			r.Next()
+			return r.Scan(&n)
+		}); err != nil || n != 5 {
+			return nil, fmt.Errorf("temp trigger count %d: %v", n, err)
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Temp objects must not survive past Mutate.
+	var tempCount int
+	if err := f.d.conn.QueryRowContext(bg, "SELECT count(*) FROM sqlite_temp_schema WHERE name NOT LIKE 'sqlite_%'").Scan(&tempCount); err != nil || tempCount != 0 {
+		t.Fatalf("temp objects left after Mutate: %d (%v)", tempCount, err)
+	}
+	f.publish(t, false)
+	// Restore at seq 2, then apply seq 3 delta in place with CatchUp + concurrent ReadConcurrent.
+	r := f.restore(t)
+	f.mutate(t, "UPDATE t SET v = 'updated' WHERE id = 3")
+	f.publish(t, false)
+	deltaRef := f.head.Deltas[len(f.head.Deltas)-1]
+	deltaObj := f.objs[len(f.objs)-1]
+	if err := CheckObjects([]head.Ref{deltaRef}, readers([][]byte{deltaObj})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.CatchUp(bg, 4000, &f.head, []head.Ref{deltaRef}, readers([][]byte{deltaObj})); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	var got string
+	if _, err := r.ReadConcurrent(bg, func(v *View) ([]byte, error) {
+		return nil, v.Query(bg, "SELECT v FROM t WHERE id = 3", nil, func(rs *sql.Rows) error {
+			rs.Next()
+			return rs.Scan(&got)
+		})
+	}); err != nil || got != "updated" {
+		t.Fatalf("ReadConcurrent after CatchUp: %q (%v)", got, err)
 	}
 }

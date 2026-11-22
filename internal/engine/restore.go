@@ -37,6 +37,18 @@ const maxFrame = pageSize + pageSize/255 + 16
 // the replay pages of PROTOCOL §6 step 7.
 func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt, from *Image) (
 	d *DB, pages []uint32, err error) {
+	return restore(ctx, drv, path, maxPages, h, objs, from, false)
+}
+
+// RestoreChecked is Restore with PRAGMA integrity_check forced at any size
+// (used by Import on untrusted archives).
+func RestoreChecked(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (
+	d *DB, pages []uint32, err error) {
+	return restore(ctx, drv, path, maxPages, h, objs, nil, true)
+}
+
+func restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt, from *Image, fullCheck bool) (
+	d *DB, pages []uint32, err error) {
 	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
 	if h.Tail != nil {
 		refs = append(refs, h.Tail.Ref())
@@ -58,8 +70,12 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 			break
 		}
 	}
-	var full Image
-	if err == nil {
+	// On a cold restore (from == nil), apply created the file from scratch and
+	// hashed every page it wrote, so img.Checksum already covers the whole file.
+	// A warm file (from != nil) is an untrusted local hint and must pass a full
+	// file scan against head.DatabaseChecksum.
+	full := img
+	if err == nil && from != nil {
 		full, err = fileImage(f, img.Sequence)
 	}
 	if err == nil && (img != Image{h.Sequence, h.PageCount, h.DatabaseChecksum} || full != img) {
@@ -77,12 +93,75 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 	// Node's extensions, so activation never runs caller code.
 	c := &DB{db: sql.OpenDB(connector{&sqlite.Driver{}, fileDSN(path, "ro")})}
 	if c.conn, err = c.db.Conn(ctx); err == nil {
-		err = c.check(h)
+		err = c.check(h, fullCheck)
 	}
 	if err = errors.Join(err, c.close()); err != nil {
 		return nil, nil, errors.Join(err, d.Discard())
 	}
 	return d, pages, nil
+}
+
+// CheckObjects verifies each object's length, SHA-256 and LTX frame bounds
+// against its reference without touching any database file.
+func CheckObjects(refs []head.Ref, objs []io.ReaderAt) error {
+	if len(refs) != len(objs) {
+		return errors.New("engine: object count differs from refs")
+	}
+	for i, ref := range refs {
+		if err := checkObject(objs[i], ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CatchUp applies the delta suffix refs/objs directly onto d's already-verified
+// resident file, updating its rolling checksum incrementally without scanning
+// unchanged pages. On any error the file is removed and d is unusable.
+func (d *DB) CatchUp(ctx context.Context, maxPages uint32, h *head.Head, refs []head.Ref, objs []io.ReaderAt) ([]uint32, error) {
+	if len(refs) == 0 || len(refs) != len(objs) || h.PageCount > maxPages {
+		return nil, errors.New("engine: invalid catch-up objects or page limit")
+	}
+	path, drv, img := d.path, d.drv, d.pub
+	if err := d.close(); err != nil {
+		removeFiles(path)
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|NoFollow, 0o600)
+	if err != nil {
+		removeFiles(path)
+		return nil, err
+	}
+	pages := make([]uint32, len(refs))
+	for i, ref := range refs {
+		if img, pages[i], err = apply(ctx, f, img, ref, objs[i], i == 0); err != nil {
+			break
+		}
+	}
+	if err == nil && (img != Image{h.Sequence, h.PageCount, h.DatabaseChecksum}) {
+		err = fmt.Errorf("%w: caught-up image %+v differs from the head", ErrCorrupt, img)
+	}
+	if err = errors.Join(err, f.Close()); err != nil {
+		removeFiles(path)
+		return nil, err
+	}
+	reopened, err := open(ctx, drv, path, maxPages)
+	if err != nil {
+		removeFiles(path)
+		return nil, err
+	}
+	m, err := reopened.Meta()
+	if err == nil && (m.Namespace != h.Namespace || m.Key != h.Key || m.Incarnation != h.Incarnation ||
+		m.Schema != h.Schema || m.Sequence != h.Sequence) {
+		err = fmt.Errorf("%w: _state_meta does not match the head after catch-up", ErrCorrupt)
+	}
+	if err != nil {
+		reopened.Discard()
+		return nil, err
+	}
+	reopened.pub = img
+	d.db, d.conn, d.main, d.pub = reopened.db, reopened.conn, reopened.main, reopened.pub
+	return pages, nil
 }
 
 // Rebase rewrites the identity in the metadata row of an imported image
@@ -100,8 +179,9 @@ func (d *DB) Rebase(ns head.ID, key string, inc head.ID) error {
 }
 
 // check verifies the metadata row against h and the schema's use of
-// reserved names, and runs integrity_check.
-func (d *DB) check(h *head.Head) error {
+// reserved names, and runs integrity_check for databases up to 256 MiB or
+// when fullCheck is forced (Import).
+func (d *DB) check(h *head.Head, fullCheck bool) error {
 	m, err := d.Meta()
 	if err != nil {
 		return err
@@ -124,12 +204,14 @@ func (d *DB) check(h *head.Head) error {
 	case err != nil || files != filesSQL:
 		return fmt.Errorf("%w: _state_blobs is not the format 1 table", ErrCorrupt)
 	}
-	var res string
-	if err := d.conn.QueryRowContext(context.Background(), "PRAGMA integrity_check(1)").Scan(&res); err != nil {
-		return err
-	}
-	if res != "ok" {
-		return fmt.Errorf("%w: integrity_check: %.200s", ErrCorrupt, res)
+	if fullCheck || h.PageCount <= 65536 {
+		var res string
+		if err := d.conn.QueryRowContext(context.Background(), "PRAGMA integrity_check(1)").Scan(&res); err != nil {
+			return err
+		}
+		if res != "ok" {
+			return fmt.Errorf("%w: integrity_check: %.200s", ErrCorrupt, res)
+		}
 	}
 	return nil
 }
