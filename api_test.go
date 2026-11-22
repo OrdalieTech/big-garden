@@ -109,8 +109,8 @@ func TestAPIFrozen(t *testing.T) {
 			callables++
 		}
 	}
-	if types > 18 || callables > 36 { // 30, plus Tx.File (D33), ReadStale/Tx.Prepare/Stmt (D39, D40)
-		t.Fatalf("API budget exceeded: %d types (max 18), %d functions/methods (max 36)", types, callables)
+	if types > 18 || callables > 41 { // 30, plus Tx.File (D33), ReadStale/Tx.Prepare/Stmt (D39, D40), ReadKey/Write/Remove/QueryRow (D41)
+		t.Fatalf("API budget exceeded: %d types (max 18), %d functions/methods (max 41)", types, callables)
 	}
 }
 

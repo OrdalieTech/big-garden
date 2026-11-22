@@ -530,25 +530,44 @@ func TestLocalDir(t *testing.T) {
 	}
 	w := openLocal("writer")
 	r := openLocal("reader")
-	ref, _, err := w.Create(bg, "k1", newReq(t, "c1", 1), func(tx *Tx) ([]byte, error) {
+	if _, err := w.Write(bg, "k1", 1, func(tx *Tx) error {
 		if _, err := tx.Exec(bg, "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)"); err != nil {
-			return nil, err
+			return err
 		}
-		_, err := tx.Exec(bg, "INSERT INTO t VALUES('a', 42)")
-		return nil, err
-	})
-	if err != nil {
+		if _, err := tx.Exec(bg, "INSERT INTO t VALUES('a', 42)"); err != nil {
+			return err
+		}
+		var v int
+		if err := tx.QueryRow(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, &v); err != nil || v != 42 {
+			t.Fatalf("Tx.QueryRow = %d, %v", v, err)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var got int
-	if _, err := r.ReadStale(bg, ref, 1, time.Second, func(v *View) ([]byte, error) {
-		return nil, v.Query(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, func(rows *sql.Rows) error {
-			if rows.Next() {
-				return rows.Scan(&got)
-			}
-			return rows.Err()
-		})
+	if _, err := r.ReadKey(bg, "k1", 1, time.Second, func(v *View) error {
+		return v.QueryRow(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, &got)
 	}); err != nil || got != 42 {
-		t.Fatalf("LocalDir read = %d, %v", got, err)
+		t.Fatalf("ReadKey = %d, %v", got, err)
+	}
+	// Another writer takes over via Write, then removes via Remove.
+	w2 := openLocal("writer2")
+	if _, err := w2.Write(bg, "k1", 1, func(tx *Tx) error {
+		_, err := tx.Exec(bg, "UPDATE t SET v=99 WHERE k='a'")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadKey(bg, "k1", 1, 0, func(v *View) error {
+		return v.QueryRow(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, &got)
+	}); err != nil || got != 99 {
+		t.Fatalf("ReadKey after takeover = %d, %v", got, err)
+	}
+	if err := w2.Remove(bg, "k1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadKey(bg, "k1", 1, 0, func(v *View) error { return nil }); func() bool { _, ok := hasCode(err, CodeNotFound); return !ok }() {
+		t.Fatalf("ReadKey after Remove: %v", err)
 	}
 }

@@ -34,6 +34,8 @@ type Node struct {
 
 	mu         sync.Mutex
 	entities   map[string]*entity
+	refMu      sync.RWMutex
+	refs       map[string]Ref
 	wmu        sync.Mutex          // the warm tier below; after mu, never before
 	warm       map[string]warmFile // by EntityDir hash (D21)
 	warmUsed   int64               // sum of the warm files' bytes, under wmu
@@ -92,7 +94,7 @@ func open(ctx context.Context, cfg Config, st store.Store) (*Node, error) {
 	if cfg.Key != nil {
 		st, _ = store.Sealed(st, cfg.Key) // validated: 32 bytes
 	}
-	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, uploads: map[string]upload{}, unborn: map[string]spooledBlob{}, offGate: 16 << 20 / head.PageSize, now: time.Now,
+	n := &Node{cfg: cfg, st: limited{st, make(chan struct{}, cfg.Limits.InflightStorage), &[4]atomic.Int64{}}, entities: map[string]*entity{}, refs: map[string]Ref{}, uploads: map[string]upload{}, unborn: map[string]spooledBlob{}, offGate: 16 << 20 / head.PageSize, now: time.Now,
 		recoveries: make(chan struct{}, cfg.Limits.Recoveries)}
 	var err error
 	if n.drv, err = engine.NewDriver(cfg.Extend); err != nil {

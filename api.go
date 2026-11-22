@@ -158,10 +158,33 @@ func (v *View) Query(ctx context.Context, q string, args []any, fn func(*sql.Row
 	return v.v.Query(ctx, q, args, fn)
 }
 
+func (v *View) QueryRow(ctx context.Context, q string, args []any, dest ...any) error {
+	return queryRow(ctx, v.v.Query, q, args, dest...)
+}
+
 func (t *Tx) Query(ctx context.Context, q string, args []any, fn func(*sql.Rows) error) error {
 	return t.t.Query(ctx, q, args, fn)
 }
 
+func (t *Tx) QueryRow(ctx context.Context, q string, args []any, dest ...any) error {
+	return queryRow(ctx, t.t.Query, q, args, dest...)
+}
+
 func (t *Tx) Exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
 	return t.t.Exec(ctx, q, args...)
+}
+
+func queryRow(ctx context.Context, qfn func(context.Context, string, []any, func(*sql.Rows) error) error, q string, args []any, dest ...any) error {
+	found := false
+	err := qfn(ctx, q, args, func(rows *sql.Rows) error {
+		if rows.Next() {
+			found = true
+			return rows.Scan(dest...)
+		}
+		return rows.Err()
+	})
+	if err == nil && !found {
+		return sql.ErrNoRows
+	}
+	return err
 }
