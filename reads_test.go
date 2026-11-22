@@ -2,14 +2,19 @@ package garden
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
+	"github.com/OrdalieTech/big-garden/internal/store"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
 )
 
@@ -415,10 +420,28 @@ func TestReadStaleConcurrentAndCatchUp(t *testing.T) {
 		}
 		return minGen, res.Version.Sequence, nil
 	}
-	// Cold activation on follower.
-	gen, seq0, err := readConsistent(follower, 200*time.Millisecond)
-	if err != nil || gen != 0 {
-		t.Fatalf("initial ReadStale: gen=%d seq=%d err=%v", gen, seq0, err)
+	// Cold activation on follower via ReadStale returns CodeUnavailable immediately
+	// while activating in the background.
+	waitReady := func(n *Node, maxAge time.Duration) (int, uint64) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			g, seq, err := readConsistent(n, maxAge)
+			if err == nil {
+				return g, seq
+			}
+			if _, ok := hasCode(err, CodeUnavailable); !ok {
+				t.Fatalf("unexpected ReadStale error: %v", err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for background activation")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	gen, seq0 := waitReady(follower, 200*time.Millisecond)
+	if gen != 0 {
+		t.Fatalf("initial ReadStale: gen=%d seq=%d", gen, seq0)
 	}
 	// Fresh reads make zero S3 requests.
 	from := len(st.Journal())
@@ -507,8 +530,8 @@ func TestReadStaleConcurrentAndCatchUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := warmNode(t, st, "follower2", t.TempDir(), nil)
-	if g, _, err := readConsistent(fresh, time.Second); err != nil || g != 12 {
-		t.Fatalf("fresh follower after cache wipe: gen=%d err=%v", g, err)
+	if g, _ := waitReady(fresh, time.Second); g != 12 {
+		t.Fatalf("fresh follower after cache wipe: gen=%d", g)
 	}
 }
 
@@ -546,10 +569,19 @@ func TestLocalDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got int
-	if _, err := r.ReadKey(bg, "k1", 1, time.Second, func(v *View) error {
-		return v.QueryRow(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, &got)
-	}); err != nil || got != 42 {
-		t.Fatalf("ReadKey = %d, %v", got, err)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		_, err := r.ReadKey(bg, "k1", 1, time.Second, func(v *View) error {
+			return v.QueryRow(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, &got)
+		})
+		if err == nil {
+			break
+		}
+		if _, ok := hasCode(err, CodeUnavailable); !ok || time.Now().After(deadline) {
+			t.Fatalf("ReadKey = %d, %v", got, err)
+		}
+	}
+	if got != 42 {
+		t.Fatalf("ReadKey = %d, want 42", got)
 	}
 	// Another writer takes over via Write, then removes via Remove.
 	w2 := openLocal("writer2")
@@ -569,5 +601,219 @@ func TestLocalDir(t *testing.T) {
 	}
 	if _, err := r.ReadKey(bg, "k1", 1, 0, func(v *View) error { return nil }); func() bool { _, ok := hasCode(err, CodeNotFound); return !ok }() {
 		t.Fatalf("ReadKey after Remove: %v", err)
+	}
+}
+
+type throttledStore struct {
+	store.Store
+	delay     atomic.Int64 // nanoseconds per Read on .ltx objects
+	inFlight  atomic.Int64
+	maxActive atomic.Int64
+}
+
+func (s *throttledStore) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
+	rc, err := s.Store.Open(ctx, key, off, n)
+	if err != nil || !strings.HasSuffix(key, ".ltx") {
+		return rc, err
+	}
+	cur := s.inFlight.Add(1)
+	for {
+		old := s.maxActive.Load()
+		if cur <= old || s.maxActive.CompareAndSwap(old, cur) {
+			break
+		}
+	}
+	return &throttledReader{rc: rc, ctx: ctx, store: s}, nil
+}
+
+type throttledReader struct {
+	rc     io.ReadCloser
+	ctx    context.Context
+	store  *throttledStore
+	closed atomic.Bool
+}
+
+func (r *throttledReader) Read(p []byte) (int, error) {
+	if d := time.Duration(r.store.delay.Load()); d > 0 {
+		t := time.NewTimer(d)
+		select {
+		case <-r.ctx.Done():
+			t.Stop()
+			return 0, r.ctx.Err()
+		case <-t.C:
+		}
+	}
+	if len(p) > 4096 {
+		p = p[:4096]
+	}
+	return r.rc.Read(p)
+}
+
+func (r *throttledReader) Close() error {
+	if r.closed.CompareAndSwap(false, true) {
+		r.store.inFlight.Add(-1)
+	}
+	return r.rc.Close()
+}
+
+// TestReadStaleSlowRepublishAndColdActivation reproduces the production bug
+// where a republished snapshot or newly added entity takes longer to download
+// than the per-request deadline: reads on an already-local entity must never
+// fail or wait (serving stale data until background catch-up completes),
+// requests for a not-yet-local entity must return immediately while activating
+// in the background, and downloads must run one at a time when Recoveries=1.
+func TestReadStaleSlowRepublishAndColdActivation(t *testing.T) {
+	base := newStore(t)
+	ts := &throttledStore{Store: base}
+	owner := testNode(t, base, "owner", nil)
+	follower := warmNode(t, ts, "follower", t.TempDir(), func(l *Limits) {
+		l.Recoveries = 1
+	})
+
+	// Seed company-fr at gen 1 and warm it on the follower.
+	ref, _, err := owner.Create(bg, "index/company-fr", newReq(t, "c0", 1), func(tx *Tx) ([]byte, error) {
+		if _, err := tx.Exec(bg, "CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT, gen INTEGER NOT NULL)"); err != nil {
+			return nil, err
+		}
+		for i := range 200 {
+			if _, err := tx.Exec(bg, "INSERT INTO kv VALUES(?, ?, 1)", fmt.Sprintf("k%04d", i), randText(512)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := follower.Read(bg, ref, 1, func(v *View) ([]byte, error) { return nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	// Builder republishes a new snapshot of index/company-fr (gen 2) and a brand-new entity sources/fr.land.
+	if _, err := owner.Update(bg, ref, newReq(t, "u2", 1), func(tx *Tx) ([]byte, error) {
+		for i := range 200 {
+			if _, err := tx.Exec(bg, "UPDATE kv SET v=?, gen=2 WHERE k=?", randText(512), fmt.Sprintf("k%04d", i)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.Snapshot(bg, ref); err != nil {
+		t.Fatal(err)
+	}
+	landRef, _, err := owner.Create(bg, "sources/fr.land", newReq(t, "land0", 1), func(tx *Tx) ([]byte, error) {
+		if _, err := tx.Exec(bg, "CREATE TABLE land(k TEXT PRIMARY KEY, v TEXT)"); err != nil {
+			return nil, err
+		}
+		for i := range 200 {
+			if _, err := tx.Exec(bg, "INSERT INTO land VALUES(?, ?)", fmt.Sprintf("l%04d", i), randText(512)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Throttle .ltx reads so a snapshot download takes ~450ms, well beyond the 80ms request deadline.
+	ts.delay.Store(int64(15 * time.Millisecond))
+	const (
+		maxAge     = 30 * time.Millisecond
+		reqTimeout = 80 * time.Millisecond
+	)
+	// Let validTime age past maxAge before requests arrive (the quiet-gap trigger).
+	time.Sleep(maxAge + 20*time.Millisecond)
+
+	// Concurrently serve requests with an 80ms deadline while both downloads run.
+	var failedReads, servedReads, sawStale atomic.Int64
+	var sawGen2 atomic.Bool
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rctx, cancel := context.WithTimeout(bg, reqTimeout)
+				var gen int
+				res, err := follower.ReadStale(rctx, ref, 1, maxAge, func(v *View) ([]byte, error) {
+					return nil, v.QueryRow(rctx, "SELECT MIN(gen) FROM kv", nil, &gen)
+				})
+				cancel()
+				if err != nil {
+					failedReads.Add(1)
+					t.Errorf("ReadStale failed during slow republish: %v", err)
+					return
+				}
+				servedReads.Add(1)
+				if res.Stale > maxAge {
+					sawStale.Add(1)
+				}
+				if gen == 2 {
+					sawGen2.Store(true)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
+
+	// A request for not-yet-local sources/fr.land must answer immediately (< 40ms), not block until reqTimeout.
+	lctx, lcancel := context.WithTimeout(bg, reqTimeout)
+	t0 := time.Now()
+	_, lerr := follower.ReadStale(lctx, landRef, 1, maxAge, func(v *View) ([]byte, error) { return nil, nil })
+	lcancel()
+	if elapsed := time.Since(t0); elapsed >= reqTimeout/2 {
+		t.Errorf("cold ReadStale waited %v (want immediate error)", elapsed)
+	}
+	var ge *Error
+	if !errors.As(lerr, &ge) || ge.Code != CodeUnavailable {
+		t.Errorf("cold ReadStale err = %v, want CodeUnavailable", lerr)
+	}
+
+	// Wait for both background downloads to finish on their own (no request context cancellation).
+	deadline := time.Now().Add(15 * time.Second)
+	for !sawGen2.Load() {
+		if time.Now().After(deadline) {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("follower never caught up to gen 2 (served=%d failed=%d)", servedReads.Load(), failedReads.Load())
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	for {
+		rctx, cancel := context.WithTimeout(bg, reqTimeout)
+		_, err := follower.ReadStale(rctx, landRef, 1, maxAge, func(v *View) ([]byte, error) { return nil, nil })
+		cancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("sources/fr.land never activated in background: %v", err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	close(stop)
+	wg.Wait()
+
+	if failedReads.Load() != 0 {
+		t.Fatalf("failedReads = %d, want 0", failedReads.Load())
+	}
+	if servedReads.Load() == 0 {
+		t.Fatal("expected reads to be served during slow republish")
+	}
+	if sawStale.Load() == 0 {
+		t.Fatal("expected ReadStale to report Stale > maxAge while background download was running")
+	}
+	if max := ts.maxActive.Load(); max > 1 {
+		t.Fatalf("concurrent .ltx downloads = %d, want 1 (Recoveries=1)", max)
 	}
 }

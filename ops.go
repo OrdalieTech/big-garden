@@ -390,12 +390,14 @@ func (n *Node) Read(ctx context.Context, ref Ref, schema uint32, fn func(*View) 
 	return Result{Value: v, Version: Version{e.h.Incarnation, e.h.Sequence}}, nil
 }
 
-// ReadStale runs fn on a local read-only snapshot of ref whose head was proven
-// current within maxAge, without waiting on S3 when fresh and without taking
-// ownership. Concurrent ReadStale calls execute in parallel on a read-only
-// SQLite connection pool. When half of maxAge has elapsed, a single background
-// revalidation checks S3 and, if the head moved, downloads only the new deltas
-// before briefly pausing readers to apply them in place. A maxAge <= 0 runs a
+// ReadStale runs fn on a local read-only snapshot of ref without waiting on S3
+// or taking ownership. Concurrent ReadStale calls execute in parallel on a
+// read-only SQLite connection pool. When half of maxAge has elapsed, a single
+// background refresh checks S3 (under the Node's lifetime context, independent
+// of any request deadline) and downloads only new deltas or a replacement
+// snapshot one recovery at a time while reads keep serving the already-local
+// revision. If the entity is not local yet, ReadStale starts background
+// activation and returns CodeUnavailable immediately. A maxAge <= 0 runs a
 // strong Read.
 func (n *Node) ReadStale(ctx context.Context, ref Ref, schema uint32, maxAge time.Duration, fn func(*View) ([]byte, error)) (res Result, err error) {
 	if maxAge <= 0 {
@@ -410,54 +412,36 @@ func (n *Node) ReadStale(ctx context.Context, ref Ref, schema uint32, maxAge tim
 		return Result{}, err
 	}
 	defer n.drop(e)
-	for range 3 {
-		e.rw.RLock()
-		if e.roReady(ref) {
-			age := time.Since(e.validTime())
-			if age < maxAge {
-				if age >= maxAge/2 {
-					n.refreshAsync(e, ref)
-				}
-				if e.h.Schema != schema {
-					ver, got := Version{e.h.Incarnation, e.h.Sequence}, e.h.Schema
-					e.rw.RUnlock()
-					return Result{}, &Error{Code: CodeSchemaMismatch, At: ver, Schema: got, Message: "stored schema differs"}
-				}
-				db, ver := e.db, Version{e.h.Incarnation, e.h.Sequence}
-				e.touch()
-				var cb error
-				v, err := db.ReadConcurrent(ctx, scoped(math.MaxInt, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
-				e.rw.RUnlock()
-				if err != nil {
-					return Result{}, callbackError(err, cb)
-				}
-				return Result{Value: v, Version: ver}, nil
-			}
-		}
-		e.rw.RUnlock()
-		if err := n.refreshSync(ctx, ref, maxAge); err != nil {
-			return Result{}, err
-		}
-	}
-	return Result{}, newError(CodeUnavailable, "entity changed repeatedly during read", nil)
-}
-
-func (n *Node) refreshSync(ctx context.Context, ref Ref, maxAge time.Duration) error {
-	e, err := n.enter(ctx, ref.Key, &MutationID{}, nil, true)
-	if err != nil {
-		return err
-	}
-	defer n.leave(e)
 	e.rw.RLock()
-	fresh := e.roReady(ref) && time.Since(e.validTime()) < maxAge
-	e.rw.RUnlock()
-	if fresh {
-		return nil
+	if e.roReady(ref) {
+		age := time.Since(e.validTime())
+		if age >= maxAge/2 {
+			n.refreshAsync(e, ref, maxAge)
+		}
+		if e.h.Schema != schema {
+			ver, got := Version{e.h.Incarnation, e.h.Sequence}, e.h.Schema
+			e.rw.RUnlock()
+			return Result{}, &Error{Code: CodeSchemaMismatch, At: ver, Schema: got, Message: "stored schema differs"}
+		}
+		db, ver, syncing := e.db, Version{e.h.Incarnation, e.h.Sequence}, e.refreshing.Load()
+		e.touch()
+		var cb error
+		v, err := db.ReadConcurrent(ctx, scoped(math.MaxInt, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
+		e.rw.RUnlock()
+		if err != nil {
+			return Result{}, callbackError(err, cb)
+		}
+		return Result{Value: v, Version: ver, Stale: age, Syncing: syncing}, nil
 	}
-	return n.syncFollower(ctx, e, ref)
+	e.rw.RUnlock()
+	n.refreshAsync(e, ref, maxAge)
+	return Result{}, newError(CodeUnavailable, "entity activation in progress", nil)
 }
 
-func (n *Node) refreshAsync(e *entity, ref Ref) {
+func (n *Node) refreshAsync(e *entity, ref Ref, maxAge time.Duration) {
+	if retry := e.retryAfter.Load(); retry > 0 && time.Now().UnixNano() < retry {
+		return
+	}
 	if !e.refreshing.CompareAndSwap(false, true) {
 		return
 	}
@@ -480,8 +464,22 @@ func (n *Node) refreshAsync(e *entity, ref Ref) {
 			return
 		}
 		defer n.leave(e)
-		if !n.isClosed() && e.unresolved == nil {
-			_ = n.syncFollower(ctx, e, ref)
+		if n.isClosed() || e.unresolved != nil {
+			return
+		}
+		err := n.syncFollower(ctx, e, ref)
+		if ge, ok := hasCode(err, CodeIncarnationMismatch); ok && ge.Route != nil {
+			if err = n.syncFollower(ctx, e, ge.Route.Ref); err == nil {
+				n.setRef(e.key, ge.Route.Ref)
+			}
+		} else if _, ok := hasCode(err, CodeNotFound); ok {
+			n.forgetRef(e.key)
+		}
+		if err != nil {
+			backoff := min(max(maxAge/2, 20*time.Millisecond), time.Second)
+			e.retryAfter.Store(time.Now().Add(backoff).UnixNano())
+		} else {
+			e.retryAfter.Store(0)
 		}
 	}()
 }
@@ -541,11 +539,16 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 		return nil
 	}
 	// Case B: resident DB behind cur; download only the new delta suffix outside
-	// e.rw, then take e.rw briefly to apply pages in place.
+	// e.rw (serialized by n.recoveries), then take e.rw briefly to apply pages in place.
 	if oldDB != nil && oldDB.Published().Sequence < cur.Sequence {
 		refs := links(cur)
 		i := slices.IndexFunc(refs, func(r head.Ref) bool { return r.MaxSequence > oldDB.Published().Sequence })
 		if i > 0 && i < len(refs) {
+			select {
+			case n.recoveries <- struct{}{}:
+			case <-ctx.Done():
+				return newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
+			}
 			objs, done, oerr := n.objects(ctx, refs[i:], cur, &n.counters.activationBytes)
 			if oerr == nil {
 				oerr = engine.CheckObjects(refs[i:], objs)
@@ -566,6 +569,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 					n.counters.catchUps.Add(1)
 					e.rw.Unlock()
 					done()
+					<-n.recoveries
 					return nil
 				}
 				// CatchUp already removed the dirty file.
@@ -574,18 +578,14 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 				e.rw.Unlock()
 			}
 			done()
+			<-n.recoveries
 			if oerr != nil && !miss(oerr) {
 				return storeError(oerr)
 			}
 		}
 	}
 	// Case C: cold or warm restore into a fresh file outside e.rw, then swap.
-	// If keeping oldDB alongside the replacement would exceed CacheBytes,
-	// discard oldDB first so peak disk stays bounded to one copy of the database.
-	if oldDB != nil && !n.fitsWith(e, n.activationBytes(cur)) {
-		e.discard()
-		oldDB = nil
-	}
+	// restoreNew acquires n.recoveries and discards oldDB only if needed to fit CacheBytes.
 	db, gotH, gotTag, gotIssued, pages, err := n.restoreNew(ctx, e, cur, obj.ETag, oldDB == nil, true)
 	if err != nil {
 		return err

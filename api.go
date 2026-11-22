@@ -71,6 +71,8 @@ type Result struct {
 	Value    []byte // copied, bounded; never an open cursor or streaming body
 	Version  Version
 	Replayed bool
+	Stale    time.Duration // age since last storage head proof (set by ReadStale)
+	Syncing  bool          // true while a background refresh is in flight
 }
 
 // Config configures a Node. The caller owns S3 and Logger.

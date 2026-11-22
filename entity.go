@@ -40,6 +40,7 @@ type entity struct {
 	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
 	usedUnix   atomic.Int64 // unix nanos of last ReadStale hit
 	refreshing atomic.Bool  // background ReadStale revalidation in flight
+	retryAfter atomic.Int64 // unix nanos before next background refresh after an error
 	building   bool         // under Node.mu: between room and unreserve, counted as resident
 	tried      time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
 	validUnix  atomic.Int64 // unix nanos of issue time that last proved h current: a GET, 304 or CAS (D23)
@@ -468,6 +469,12 @@ func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag str
 		return nil, nil, "", time.Time{}, nil, newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
 	}
 	need := n.activationBytes(h)
+	// If replacing an existing resident image would exceed CacheBytes, discard
+	// it only once this activation holds a recovery slot (never while queued).
+	if e.db != nil && !n.fitsWith(e, need) {
+		e.discard()
+		tryWarm = true
+	}
 	if err := n.cacheFor(ctx, e, need); err != nil {
 		return nil, nil, "", time.Time{}, nil, err
 	}
