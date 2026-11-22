@@ -91,9 +91,11 @@ func (l Limits) resolve() (Limits, error) {
 func (c Config) validate() (Config, error) {
 	var err error
 	switch {
-	case c.S3 == nil:
+	case c.LocalDir != "" && (c.S3 != nil || c.Bucket != ""):
+		return c, invalid("Config.LocalDir cannot be combined with S3 or Bucket")
+	case c.LocalDir == "" && c.S3 == nil:
 		return c, invalid("Config.S3 is required")
-	case c.Bucket == "":
+	case c.LocalDir == "" && c.Bucket == "":
 		return c, invalid("Config.Bucket is required")
 	case !validPrefix(c.Prefix):
 		return c, invalid("Config.Prefix must be 1..256 bytes of UTF-8 '/'-separated segments, none empty, '.' or '..'")

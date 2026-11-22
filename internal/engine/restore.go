@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 
@@ -45,6 +46,62 @@ func Restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 func RestoreChecked(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt) (
 	d *DB, pages []uint32, err error) {
 	return restore(ctx, drv, path, maxPages, h, objs, nil, true)
+}
+
+// RestoreStream reconstructs the image named by h directly from streamed LTX
+// readers opened one at a time, without spooling encoded LTX objects to disk.
+// Each stream's exact length, SHA-256, frame bounds, header, trailer and
+// rolling checksum are verified against h before the database is opened; any
+// error deletes path. open returns the stream for ref (which may wrap
+// ErrCorrupt on authentication failure or return a storage error).
+func RestoreStream(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head,
+	openObj func(head.Ref) (io.ReadCloser, error)) (d *DB, pages []uint32, err error) {
+	refs := append([]head.Ref{h.Snapshot}, h.Deltas...)
+	if h.Tail != nil {
+		refs = append(refs, h.Tail.Ref())
+	}
+	if h.PageCount > maxPages {
+		return nil, nil, errors.New("engine: head exceeds page limit")
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|NoFollow, 0o600)
+	if err != nil {
+		return nil, nil, err
+	}
+	var img Image
+	pages = make([]uint32, len(refs))
+	for i, ref := range refs {
+		var rc io.ReadCloser
+		rc, err = openObj(ref)
+		if err != nil {
+			break
+		}
+		img, pages[i], err = applyStream(ctx, f, img, ref, rc)
+		cerr := rc.Close()
+		if err == nil {
+			err = cerr
+		}
+		if err != nil {
+			break
+		}
+	}
+	if err == nil && (img != Image{h.Sequence, h.PageCount, h.DatabaseChecksum}) {
+		err = fmt.Errorf("%w: restored image %+v differs from the head", ErrCorrupt, img)
+	}
+	if err = errors.Join(err, f.Close()); err != nil {
+		return nil, nil, errors.Join(err, removeFiles(path))
+	}
+	if d, err = open(ctx, drv, path, maxPages); err != nil {
+		return nil, nil, errors.Join(err, removeFiles(path))
+	}
+	d.pub = img
+	c := &DB{db: sql.OpenDB(connector{&sqlite.Driver{}, fileDSN(path, "ro")})}
+	if c.conn, err = c.db.Conn(ctx); err == nil {
+		err = c.check(h, false)
+	}
+	if err = errors.Join(err, c.close()); err != nil {
+		return nil, nil, errors.Join(err, d.Discard())
+	}
+	return d, pages, nil
 }
 
 func restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head, objs []io.ReaderAt, from *Image, fullCheck bool) (
@@ -228,6 +285,35 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 	if err != nil {
 		return img, 0, err
 	}
+	return applyDecoder(ctx, f, img, ref, dec, overlay)
+}
+
+func applyStream(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader) (Image, uint32, error) {
+	if ref.Bytes > head.MaxObjectBytes {
+		return img, 0, fmt.Errorf("%w: object of %d bytes", ErrCorrupt, ref.Bytes)
+	}
+	sg := newStreamGuard(r, ref.Bytes)
+	dec := ltx.NewDecoder(sg)
+	dec.SetRetainPageIndex(false)
+	if err := dec.DecodeHeader(); err != nil {
+		return img, 0, sg.classify(err)
+	}
+	if hd := dec.Header(); hd.NoChecksum() || hd.PageSize != pageSize || hd.Commit == 0 || hd.Commit > head.MaxPages ||
+		uint64(hd.MinTXID) != ref.MinSequence || uint64(hd.MaxTXID) != ref.MaxSequence ||
+		head.Checksum(hd.PreApplyChecksum) != ref.PreChecksum {
+		return img, 0, fmt.Errorf("%w: LTX header %+v does not match its reference", ErrCorrupt, hd)
+	}
+	next, carried, err := applyDecoder(ctx, f, img, ref, dec, false)
+	if err != nil {
+		return img, 0, sg.classify(err)
+	}
+	if err := sg.verify(ref); err != nil {
+		return img, 0, err
+	}
+	return next, carried, nil
+}
+
+func applyDecoder(ctx context.Context, f *os.File, img Image, ref head.Ref, dec *ltx.Decoder, overlay bool) (Image, uint32, error) {
 	snapshot, hd := ref.MinSequence == 1, dec.Header()
 	follows := ref.MinSequence == img.Sequence+1 && ref.PreChecksum == img.Checksum
 	if overlay {
@@ -296,6 +382,143 @@ func apply(ctx context.Context, f *os.File, img Image, ref head.Ref, r io.Reader
 		return img, 0, fmt.Errorf("%w: post-apply checksum %s, computed %s, head %s", ErrCorrupt, t.PostApplyChecksum, ltx.Checksum(post), ltx.Checksum(ref.PostChecksum))
 	}
 	return Image{ref.MaxSequence, hd.Commit, post}, carried, nil
+}
+
+// streamGuard validates an LTX v3 stream incrementally before handing page
+// frames to ltx.Decoder: it bounds every frame size to maxFrame, bounds total
+// bytes to limit, and hashes every byte read for SHA-256 verification.
+type streamGuard struct {
+	br     *bufio.Reader
+	h      hash.Hash
+	n      int64
+	limit  int64
+	srcErr error // first non-EOF error from the underlying stream
+	stage  int   // 0: header, 1: frames, 2: trailer
+	frames int
+	buf    []byte
+	off    int
+}
+
+func newStreamGuard(r io.Reader, limit uint64) *streamGuard {
+	sg := &streamGuard{h: sha256.New(), limit: int64(limit)}
+	sg.br = bufio.NewReaderSize(&guardSrc{r: r, sg: sg}, 64<<10)
+	return sg
+}
+
+type guardSrc struct {
+	r  io.Reader
+	sg *streamGuard
+}
+
+func (g *guardSrc) Read(p []byte) (int, error) {
+	rem := g.sg.limit + 1 - g.sg.n
+	if rem <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	n, err := g.r.Read(p)
+	if n > 0 {
+		g.sg.h.Write(p[:n])
+		g.sg.n += int64(n)
+	}
+	if err != nil && err != io.EOF && g.sg.srcErr == nil {
+		g.sg.srcErr = err
+	}
+	return n, err
+}
+
+func (sg *streamGuard) Read(p []byte) (int, error) {
+	if sg.off < len(sg.buf) {
+		n := copy(p, sg.buf[sg.off:])
+		sg.off += n
+		return n, nil
+	}
+	if sg.stage == 2 {
+		return sg.br.Read(p)
+	}
+	if err := sg.fill(); err != nil {
+		return 0, err
+	}
+	n := copy(p, sg.buf[sg.off:])
+	sg.off += n
+	return n, nil
+}
+
+func (sg *streamGuard) fill() error {
+	sg.off = 0
+	if sg.stage == 0 {
+		sg.buf = growBuf(sg.buf, ltx.HeaderSize)
+		if _, err := io.ReadFull(sg.br, sg.buf); err != nil {
+			return err
+		}
+		var hd ltx.Header
+		if err := hd.UnmarshalBinary(sg.buf); err != nil {
+			return fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
+		sg.stage = 1
+		return nil
+	}
+	var hdr [ltx.PageHeaderSize]byte
+	if _, err := io.ReadFull(sg.br, hdr[:]); err != nil {
+		return err
+	}
+	var zero [ltx.PageHeaderSize]byte
+	if hdr == zero {
+		sg.buf = append(sg.buf[:0], hdr[:]...)
+		sg.stage = 2
+		return nil
+	}
+	if sg.frames >= head.MaxPages || binary.BigEndian.Uint16(hdr[4:]) != ltx.PageHeaderFlagSize {
+		return fmt.Errorf("%w: unexpected page frame %d", ErrCorrupt, sg.frames)
+	}
+	var sz [4]byte
+	if _, err := io.ReadFull(sg.br, sz[:]); err != nil {
+		return err
+	}
+	size := binary.BigEndian.Uint32(sz[:])
+	if size == 0 || size > maxFrame {
+		return fmt.Errorf("%w: page frame of %d bytes", ErrCorrupt, size)
+	}
+	sg.frames++
+	sg.buf = growBuf(sg.buf, ltx.PageHeaderSize+4+int(size))
+	copy(sg.buf, hdr[:])
+	copy(sg.buf[ltx.PageHeaderSize:], sz[:])
+	if _, err := io.ReadFull(sg.br, sg.buf[ltx.PageHeaderSize+4:]); err != nil {
+		return err
+	}
+	return nil
+}
+
+func growBuf(b []byte, n int) []byte {
+	if cap(b) < n {
+		return make([]byte, n)
+	}
+	return b[:n]
+}
+
+func (sg *streamGuard) classify(err error) error {
+	if sg.srcErr != nil {
+		return sg.srcErr
+	}
+	if errors.Is(err, ErrCorrupt) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrCorrupt, err)
+}
+
+func (sg *streamGuard) verify(ref head.Ref) error {
+	if _, err := io.Copy(io.Discard, sg.br); err != nil {
+		return sg.classify(err)
+	}
+	if sg.srcErr != nil {
+		return sg.srcErr
+	}
+	if uint64(sg.n) != ref.Bytes || !bytes.Equal(sg.h.Sum(nil), ref.SHA256[:]) {
+		return fmt.Errorf("%w: object length or SHA-256 differs from its reference", ErrCorrupt)
+	}
+	return nil
 }
 
 // openObject verifies r against ref (checkObject), then decodes its LTX

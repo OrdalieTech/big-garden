@@ -580,6 +580,12 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 		}
 	}
 	// Case C: cold or warm restore into a fresh file outside e.rw, then swap.
+	// If keeping oldDB alongside the replacement would exceed CacheBytes,
+	// discard oldDB first so peak disk stays bounded to one copy of the database.
+	if oldDB != nil && !n.fitsWith(e, n.activationBytes(cur)) {
+		e.discard()
+		oldDB = nil
+	}
 	db, gotH, gotTag, gotIssued, pages, err := n.restoreNew(ctx, e, cur, obj.ETag, oldDB == nil, true)
 	if err != nil {
 		return err

@@ -59,6 +59,7 @@ type Code string
 type Config struct {
 	S3		*s3.Client
 	Bucket		string
+	LocalDir	string
 	Prefix		string
 	NodeID		string
 	CacheDir	string

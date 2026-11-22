@@ -479,13 +479,18 @@ func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag str
 	}
 	var issued time.Time
 	for {
-		objs, done, err := n.objects(ctx, links(h), h, &n.counters.activationBytes)
-		if err != nil && !miss(err) {
-			done()
-			return nil, nil, "", time.Time{}, nil, storeError(err)
-		}
-		if err != nil { // collection race, or a missing or corrupt object
-			done()
+		path := filepath.Join(n.dir, head.NewID().String()+".db")
+		db, pages, err := engine.RestoreStream(ctx, n.drv, path, n.maxPages(), h, func(r head.Ref) (io.ReadCloser, error) {
+			if h.Tail != nil && r == h.Tail.Ref() {
+				return io.NopCloser(bytes.NewReader(h.Tail.Data)), nil
+			}
+			body, err := n.st.Open(ctx, r.Key, 0, int64(r.Bytes))
+			if err != nil {
+				return nil, err
+			}
+			return &countedStream{rc: body, key: r.Key, downloaded: &n.counters.activationBytes}, nil
+		})
+		if err != nil && miss(err) { // collection race, or a missing or corrupt object
 			issued = time.Now()
 			obj, gerr := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 			switch store.OutcomeOf(gerr) {
@@ -499,8 +504,9 @@ func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag str
 				etag = obj.ETag
 				continue
 			case store.NotModified:
+				n.counters.activationFailures.Add(1)
 				if errors.Is(err, engine.ErrCorrupt) {
-					return nil, nil, "", time.Time{}, nil, newError(CodeCorrupt, "object differs from its reference", nil)
+					return nil, nil, "", time.Time{}, nil, newError(CodeCorrupt, "object differs from its reference", err)
 				}
 				return nil, nil, "", time.Time{}, nil, newError(CodeStateMissing, "an object of the head is missing", nil)
 			case store.NotFound:
@@ -508,10 +514,11 @@ func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag str
 			}
 			return nil, nil, "", time.Time{}, nil, storeError(gerr)
 		}
-		path := filepath.Join(n.dir, head.NewID().String()+".db")
-		db, pages, err := engine.Restore(ctx, n.drv, path, n.maxPages(), h, objs, nil)
-		done()
 		if err != nil {
+			var se *store.Error
+			if errors.As(err, &se) {
+				return nil, nil, "", time.Time{}, nil, storeError(err)
+			}
 			n.counters.activationFailures.Add(1)
 			return nil, nil, "", time.Time{}, nil, engineError(err)
 		}
@@ -519,6 +526,29 @@ func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag str
 		return db, h, etag, issued, pages, nil
 	}
 }
+
+type countedStream struct {
+	rc         io.ReadCloser
+	key        string
+	downloaded *atomic.Uint64
+}
+
+func (c *countedStream) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	if n > 0 {
+		c.downloaded.Add(uint64(n))
+	}
+	switch {
+	case err == nil || err == io.EOF:
+		return n, err
+	case errors.Is(err, store.ErrSealBroken):
+		return n, engine.ErrCorrupt
+	default:
+		return n, &store.Error{Outcome: store.Unknown, Op: "get", Key: c.key, Err: err}
+	}
+}
+
+func (c *countedStream) Close() error { return c.rc.Close() }
 
 // objects GETs the links refs of h, four at a time, each streamed into a
 // spool (D34) and checked for its length and SHA-256. h's tail, if refs ends with it, is read from h.

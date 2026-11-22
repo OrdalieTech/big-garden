@@ -73,9 +73,11 @@ type Result struct {
 }
 
 // Config configures a Node. The caller owns S3 and Logger.
+// Either S3+Bucket or LocalDir must be set (not both).
 type Config struct {
 	S3       *s3.Client // official SDK client, supplied by the caller
 	Bucket   string
+	LocalDir string // local filesystem store root (alternative to S3+Bucket)
 	Prefix   string
 	NodeID   string
 	CacheDir string

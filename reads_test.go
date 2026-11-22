@@ -511,3 +511,44 @@ func TestReadStaleConcurrentAndCatchUp(t *testing.T) {
 		t.Fatalf("fresh follower after cache wipe: gen=%d err=%v", g, err)
 	}
 }
+
+func TestLocalDir(t *testing.T) {
+	storeDir := t.TempDir()
+	openLocal := func(id string) *Node {
+		n, err := Open(bg, Config{
+			LocalDir: storeDir,
+			Prefix:   "stores",
+			NodeID:   id,
+			CacheDir: t.TempDir(),
+			Limits:   Limits{EntityBytes: 1 << 20, CacheBytes: 4 << 20, Recoveries: 1},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { n.Close(bg) })
+		return n
+	}
+	w := openLocal("writer")
+	r := openLocal("reader")
+	ref, _, err := w.Create(bg, "k1", newReq(t, "c1", 1), func(tx *Tx) ([]byte, error) {
+		if _, err := tx.Exec(bg, "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER)"); err != nil {
+			return nil, err
+		}
+		_, err := tx.Exec(bg, "INSERT INTO t VALUES('a', 42)")
+		return nil, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	if _, err := r.ReadStale(bg, ref, 1, time.Second, func(v *View) ([]byte, error) {
+		return nil, v.Query(bg, "SELECT v FROM t WHERE k=?", []any{"a"}, func(rows *sql.Rows) error {
+			if rows.Next() {
+				return rows.Scan(&got)
+			}
+			return rows.Err()
+		})
+	}); err != nil || got != 42 {
+		t.Fatalf("LocalDir read = %d, %v", got, err)
+	}
+}

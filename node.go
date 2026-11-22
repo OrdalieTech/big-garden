@@ -63,7 +63,16 @@ func Open(ctx context.Context, cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return open(ctx, cfg, store.NewS3(cfg.S3, cfg.Bucket, cfg.Prefix, cfg.Limits.StorageAttemptTimeout))
+	var st store.Store
+	if cfg.LocalDir != "" {
+		st, err = store.NewLocal(cfg.LocalDir, cfg.Prefix)
+		if err != nil {
+			return nil, newError(CodeUnavailable, "local store", err)
+		}
+	} else {
+		st = store.NewS3(cfg.S3, cfg.Bucket, cfg.Prefix, cfg.Limits.StorageAttemptTimeout)
+	}
+	return open(ctx, cfg, st)
 }
 
 // keyCheck is the namespace's check of a sealing key (D36): it proves the key
@@ -543,13 +552,21 @@ func (n *Node) isClosed() bool {
 func (n *Node) buildBytes() int64 { return n.cfg.Limits.EntityBytes + 1<<20 }
 
 // activationBytes is the cache reserve of activating h: its live database
-// file plus the encoded links it may download, plus 1 MiB headroom.
+// file plus 1 MiB headroom (cold restore streams LTX directly without spooling).
 func (n *Node) activationBytes(h *head.Head) int64 {
-	need := int64(h.PageCount)*head.PageSize + 1<<20
-	for _, r := range links(h) {
-		need += int64(r.Bytes)
+	return int64(h.PageCount)*head.PageSize + 1<<20
+}
+
+// fitsWith reports whether adding need bytes alongside self's current file and
+// all other resident/warm/reserved bytes fits within CacheBytes.
+func (n *Node) fitsWith(self *entity, need int64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	_, used, _ := n.scan(time.Time{}, self)
+	if self != nil {
+		used += self.bytes.Load()
 	}
-	return need
+	return n.reserved+used+n.warmBytes()+n.staging.Load()+need <= n.cfg.Limits.CacheBytes
 }
 
 // cache makes room for e to become resident and reserves buildBytes for
