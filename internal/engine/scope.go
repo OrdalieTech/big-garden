@@ -49,7 +49,7 @@ func setConnMode(conn *sql.Conn, m mode, modules map[string]bool) error {
 
 // introspection lists the read-only pragmas application SQL may run.
 var introspection = map[string]bool{"table_info": true, "table_xinfo": true, "index_list": true,
-	"index_info": true, "index_xinfo": true, "foreign_key_list": true}
+	"index_info": true, "index_xinfo": true, "foreign_key_list": true, "quick_check": true}
 
 // moduleReads lists the pragmas the built-in modules query, without an
 // argument: rtree reads page_size when it creates a table, fts5 reads
