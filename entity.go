@@ -42,7 +42,7 @@ type entity struct {
 	refreshing atomic.Bool  // background ReadStale revalidation in flight
 	building   bool         // under Node.mu: between room and unreserve, counted as resident
 	tried      time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
-	valid      time.Time    // issue time of the request that last proved h current: a GET, 304 or CAS (D23)
+	validUnix  atomic.Int64 // unix nanos of issue time that last proved h current: a GET, 304 or CAS (D23)
 	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
 	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
 	readers    atomic.Int64 // the Reads among them: they do not stop a batch (D23)
@@ -109,8 +109,24 @@ func (e *entity) clear() {
 }
 
 func (e *entity) clearLocked() {
-	e.db, e.h, e.etag, e.pages, e.valid = nil, nil, "", nil, time.Time{}
+	e.db, e.h, e.etag, e.pages = nil, nil, "", nil
+	e.validUnix.Store(0)
 	e.bytes.Store(0)
+}
+
+func (e *entity) setValid(t time.Time) {
+	if t.IsZero() {
+		e.validUnix.Store(0)
+	} else {
+		e.validUnix.Store(t.UnixNano())
+	}
+}
+
+func (e *entity) validTime() time.Time {
+	if u := e.validUnix.Load(); u != 0 {
+		return time.Unix(0, u)
+	}
+	return time.Time{}
 }
 
 func (e *entity) touch() { e.usedUnix.Store(time.Now().UnixNano()) }
@@ -135,7 +151,7 @@ func (e *entity) roReady(ref Ref) bool {
 // the local image is exactly e.h (D23): a strong read or a barrier invoked
 // at t0 then needs no GET of its own.
 func (e *entity) current(t0 time.Time) bool {
-	return e.valid.After(t0) && e.db != nil && e.db.Published() == imageOf(e.h)
+	return e.validTime().After(t0) && e.db != nil && e.db.Published() == imageOf(e.h)
 }
 
 // links are h's snapshot, deltas and tail, in order.
@@ -295,8 +311,9 @@ func (n *Node) settle(e *entity, c *candidate, cur *head.Head, etag string, issu
 	if e.db != nil && e.db.Published() != imageOf(cur) {
 		e.discardLocked()
 	}
-	h := *cur                               // a copy: cur may be &c.next, and c.base chains every earlier head
-	e.h, e.etag, e.valid = &h, etag, issued // kept even without a local image: the next access activates or revalidates it
+	h := *cur              // a copy: cur may be &c.next, and c.base chains every earlier head
+	e.h, e.etag = &h, etag // kept even without a local image: the next access activates or revalidates it
+	e.setValid(issued)
 	if e.db != nil {
 		e.bytes.Store(e.db.Bytes())
 	}
@@ -432,7 +449,7 @@ func (n *Node) activateMode(ctx context.Context, e *entity, h *head.Head, etag s
 	}
 	e.db, e.h, e.etag, e.pages = db, cur, curTag, pages
 	if curTag != etag {
-		e.valid = curIssued
+		e.setValid(curIssued)
 	}
 	e.bytes.Store(db.Bytes())
 	e.rw.Unlock()

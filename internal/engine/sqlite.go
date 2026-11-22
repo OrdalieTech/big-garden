@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/superfly/ltx"
@@ -94,8 +95,9 @@ type DB struct {
 	main    *os.File        // read-only; holds the published image between checkpoints
 	pub     Image           // image of the main file (the last checkpointed, published state)
 
-	roMu sync.Mutex
-	ro   *sql.DB // concurrent read-only connection pool (opened lazily for ReadConcurrent)
+	roMu    sync.Mutex
+	ro      *sql.DB  // concurrent read-only connection pool (opened lazily for ReadConcurrent)
+	roModes sync.Map // driver.Conn -> *atomic.Bool (true only while library runs BEGIN/ROLLBACK)
 
 	SweepDue bool // a mutation changed files, or the epoch changed: Node.Sweep has work (D33)
 }
@@ -648,10 +650,13 @@ func (d *DB) dropTemp() error {
 }
 
 // roConnector opens read-only connections on path with query_only=ON,
-// trusted_schema=OFF, cache_size and optional mmap_size.
+// trusted_schema=OFF, cache_size and optional mmap_size, installing the
+// read-mode authorizer and rejecting commit hook once per physical connection.
 type roConnector struct {
-	d   *sqlite.Driver
-	dsn string
+	d       *sqlite.Driver
+	dsn     string
+	modules map[string]bool
+	modes   *sync.Map
 }
 
 func (c roConnector) Connect(context.Context) (driver.Conn, error) {
@@ -659,12 +664,27 @@ func (c roConnector) Connect(context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, ok := dc.(sqlite.HookRegisterer)
+	reg, ok := dc.(interface {
+		sqlite.AuthorizerRegisterer
+		sqlite.HookRegisterer
+	})
 	if !ok {
 		dc.Close()
-		return nil, errors.New("engine: driver connection lacks hooks")
+		return nil, errors.New("engine: driver connection lacks authorizer or hooks")
 	}
-	h.RegisterCommitHook(func() int32 { return 1 })
+	libMode := &atomic.Bool{}
+	readPolicy := policy(read, c.modules)
+	reg.RegisterCommitHook(func() int32 { return 1 })
+	if err := reg.RegisterAuthorizer(func(a sqlite.AuthorizerActionCode, a1, a2, db, tv string) sqlite.AuthorizerReturnCode {
+		if libMode.Load() {
+			return sqlite.AuthorizerOK
+		}
+		return readPolicy(a, a1, a2, db, tv)
+	}); err != nil {
+		dc.Close()
+		return nil, err
+	}
+	c.modes.Store(dc, libMode)
 	return dc, nil
 }
 
@@ -681,7 +701,7 @@ func (d *DB) readPool() *sql.DB {
 		q += fmt.Sprintf("&_pragma=mmap_size(%d)", d.drv.opts.MmapBytes)
 	}
 	dsn := (&url.URL{Scheme: "file", OmitHost: true, Path: d.path, RawQuery: q}).String()
-	ro := sql.OpenDB(roConnector{d: d.drv.sqlite, dsn: dsn})
+	ro := sql.OpenDB(roConnector{d: d.drv.sqlite, dsn: dsn, modules: d.modules, modes: &d.roModes})
 	ro.SetMaxOpenConns(8)
 	ro.SetMaxIdleConns(8)
 	d.ro = ro
@@ -698,7 +718,12 @@ func (d *DB) CloseReaders() error {
 	if ro == nil {
 		return nil
 	}
-	return ro.Close()
+	err := ro.Close()
+	d.roModes.Range(func(k, _ any) bool {
+		d.roModes.Delete(k)
+		return true
+	})
+	return err
 }
 
 // ReadConcurrent runs fn on a pooled read-only connection inside a read
@@ -709,17 +734,29 @@ func (d *DB) ReadConcurrent(ctx context.Context, fn func(*View) ([]byte, error))
 		return nil, err
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+	var libMode *atomic.Bool
+	if err := conn.Raw(func(dc any) error {
+		v, ok := d.roModes.Load(dc)
+		if !ok {
+			return errors.New("engine: read-only connection missing mode flag")
+		}
+		libMode = v.(*atomic.Bool)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	libMode.Store(true)
+	_, err = conn.ExecContext(ctx, "BEGIN")
+	libMode.Store(false)
+	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		merr := setConnMode(conn, library, d.modules)
+		libMode.Store(true)
 		_, rerr := conn.ExecContext(context.Background(), "ROLLBACK")
-		err = withCleanup(err, merr, rerr)
+		libMode.Store(false)
+		err = withCleanup(err, rerr)
 	}()
-	if err := setConnMode(conn, read, d.modules); err != nil {
-		return nil, err
-	}
 	v := &View{scope{conn: conn}}
 	return runScoped(&v.scope, func() ([]byte, error) { return fn(v) })
 }

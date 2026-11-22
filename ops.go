@@ -217,9 +217,7 @@ func (n *Node) barrier(ctx context.Context, e *entity, t0 time.Time) (changed bo
 	_, err = n.st.Get(ctx, head.HeadKey(e.key), e.etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
-		e.rw.Lock()
-		e.valid = issued
-		e.rw.Unlock()
+		e.setValid(issued)
 		return false, nil
 	case store.OK:
 		e.discard()
@@ -415,7 +413,7 @@ func (n *Node) ReadStale(ctx context.Context, ref Ref, schema uint32, maxAge tim
 	for range 3 {
 		e.rw.RLock()
 		if e.roReady(ref) {
-			age := time.Since(e.valid)
+			age := time.Since(e.validTime())
 			if age < maxAge {
 				if age >= maxAge/2 {
 					n.refreshAsync(e, ref)
@@ -451,7 +449,7 @@ func (n *Node) refreshSync(ctx context.Context, ref Ref, maxAge time.Duration) e
 	}
 	defer n.leave(e)
 	e.rw.RLock()
-	fresh := e.roReady(ref) && time.Since(e.valid) < maxAge
+	fresh := e.roReady(ref) && time.Since(e.validTime()) < maxAge
 	e.rw.RUnlock()
 	if fresh {
 		return nil
@@ -500,9 +498,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
 		if oldDB != nil && oldH != nil && oldH.Incarnation == ref.Incarnation && !oldH.Deleted && oldDB.Published() == imageOf(oldH) {
-			e.rw.Lock()
-			e.valid = issued
-			e.rw.Unlock()
+			e.setValid(issued)
 			return nil
 		}
 		// Cached head without a matching local DB: re-fetch full head.
@@ -539,7 +535,8 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 		if oldH != nil && !slices.Equal(links(oldH), links(cur)) {
 			e.pages = nil
 		}
-		e.h, e.etag, e.valid = cur, obj.ETag, issued
+		e.h, e.etag = cur, obj.ETag
+		e.setValid(issued)
 		e.rw.Unlock()
 		return nil
 	}
@@ -562,7 +559,8 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 					} else {
 						e.pages = nil
 					}
-					e.h, e.etag, e.valid = cur, obj.ETag, issued
+					e.h, e.etag = cur, obj.ETag
+					e.setValid(issued)
 					e.bytes.Store(oldDB.Bytes())
 					n.counters.activations.Add(1)
 					n.counters.catchUps.Add(1)
@@ -593,7 +591,8 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 	if e.db != nil {
 		e.db.Discard()
 	}
-	e.db, e.h, e.etag, e.valid, e.pages = db, gotH, gotTag, issued, pages
+	e.db, e.h, e.etag, e.pages = db, gotH, gotTag, pages
+	e.setValid(issued)
 	e.bytes.Store(db.Bytes())
 	e.rw.Unlock()
 	return nil

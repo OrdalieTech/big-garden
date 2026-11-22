@@ -19,9 +19,7 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	obj, err := n.st.Get(ctx, head.HeadKey(e.key), etag, head.MaxHeadBytes)
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
-		e.rw.Lock()
-		e.valid = issued
-		e.rw.Unlock()
+		e.setValid(issued)
 		return nil
 	case store.OK:
 	case store.NotFound:
@@ -48,7 +46,8 @@ func (n *Node) fetch(ctx context.Context, e *entity, inc head.ID, etag string) e
 	if e.db != nil && e.h != nil && !slices.Equal(links(e.h), links(cur)) {
 		e.pages = nil
 	}
-	e.h, e.etag, e.valid = cur, obj.ETag, issued
+	e.h, e.etag = cur, obj.ETag
+	e.setValid(issued)
 	e.rw.Unlock()
 	return nil
 }
