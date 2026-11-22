@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 	"github.com/OrdalieTech/big-garden/internal/head"
 	"github.com/OrdalieTech/big-garden/internal/store"
 	"github.com/OrdalieTech/big-garden/internal/storetest"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // headGets counts the GETs of key's head in st's journal from entry from on.
@@ -816,4 +818,157 @@ func TestReadStaleSlowRepublishAndColdActivation(t *testing.T) {
 	if max := ts.maxActive.Load(); max > 1 {
 		t.Fatalf("concurrent .ltx downloads = %d, want 1 (Recoveries=1)", max)
 	}
+}
+
+// TestReadStaleWarmRestartAndSyncingState verifies that:
+//  1. A local entity at the head reports Syncing=false even when maxAge/2 triggers a head revalidation.
+//  2. Closing a follower that served ReadStale (with active read pool) parks the DB cleanly.
+//  3. Restarting on the same CacheDir serves ReadKey(maxAge>0) immediately from disk even if S3
+//     is stalled, with zero object downloads, and catches up in the background once S3 responds.
+func TestReadStaleWarmRestartAndSyncingState(t *testing.T) {
+	mem := storetest.NewMem()
+	var stallHead atomic.Bool
+	ts := &throttledStore{Store: mem}
+	ts.delay.Store(int64(2 * time.Millisecond))
+	headGate := &headBlockingStore{Store: ts, block: &stallHead, release: make(chan struct{})}
+
+	writer := testNode(t, mem, "writer", func(l *Limits) {
+		l.EntityBytes, l.CacheBytes, l.Recoveries = 8<<20, 64<<20, 1
+	})
+	if _, err := writer.Write(bg, "idx", 1, func(tx *Tx) error {
+		if _, err := tx.Exec(bg, "CREATE TABLE kv(k TEXT PRIMARY KEY, v INT)"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(bg, "INSERT INTO kv VALUES('a', 1)")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := t.TempDir()
+	openFollower := func(st store.Store) *Node {
+		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir,
+			Limits: Limits{EntityBytes: 8 << 20, CacheBytes: 64 << 20, Recoveries: 1,
+				StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
+		cfg, err := cfg.validate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := open(bg, cfg, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	const maxAge = 30 * time.Millisecond
+	f1 := openFollower(mem)
+	// Cold activate via ReadKey(maxAge>0), then wait until local.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var v int
+		res, err := f1.ReadKey(bg, "idx", 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='a'", nil, &v)
+		})
+		if err == nil {
+			if v != 1 || res.Syncing {
+				t.Fatalf("after cold activation: v=%d syncing=%v", v, res.Syncing)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cold activation timed out: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Sleep past maxAge/2 so the next ReadKey triggers a routine head check;
+	// because the entity is at the head, Syncing must stay false.
+	time.Sleep(maxAge)
+	var v int
+	res, err := f1.ReadKey(bg, "idx", 1, maxAge, func(vw *View) error {
+		return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='a'", nil, &v)
+	})
+	if err != nil || v != 1 || res.Syncing {
+		t.Fatalf("current entity after idle: v=%d res=%+v err=%v (want Syncing=false)", v, res, err)
+	}
+	// Clean close must park the follower DB into warm/ even with an active read pool.
+	if err := f1.Close(bg); err != nil {
+		t.Fatal(err)
+	}
+	warmDBs, _ := filepath.Glob(filepath.Join(cacheDir, "warm", "*", "*.db"))
+	if len(warmDBs) != 1 {
+		t.Fatalf("warm DBs after follower Close = %v, want 1", warmDBs)
+	}
+
+	// Writer publishes v=2 while follower is down.
+	if _, err := writer.Write(bg, "idx", 1, func(tx *Tx) error {
+		_, err := tx.Exec(bg, "UPDATE kv SET v=2 WHERE k='a'")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart follower with head GETs blocked: ReadKey(maxAge>0) must serve v=1
+	// IMMEDIATELY from the local warm file without waiting on S3.
+	f2 := openFollower(headGate)
+	defer f2.Close(bg)
+	stallHead.Store(true)
+	t0 := time.Now()
+	rctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+	res, err = f2.ReadKey(rctx, "idx", 1, maxAge, func(vw *View) error {
+		return vw.QueryRow(rctx, "SELECT v FROM kv WHERE k='a'", nil, &v)
+	})
+	cancel()
+	if err != nil {
+		t.Fatalf("warm restart ReadKey failed while head blocked: %v", err)
+	}
+	if elapsed := time.Since(t0); elapsed > 40*time.Millisecond {
+		t.Fatalf("warm restart ReadKey took %v, want immediate local serve", elapsed)
+	}
+	if v != 1 || res.Version.Sequence != 1 {
+		t.Fatalf("warm restart read v=%d seq=%d, want 1/1", v, res.Version.Sequence)
+	}
+	if s := f2.Stats(); s.WarmHits != 1 || s.ActivationBytes != 0 {
+		t.Fatalf("warm restart stats = %+v, want WarmHits=1 ActivationBytes=0", s)
+	}
+
+	// Unblock head GETs: background refresh must discover v=2 and catch up without errors.
+	stallHead.Store(false)
+	close(headGate.release)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		res, err = f2.ReadKey(bg, "idx", 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='a'", nil, &v)
+		})
+		if err != nil {
+			t.Fatalf("ReadKey during catch-up failed: %v", err)
+		}
+		if v == 2 {
+			if res.Syncing {
+				t.Fatalf("Syncing stayed true after catching up to v=2: %+v", res)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("warm restarted follower never caught up to v=2 (still v=%d)", v)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+type headBlockingStore struct {
+	store.Store
+	block   *atomic.Bool
+	release chan struct{}
+}
+
+func (s *headBlockingStore) Get(ctx context.Context, key, ifNoneMatch string, max int64) (store.Object, error) {
+	if s.block.Load() && strings.HasSuffix(key, "/head.json") {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return store.Object{}, &store.Error{Outcome: store.Unknown, Op: "get", Key: key, Err: ctx.Err()}
+		}
+	}
+	return s.Store.Get(ctx, key, ifNoneMatch, max)
 }

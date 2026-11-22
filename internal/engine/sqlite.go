@@ -787,8 +787,12 @@ func (d *DB) checkpoint() error {
 	if busy != 0 || log != done {
 		return fmt.Errorf("engine: checkpoint incomplete (busy=%d log=%d done=%d)", busy, log, done)
 	}
-	if st, err := os.Stat(d.path + "-wal"); err != nil || st.Size() != 0 {
-		return fmt.Errorf("engine: WAL not empty after checkpoint: %v", err)
+	if st, err := os.Stat(d.path + "-wal"); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("engine: WAL stat after checkpoint: %v", err)
+		}
+	} else if st.Size() != 0 {
+		return fmt.Errorf("engine: WAL not empty after checkpoint: %d bytes", st.Size())
 	}
 	return nil
 }
@@ -819,7 +823,7 @@ func (d *DB) Checkpoint(img Image) error {
 // database, moves the file to dst (D21: the warm tier) and returns its size.
 // On error the caller discards.
 func (d *DB) Park(dst string) (int64, error) {
-	if err := errors.Join(d.Checkpoint(d.pub), d.close()); err != nil {
+	if err := errors.Join(d.CloseReaders(), d.Checkpoint(d.pub), d.close()); err != nil {
 		return 0, err
 	}
 	return int64(d.pub.PageCount) * pageSize, errors.Join(os.Rename(d.path, dst), removeFiles(d.path))

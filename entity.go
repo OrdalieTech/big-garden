@@ -25,30 +25,31 @@ import (
 // decoded page frames of each of h's snapshot, deltas and tail (the replay
 // pages of PROTOCOL §6 step 7 and §9); it is derived from h and reset with it.
 type entity struct {
-	mu         gate
-	rw         sync.RWMutex // separates concurrent ReadStale (RLock) from file/head swaps and mutations (Lock); always acquired inside mu
-	key        string
-	h          *head.Head
-	etag       string
-	db         *engine.DB
-	unresolved *candidate
-	pages      []uint32
-	snap       *snapJob // an off-mutex snapshot in flight (D35), under mu
-	mutating   bool     // under rw: local SQLite mutation in flight
-	qmu        sync.Mutex
-	queue      []*waiter    // Updates waiting on mu that a batch may take (PROTOCOL §6 Batches)
-	used       time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
-	usedUnix   atomic.Int64 // unix nanos of last ReadStale hit
-	refreshing atomic.Bool  // background ReadStale revalidation in flight
-	retryAfter atomic.Int64 // unix nanos before next background refresh after an error
-	building   bool         // under Node.mu: between room and unreserve, counted as resident
-	tried      time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
-	validUnix  atomic.Int64 // unix nanos of issue time that last proved h current: a GET, 304 or CAS (D23)
-	refs       int          // operations holding e, under Node.mu: e leaves Node.entities at 0
-	waiting    atomic.Int64 // callers queued on mu (PendingPerEntity)
-	readers    atomic.Int64 // the Reads among them: they do not stop a batch (D23)
-	bytes      atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
-	since      atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)
+	mu          gate
+	rw          sync.RWMutex // separates concurrent ReadStale (RLock) from file/head swaps and mutations (Lock); always acquired inside mu
+	key         string
+	h           *head.Head
+	etag        string
+	db          *engine.DB
+	unresolved  *candidate
+	pages       []uint32
+	snap        *snapJob // an off-mutex snapshot in flight (D35), under mu
+	mutating    bool     // under rw: local SQLite mutation in flight
+	qmu         sync.Mutex
+	queue       []*waiter    // Updates waiting on mu that a batch may take (PROTOCOL §6 Batches)
+	used        time.Time    // last admission: cache policy only (ResidentEntities, IdleTimeout)
+	usedUnix    atomic.Int64 // unix nanos of last ReadStale hit
+	refreshing  atomic.Bool  // background ReadStale revalidation in flight
+	behindSince atomic.Int64 // unix nanos when local image was first seen behind head (0 when current)
+	retryAfter  atomic.Int64 // unix nanos before next background refresh after an error
+	building    bool         // under Node.mu: between room and unreserve, counted as resident
+	tried       time.Time    // end of the last settle attempt of unresolved by enter (D22 fail fast)
+	validUnix   atomic.Int64 // unix nanos of issue time that last proved h current: a GET, 304 or CAS (D23)
+	refs        int          // operations holding e, under Node.mu: e leaves Node.entities at 0
+	waiting     atomic.Int64 // callers queued on mu (PendingPerEntity)
+	readers     atomic.Int64 // the Reads among them: they do not stop a batch (D23)
+	bytes       atomic.Int64 // db + wal size last seen (CacheBytes); 0 when not resident
+	since       atomic.Int64 // unix nanos unresolved was set, 0 when nil (Stats.OldestUnresolved)
 }
 
 // gate is the entity mutex (D8); lock also gives up when ctx ends.
@@ -112,6 +113,7 @@ func (e *entity) clear() {
 func (e *entity) clearLocked() {
 	e.db, e.h, e.etag, e.pages = nil, nil, "", nil
 	e.validUnix.Store(0)
+	e.behindSince.Store(0)
 	e.bytes.Store(0)
 }
 

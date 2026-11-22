@@ -235,6 +235,9 @@ func (n *Node) shed(lru *entity) bool {
 // parked with. Both are hints: activation trusts the file only after the
 // checksum gate of a cold restore.
 type warmFile struct {
+	Key   string     `json:",omitempty"`
+	Head  *head.Head `json:",omitempty"`
+	ETag  string     `json:",omitempty"`
 	Image engine.Image
 	Pages map[head.Digest]uint32
 	bytes int64
@@ -259,6 +262,10 @@ func (n *Node) warmIndex() error {
 		case db && err == nil && serr == nil && st.Mode().IsRegular() && json.Unmarshal(b, &w) == nil:
 			w.bytes, w.used = st.Size()+int64(len(b)), st.ModTime() // the hint counts too
 			n.warmPut(filepath.Base(name), w)
+			if w.Key != "" && w.Head != nil && w.Head.Namespace == n.ns && w.Head.Key == w.Key && !w.Head.Deleted &&
+				head.ValidKey(w.Key) == nil && w.Head.Validate() == nil {
+				n.setRef(w.Key, Ref{Key: w.Key, Incarnation: w.Head.Incarnation})
+			}
 		case db || !strings.HasSuffix(path, ".json") || serr != nil: // a .json is removed with its .db
 			os.Remove(path)
 		}
@@ -277,7 +284,8 @@ func (n *Node) park(e *entity) {
 		return
 	}
 	refs := links(e.h)
-	w := warmFile{Image: imageOf(e.h), Pages: map[head.Digest]uint32{}, used: e.lastUsed()}
+	h := *e.h
+	w := warmFile{Key: e.key, Head: &h, ETag: e.etag, Image: imageOf(e.h), Pages: map[head.Digest]uint32{}, used: e.lastUsed()}
 	if len(e.pages) == len(refs) {
 		for i, r := range refs {
 			w.Pages[r.SHA256] = e.pages[i]
@@ -304,6 +312,16 @@ func (n *Node) park(e *entity) {
 	os.Remove(name + ".db")
 	os.Remove(name + ".json")
 	e.discardLocked()
+}
+
+// hasWarmHead reports whether key has a warm-tier file whose recorded head
+// matches inc and can be attached directly for ReadStale without scanning.
+func (n *Node) hasWarmHead(key string, inc head.ID) bool {
+	hash := filepath.Base(head.EntityDir(key))
+	n.wmu.Lock()
+	w, ok := n.warm[hash]
+	n.wmu.Unlock()
+	return ok && w.Head != nil && w.Head.Namespace == n.ns && w.Head.Key == key && !w.Head.Deleted && w.Head.Incarnation == inc
 }
 
 // claimWarm moves key's warm file, if any, to path and returns its hint;

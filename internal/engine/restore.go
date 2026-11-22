@@ -158,6 +158,38 @@ func restore(ctx context.Context, drv *Driver, path string, maxPages uint32, h *
 	return d, pages, nil
 }
 
+// OpenWarm opens an existing warm-tier database file for read-only follower
+// serving without scanning the whole file for a checksum. It verifies the
+// file size and _state_meta row against h; any mismatch deletes path.
+func OpenWarm(ctx context.Context, drv *Driver, path string, maxPages uint32, h *head.Head) (*DB, error) {
+	if h.PageCount > maxPages {
+		return nil, errors.New("engine: head exceeds page limit")
+	}
+	st, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() || st.Size() != int64(h.PageCount)*pageSize {
+		removeFiles(path)
+		return nil, fmt.Errorf("%w: warm file size %d differs from head page count %d", ErrCorrupt, st.Size(), h.PageCount)
+	}
+	d, err := open(ctx, drv, path, maxPages)
+	if err != nil {
+		removeFiles(path)
+		return nil, err
+	}
+	m, err := d.Meta()
+	if err == nil && (m.Namespace != h.Namespace || m.Key != h.Key || m.Incarnation != h.Incarnation ||
+		m.Schema != h.Schema || m.Sequence != h.Sequence) {
+		err = fmt.Errorf("%w: _state_meta does not match warm head", ErrCorrupt)
+	}
+	if err != nil {
+		return nil, errors.Join(err, d.Discard())
+	}
+	d.pub = Image{Sequence: h.Sequence, PageCount: h.PageCount, Checksum: h.DatabaseChecksum}
+	return d, nil
+}
+
 // CheckObjects verifies each object's length, SHA-256 and LTX frame bounds
 // against its reference without touching any database file.
 func CheckObjects(refs []head.Ref, objs []io.ReaderAt) error {

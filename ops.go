@@ -413,29 +413,115 @@ func (n *Node) ReadStale(ctx context.Context, ref Ref, schema uint32, maxAge tim
 	}
 	defer n.drop(e)
 	e.rw.RLock()
-	if e.roReady(ref) {
-		age := time.Since(e.validTime())
-		if age >= maxAge/2 {
-			n.refreshAsync(e, ref, maxAge)
-		}
-		if e.h.Schema != schema {
-			ver, got := Version{e.h.Incarnation, e.h.Sequence}, e.h.Schema
-			e.rw.RUnlock()
-			return Result{}, &Error{Code: CodeSchemaMismatch, At: ver, Schema: got, Message: "stored schema differs"}
-		}
-		db, ver, syncing := e.db, Version{e.h.Incarnation, e.h.Sequence}, e.refreshing.Load()
-		e.touch()
-		var cb error
-		v, err := db.ReadConcurrent(ctx, scoped(math.MaxInt, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
+	if !e.roReady(ref) {
 		e.rw.RUnlock()
-		if err != nil {
-			return Result{}, callbackError(err, cb)
+		if !n.hasWarmHead(ref.Key, ref.Incarnation) || !n.attachWarm(ctx, e, ref) {
+			n.refreshAsync(e, ref, maxAge)
+			return Result{}, newError(CodeUnavailable, "entity activation in progress", nil)
 		}
-		return Result{Value: v, Version: ver, Stale: age, Syncing: syncing}, nil
+		e.rw.RLock()
+		if !e.roReady(ref) {
+			e.rw.RUnlock()
+			n.refreshAsync(e, ref, maxAge)
+			return Result{}, newError(CodeUnavailable, "entity activation in progress", nil)
+		}
 	}
+	valid := e.validTime()
+	age := time.Duration(0)
+	if !valid.IsZero() {
+		age = time.Since(valid)
+	}
+	if valid.IsZero() || age >= maxAge/2 {
+		n.refreshAsync(e, ref, maxAge)
+	}
+	if e.h.Schema != schema {
+		ver, got := Version{e.h.Incarnation, e.h.Sequence}, e.h.Schema
+		e.rw.RUnlock()
+		return Result{}, &Error{Code: CodeSchemaMismatch, At: ver, Schema: got, Message: "stored schema differs"}
+	}
+	behind := e.behindSince.Load()
+	syncing := behind != 0
+	stale := age
+	if syncing {
+		stale = max(time.Since(time.Unix(0, behind)), 0)
+	}
+	db, ver := e.db, Version{e.h.Incarnation, e.h.Sequence}
+	e.touch()
+	var cb error
+	v, err := db.ReadConcurrent(ctx, scoped(math.MaxInt, func(v *engine.View) ([]byte, error) { return fn(&View{v}) }, &cb))
 	e.rw.RUnlock()
-	n.refreshAsync(e, ref, maxAge)
-	return Result{}, newError(CodeUnavailable, "entity activation in progress", nil)
+	if err != nil {
+		return Result{}, callbackError(err, cb)
+	}
+	return Result{Value: v, Version: ver, Stale: stale, Syncing: syncing}, nil
+}
+
+// attachWarm opens key's warm-tier database file for immediate ReadStale
+// serving without scanning the whole file or waiting on S3; background
+// refreshAsync then verifies it against the current head.
+func (n *Node) attachWarm(ctx context.Context, e *entity, ref Ref) bool {
+	if e.mu.lock(ctx) != nil {
+		return false
+	}
+	defer e.mu.Unlock()
+	if n.isClosed() {
+		return false
+	}
+	e.rw.RLock()
+	ready := e.roReady(ref)
+	unres := e.unresolved != nil
+	e.rw.RUnlock()
+	if ready {
+		return true
+	}
+	if unres || !n.room(e) {
+		return false
+	}
+	defer func() {
+		n.mu.Lock()
+		e.building = false
+		n.mu.Unlock()
+	}()
+	path := filepath.Join(n.dir, head.NewID().String()+".db")
+	w, ok := n.claimWarm(e.key, path)
+	if !ok {
+		return false
+	}
+	if w.Head == nil || w.Head.Namespace != n.ns || w.Head.Key != e.key || w.Head.Deleted || w.Head.Incarnation != ref.Incarnation {
+		n.unclaimWarm(e.key, path, w)
+		return false
+	}
+	db, err := engine.OpenWarm(ctx, n.drv, path, n.maxPages(), w.Head)
+	if err != nil {
+		os.Remove(path)
+		n.claimWarm(e.key, "")
+		return false
+	}
+	refs := links(w.Head)
+	var pages []uint32
+	pagesOK := true
+	for _, r := range refs {
+		p, known := w.Pages[r.SHA256]
+		pagesOK = pagesOK && known
+		pages = append(pages, p)
+	}
+	if !pagesOK {
+		pages = nil
+	}
+	h := *w.Head
+	e.rw.Lock()
+	if e.db != nil {
+		e.db.Discard()
+	}
+	e.db, e.h, e.etag, e.pages = db, &h, w.ETag, pages
+	e.setValid(time.Time{})
+	e.behindSince.Store(0)
+	e.bytes.Store(db.Bytes())
+	e.touch()
+	e.rw.Unlock()
+	n.counters.warmHits.Add(1)
+	n.claimWarm(e.key, "")
+	return true
 }
 
 func (n *Node) refreshAsync(e *entity, ref Ref, maxAge time.Duration) {
@@ -469,6 +555,12 @@ func (n *Node) refreshAsync(e *entity, ref Ref, maxAge time.Duration) {
 		}
 		err := n.syncFollower(ctx, e, ref)
 		if ge, ok := hasCode(err, CodeIncarnationMismatch); ok && ge.Route != nil {
+			e.rw.RLock()
+			hasDB := e.db != nil
+			e.rw.RUnlock()
+			if hasDB {
+				e.behindSince.CompareAndSwap(0, time.Now().UnixNano())
+			}
 			if err = n.syncFollower(ctx, e, ge.Route.Ref); err == nil {
 				n.setRef(e.key, ge.Route.Ref)
 			}
@@ -496,6 +588,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 	switch store.OutcomeOf(err) {
 	case store.NotModified:
 		if oldDB != nil && oldH != nil && oldH.Incarnation == ref.Incarnation && !oldH.Deleted && oldDB.Published() == imageOf(oldH) {
+			e.behindSince.Store(0)
 			e.setValid(issued)
 			return nil
 		}
@@ -534,9 +627,13 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 			e.pages = nil
 		}
 		e.h, e.etag = cur, obj.ETag
+		e.behindSince.Store(0)
 		e.setValid(issued)
 		e.rw.Unlock()
 		return nil
+	}
+	if oldDB != nil {
+		e.behindSince.CompareAndSwap(0, time.Now().UnixNano())
 	}
 	// Case B: resident DB behind cur; download only the new delta suffix outside
 	// e.rw (serialized by n.recoveries), then take e.rw briefly to apply pages in place.
@@ -563,6 +660,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 						e.pages = nil
 					}
 					e.h, e.etag = cur, obj.ETag
+					e.behindSince.Store(0)
 					e.setValid(issued)
 					e.bytes.Store(oldDB.Bytes())
 					n.counters.activations.Add(1)
@@ -598,6 +696,7 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 		e.db.Discard()
 	}
 	e.db, e.h, e.etag, e.pages = db, gotH, gotTag, pages
+	e.behindSince.Store(0)
 	e.setValid(issued)
 	e.bytes.Store(db.Bytes())
 	e.rw.Unlock()
