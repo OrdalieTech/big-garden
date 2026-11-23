@@ -1058,3 +1058,251 @@ func TestReadStaleCrashSalvage(t *testing.T) {
 		t.Fatalf("post-crash stats = %+v, want WarmHits=%d ActivationBytes=0", s, len(keys))
 	}
 }
+
+type openGateStore struct {
+	store.Store
+	match   func(key string) bool
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *openGateStore) Open(ctx context.Context, key string, off, length int64) (io.ReadCloser, error) {
+	if s.match != nil && s.match(key) {
+		s.once.Do(func() { close(s.entered) })
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, &store.Error{Outcome: store.Unknown, Op: "get", Key: key, Err: ctx.Err()}
+		}
+	}
+	return s.Store.Open(ctx, key, off, length)
+}
+
+// TestReadStaleCloseDuringDeltaCatchUpPreservesWarm verifies that shutting down
+// a follower while a delta download for sequence 1 -> 2 is in flight preserves
+// every settled warm database (including the catching-up entity) so the restarted
+// Node serves seq 1 immediately without re-downloading the full snapshot.
+func TestReadStaleCloseDuringDeltaCatchUpPreservesWarm(t *testing.T) {
+	mem := storetest.NewMem()
+	writer := testNode(t, mem, "writer", func(l *Limits) {
+		l.EntityBytes, l.CacheBytes, l.Recoveries = 8<<20, 64<<20, 1
+	})
+	for _, k := range []string{"sources/sirene", "sources/other"} {
+		if _, err := writer.Write(bg, k, 1, func(tx *Tx) error {
+			if _, err := tx.Exec(bg, "CREATE TABLE kv(k TEXT PRIMARY KEY, v BLOB)"); err != nil {
+				return err
+			}
+			_, err := tx.Exec(bg, "INSERT INTO kv VALUES('ver', ?)", []byte("seq1"))
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cacheDir := t.TempDir()
+	openFollower := func(st store.Store) *Node {
+		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir,
+			Limits: Limits{EntityBytes: 8 << 20, CacheBytes: 64 << 20, Recoveries: 1,
+				StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
+		cfg, err := cfg.validate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := open(bg, cfg, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	const maxAge = 40 * time.Millisecond
+	gate := &openGateStore{
+		Store:   mem,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	f1 := openFollower(gate)
+	for _, k := range []string{"sources/sirene", "sources/other"} {
+		var v []byte
+		if _, err := f1.ReadKey(bg, k, 1, 0, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &v)
+		}); err != nil || string(v) != "seq1" {
+			t.Fatalf("seed %s: v=%q err=%v", k, v, err)
+		}
+	}
+
+	// Publish seq 2 with >InlineBytes payload so it produces a separate S3 delta object.
+	payload := make([]byte, 128<<10)
+	for i := range payload {
+		payload[i] = byte(i*31 + 7)
+	}
+	if _, err := writer.Write(bg, "sources/sirene", 1, func(tx *Tx) error {
+		if _, err := tx.Exec(bg, "UPDATE kv SET v=? WHERE k='ver'", []byte("seq2")); err != nil {
+			return err
+		}
+		_, err := tx.Exec(bg, "INSERT INTO kv VALUES('pad', ?)", payload)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pause the follower right as it tries to download the seq 2 delta object.
+	gate.match = func(key string) bool { return strings.Contains(key, "/objects/") }
+	time.Sleep(maxAge)
+	var v []byte
+	if _, err := f1.ReadKey(bg, "sources/sirene", 1, maxAge, func(vw *View) error {
+		return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &v)
+	}); err != nil || string(v) != "seq1" {
+		t.Fatalf("stale read during update: v=%q err=%v", v, err)
+	}
+	select {
+	case <-gate.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background delta download did not start")
+	}
+
+	// Close f1 while delta download is blocked (simulating SIGTERM mid-refresh).
+	closeCtx, cancel := context.WithTimeout(bg, 3*time.Second)
+	defer cancel()
+	if err := f1.Close(closeCtx); err != nil {
+		t.Fatalf("f1.Close: %v", err)
+	}
+
+	// Restart f2 against the unblocked store: both warm DBs must be present and serve immediately.
+	f2 := openFollower(mem)
+	defer f2.Close(bg)
+	if s := f2.Stats(); s.WarmEntities != 2 {
+		t.Fatalf("post-close WarmEntities = %d, want 2", s.WarmEntities)
+	}
+	var got []byte
+	t0 := time.Now()
+	if _, err := f2.ReadKey(bg, "sources/sirene", 1, maxAge, func(vw *View) error {
+		return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &got)
+	}); err != nil || (string(got) != "seq1" && string(got) != "seq2") {
+		t.Fatalf("restart read sirene: got=%q err=%v", got, err)
+	}
+	if time.Since(t0) > 100*time.Millisecond {
+		t.Fatalf("restart read took %v (expected immediate warm attach)", time.Since(t0))
+	}
+	// Background catch-up advances to seq 2 via LTX delta (CatchUps >= 1), not a full cold restore.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var cur []byte
+		res, err := f2.ReadKey(bg, "sources/sirene", 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &cur)
+		})
+		if err == nil && string(cur) == "seq2" && !res.Syncing {
+			if st := f2.Stats(); st.CatchUps < 1 {
+				t.Fatalf("expected delta CatchUps >= 1, got stats=%+v", st)
+			}
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("restarted follower did not catch up to seq2")
+}
+
+// TestReadStaleReplaceShedsIdleSiblingToStayAvailable verifies that during a
+// Case C replacement (new incarnation) when CacheBytes is tight, the follower
+// sheds idle siblings instead of discarding the actively-served entity, so
+// ReadStale keeps serving the previous incarnation throughout the download.
+func TestReadStaleReplaceShedsIdleSiblingToStayAvailable(t *testing.T) {
+	mem := storetest.NewMem()
+	writer := testNode(t, mem, "writer", func(l *Limits) {
+		l.EntityBytes, l.CacheBytes, l.Recoveries = 4<<20, 32<<20, 1
+	})
+	seed := func(key, tag string) {
+		t.Helper()
+		pad := make([]byte, 200<<10)
+		for i := range pad {
+			pad[i] = byte(i*17 + len(tag))
+		}
+		if _, err := writer.Write(bg, key, 1, func(tx *Tx) error {
+			if _, err := tx.Exec(bg, "CREATE TABLE kv(k TEXT PRIMARY KEY, v BLOB)"); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(bg, "INSERT INTO kv VALUES('ver', ?)", []byte(tag)); err != nil {
+				return err
+			}
+			_, err := tx.Exec(bg, "INSERT INTO kv VALUES('pad', ?)", pad)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("sources/sirene", "inc1")
+	seed("sources/sibling", "sib1")
+
+	gate := &openGateStore{
+		Store:   mem,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	// CacheBytes=5 MiB with EntityBytes=4 MiB: each activation reserves ~1.25 MiB
+	// (PageCount*4KiB + 1 MiB). Wait: make sibling+sirene+newSirene > CacheBytes
+	// while sirene+newSirene <= CacheBytes by using EntityBytes=2 MiB and CacheBytes=3 MiB.
+	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: t.TempDir(),
+		Limits: Limits{EntityBytes: 2 << 20, CacheBytes: 3 << 20, Recoveries: 1,
+			StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
+	cfg, err := cfg.validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := open(bg, cfg, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close(bg)
+
+	const maxAge = 40 * time.Millisecond
+	for _, k := range []string{"sources/sibling", "sources/sirene"} {
+		if _, err := f.ReadKey(bg, k, 1, 0, func(*View) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Replace sirene with a brand-new incarnation (forces Case C restoreNew).
+	if err := writer.Remove(bg, "sources/sirene"); err != nil {
+		t.Fatal(err)
+	}
+	seed("sources/sirene", "inc2")
+
+	gate.match = func(key string) bool { return strings.Contains(key, "/objects/") }
+	time.Sleep(maxAge)
+	var v []byte
+	if _, err := f.ReadKey(bg, "sources/sirene", 1, maxAge, func(vw *View) error {
+		return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &v)
+	}); err != nil || string(v) != "inc1" {
+		t.Fatalf("trigger read: v=%q err=%v", v, err)
+	}
+	select {
+	case <-gate.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replacement download did not start")
+	}
+
+	// While inc2 download is in flight, ReadStale must keep serving inc1 without unavailable errors.
+	for range 5 {
+		var cur []byte
+		res, err := f.ReadKey(bg, "sources/sirene", 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &cur)
+		})
+		if err != nil || string(cur) != "inc1" || !res.Syncing {
+			t.Fatalf("mid-download read: cur=%q res=%+v err=%v", cur, res, err)
+		}
+	}
+	close(gate.release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var cur []byte
+		res, err := f.ReadKey(bg, "sources/sirene", 1, maxAge, func(vw *View) error {
+			return vw.QueryRow(bg, "SELECT v FROM kv WHERE k='ver'", nil, &cur)
+		})
+		if err == nil && string(cur) == "inc2" && !res.Syncing {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("follower did not switch to inc2 after download completed")
+}

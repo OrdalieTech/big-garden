@@ -684,18 +684,6 @@ func (n *Node) activationBytes(h *head.Head) int64 {
 	return int64(h.PageCount)*head.PageSize + 1<<20
 }
 
-// fitsWith reports whether adding need bytes alongside self's current file and
-// all other resident/warm/reserved bytes fits within CacheBytes.
-func (n *Node) fitsWith(self *entity, need int64) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	_, used, _ := n.scan(time.Time{}, self)
-	if self != nil {
-		used += self.bytes.Load()
-	}
-	return n.reserved+used+n.warmBytes()+n.staging.Load()+need <= n.cfg.Limits.CacheBytes
-}
-
 // cache makes room for e to become resident and reserves buildBytes for
 // building its file (PROTOCOL §4 step 1, §7 cache policy); the caller
 // releases the reserve with unreserve once the file is built.
@@ -709,7 +697,7 @@ func (n *Node) cacheFor(ctx context.Context, e *entity, need int64) error {
 			return newError(CodeCapacity, "ResidentEntities entities are busy", ctx.Err())
 		}
 	}
-	for i := 0; !n.fitFor(e, need); i++ { // wait briefly for pinned entities
+	for i := 0; !n.fitFor(e, need, false); i++ { // wait briefly for pinned entities
 		if i == 100 || pause(ctx, 10*time.Millisecond) != nil {
 			n.mu.Lock()
 			e.building = false
@@ -724,16 +712,21 @@ func (n *Node) cacheFor(ctx context.Context, e *entity, need int64) error {
 // reserves, the files of the other resident entities, the warm tier and the
 // spools of objects and blobs in flight (D37),
 // deleting warm files then parking idle, settled entities, least recently
-// used first, until it does. A busy
-// entity is pinned and counts with its last seen size. It never blocks on an
-// entity mutex.
-func (n *Node) fitFor(self *entity, need int64) bool {
+// used first, until it does. When keepSelf is true, self's existing resident
+// bytes are also counted so the old file can stay mounted during replacement.
+// A busy entity is pinned and counts with its last seen size. It never blocks on
+// an entity mutex.
+func (n *Node) fitFor(self *entity, need int64, keepSelf bool) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	selfWarm := n.warmSize(self.key)
+	selfBytes := int64(0)
+	if keepSelf {
+		selfBytes = self.bytes.Load()
+	}
 	for {
 		_, used, lru := n.scan(time.Time{}, self)
-		if n.reserved+used+n.warmBytes()-selfWarm+n.staging.Load()+need <= n.cfg.Limits.CacheBytes {
+		if n.reserved+used+selfBytes+n.warmBytes()-selfWarm+n.staging.Load()+need <= n.cfg.Limits.CacheBytes {
 			n.reserved += need
 			return true
 		}
@@ -793,6 +786,20 @@ func (n *Node) Close(ctx context.Context) error {
 	n.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, n.cfg.Limits.CommitTimeout)
 	defer cancel()
+	// Park already-idle settled entities immediately so a slow background refresh
+	// on one entity cannot delay parking the others under a tight SIGTERM budget.
+	var busy []*entity
+	for _, e := range es {
+		if e.mu.TryLock() {
+			if e.unresolved == nil {
+				n.park(e)
+				e.mu.Unlock()
+				continue
+			}
+			e.mu.Unlock()
+		}
+		busy = append(busy, e)
+	}
 	idle := make(chan struct{})
 	go func() { n.wg.Wait(); close(idle) }()
 	select {
@@ -800,7 +807,7 @@ func (n *Node) Close(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 	unknown := false
-	for _, e := range es {
+	for _, e := range busy {
 		if e.mu.lock(ctx) != nil { // still busy: it may hold an unresolved candidate
 			unknown = true
 			continue

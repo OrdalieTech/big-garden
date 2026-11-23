@@ -653,9 +653,17 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 				oerr = engine.CheckObjects(refs[i:], objs)
 			}
 			if oerr == nil {
-				n.removeSidecar(oldDB)
 				e.rw.Lock()
-				newPages, cerr := oldDB.CatchUp(ctx, n.maxPages(), cur, refs[i:], objs)
+				if n.isClosed() || ctx.Err() != nil {
+					e.rw.Unlock()
+					done()
+					<-n.recoveries
+					return storeError(cmp.Or(ctx.Err(), context.Canceled))
+				}
+				n.removeSidecar(oldDB)
+				// All delta bytes are already local and verified; finish in-place apply
+				// without cancelling on shutdown so SIGTERM never destroys a resident DB.
+				newPages, cerr := oldDB.CatchUp(context.Background(), n.maxPages(), cur, refs[i:], objs)
 				if cerr == nil {
 					if e.pages != nil && oldH != nil && len(links(oldH)) >= i && slices.Equal(links(oldH)[:i], refs[:i]) {
 						e.pages = append(slices.Clone(e.pages[:i]), newPages...)

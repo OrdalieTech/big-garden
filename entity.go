@@ -473,14 +473,23 @@ func (n *Node) restoreNew(ctx context.Context, e *entity, h *head.Head, etag str
 		return nil, nil, "", time.Time{}, nil, newError(CodeCapacity, "Recoveries activations in progress", ctx.Err())
 	}
 	need := n.activationBytes(h)
-	// If replacing an existing resident image would exceed CacheBytes, discard
-	// it only once this activation holds a recovery slot (never while queued).
-	if e.db != nil && !n.fitsWith(e, need) {
-		e.discard()
-		tryWarm = true
+	// When replacing a resident image, first try to reserve room alongside e.db
+	// (shedding other warm files or idle entities if needed) so ReadStale keeps
+	// serving the previous sequence while the replacement downloads. Only discard
+	// e.db ahead of download if two copies cannot fit within CacheBytes at all.
+	reserved := false
+	if e.db != nil {
+		if n.fitFor(e, need, true) {
+			reserved = true
+		} else {
+			e.discard()
+			tryWarm = true
+		}
 	}
-	if err := n.cacheFor(ctx, e, need); err != nil {
-		return nil, nil, "", time.Time{}, nil, err
+	if !reserved {
+		if err := n.cacheFor(ctx, e, need); err != nil {
+			return nil, nil, "", time.Time{}, nil, err
+		}
 	}
 	defer n.unreserveFor(e, need)
 	if tryWarm {
