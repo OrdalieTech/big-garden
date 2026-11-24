@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -294,14 +295,36 @@ func failed(op, key string, o Outcome, msg string) error {
 	return &Error{Outcome: o, Op: op, Key: key, Err: errors.New(msg)}
 }
 
+// sizedDuration computes one attempt's timeout moving n bytes without int64 overflow.
+func (s *S3) sizedDuration(n int64) time.Duration {
+	if n <= 0 {
+		return s.attempt
+	}
+	secs := n / minRate
+	rem := n % minRate
+	const maxSecs = (math.MaxInt64 / int64(time.Second)) - 1
+	if secs >= maxSecs {
+		return time.Duration(math.MaxInt64)
+	}
+	d := time.Duration(secs)*time.Second + time.Duration(rem)*time.Second/minRate
+	if s.attempt > math.MaxInt64-d {
+		return time.Duration(math.MaxInt64)
+	}
+	return s.attempt + d
+}
+
 // sized bounds one attempt moving n bytes: the attempt timeout plus n at
 // minRate (PLAN §11.2: larger objects get bounded, size-based timeouts).
 func (s *S3) sized(ctx context.Context, n int64) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, s.attempt+time.Duration(n)*time.Second/minRate)
+	return context.WithTimeout(ctx, s.sizedDuration(n))
 }
 
 // minRate is the slowest transfer an attempt tolerates, in bytes per second.
 const minRate = 256 << 10
+
+// openChunkSize bounds each physical Range GET inside Open so multi-GiB objects
+// stream in short-lived chunks and resume from the exact byte offset on drop.
+var openChunkSize int64 = 64 << 20
 
 // partSizeFor picks a multipart part size at least PartBytes that keeps the
 // part count at or below 500 (well under S3 providers' 1,000-part limit for
@@ -392,31 +415,148 @@ func (s *S3) Copy(ctx context.Context, from, to string) error {
 func b64(b []byte) *string { return aws.String(base64.StdEncoding.EncodeToString(b)) }
 
 func (s *S3) Open(ctx context.Context, key string, off, n int64) (io.ReadCloser, error) {
-	var out *s3.GetObjectOutput
-	var cancel context.CancelFunc
-	err := retry(ctx, func() (err error) {
-		var actx context.Context
-		actx, cancel = s.sized(ctx, n) // the body is read after Open returns: Close ends the attempt
-		out, err = s.client.GetObject(actx, &s3.GetObjectInput{Bucket: &s.bucket, Key: aws.String(s.prefix + key),
-			Range: aws.String(fmt.Sprintf("bytes=%d-%d", off, off+n-1))}, s.once)
-		if err != nil {
-			cancel()
-		}
-		return s.done(opGet, 0, n, classify("get", key, err))
-	})
-	if err != nil {
+	if n <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	rr := &rangeReader{s: s, ctx: ctx, key: key, off: off, rem: n, chunk: openChunkSize}
+	if err := rr.openChunk(); err != nil {
 		return nil, err
 	}
-	return body{io.LimitReader(out.Body, n), out.Body, cancel}, nil
+	return rr, nil
 }
 
-type body struct {
-	io.Reader
-	c      io.Closer
-	cancel context.CancelFunc
+// rangeReader streams [off, off+n) in bounded Range GET chunks, resuming from
+// the exact byte offset on mid-stream drops or timeouts.
+type rangeReader struct {
+	s          *S3
+	ctx        context.Context
+	key        string
+	off        int64
+	rem        int64
+	chunk      int64
+	cur        io.ReadCloser
+	curRem     int64
+	cancel     context.CancelFunc
+	midRetries int
+	closed     bool
 }
 
-func (b body) Close() error {
-	defer b.cancel()
-	return b.c.Close()
+func (r *rangeReader) closeChunk() {
+	if r.cur != nil {
+		_ = r.cur.Close()
+		r.cur = nil
+	}
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	r.curRem = 0
+}
+
+func (r *rangeReader) openChunk() error {
+	r.closeChunk()
+	want := min(r.rem, r.chunk)
+	if want <= 0 {
+		return nil
+	}
+	var out *s3.GetObjectOutput
+	var cancel context.CancelFunc
+	err := retry(r.ctx, func() (err error) {
+		var actx context.Context
+		actx, cancel = r.s.sized(r.ctx, want) // body is read after GetObject returns; closeChunk cancels it
+		out, err = r.s.client.GetObject(actx, &s3.GetObjectInput{
+			Bucket: &r.s.bucket, Key: aws.String(r.s.prefix + r.key),
+			Range: aws.String(fmt.Sprintf("bytes=%d-%d", r.off, r.off+want-1)),
+		}, r.s.once)
+		if err != nil {
+			cancel()
+			return r.s.done(opGet, 0, 0, classify("get", r.key, err))
+		}
+		got := want
+		if out.ContentLength != nil && *out.ContentLength < got {
+			got = *out.ContentLength
+		}
+		return r.s.done(opGet, 0, got, nil)
+	})
+	if err != nil {
+		return err
+	}
+	r.cur, r.cancel, r.curRem = out.Body, cancel, want
+	if out.ContentLength != nil && *out.ContentLength < want {
+		// Object is genuinely shorter than requested range; clamp remaining bytes.
+		r.curRem = *out.ContentLength
+		r.rem = *out.ContentLength
+	}
+	return nil
+}
+
+func (r *rangeReader) Read(p []byte) (int, error) {
+	for {
+		if r.closed {
+			return 0, io.ErrClosedPipe
+		}
+		if r.rem <= 0 {
+			r.closeChunk()
+			return 0, io.EOF
+		}
+		if r.cur == nil || r.curRem <= 0 {
+			if err := r.openChunk(); err != nil {
+				return 0, err
+			}
+			if r.curRem <= 0 {
+				r.closeChunk()
+				return 0, io.EOF
+			}
+		}
+		buf := p
+		if int64(len(buf)) > r.curRem {
+			buf = buf[:r.curRem]
+		}
+		k, err := r.cur.Read(buf)
+		if k > 0 {
+			r.off += int64(k)
+			r.rem -= int64(k)
+			r.curRem -= int64(k)
+			r.midRetries = 0
+			if r.curRem == 0 {
+				r.closeChunk()
+			}
+			return k, nil
+		}
+		if err == nil {
+			continue
+		}
+		if err == io.EOF && r.curRem == 0 {
+			r.closeChunk()
+			if r.rem == 0 {
+				return 0, io.EOF
+			}
+			continue
+		}
+		// Mid-stream drop or premature EOF with bytes still remaining: resume from exact r.off.
+		r.closeChunk()
+		if r.ctx.Err() != nil || r.midRetries >= maxAttempts {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return 0, &Error{Outcome: Unknown, Op: "get", Key: r.key, Err: err}
+		}
+		t := time.NewTimer(rand.N(min(backoffCap, backoffBase<<r.midRetries)))
+		r.midRetries++
+		select {
+		case <-r.ctx.Done():
+			t.Stop()
+			return 0, &Error{Outcome: Unknown, Op: "get", Key: r.key, Err: r.ctx.Err()}
+		case <-t.C:
+		}
+		if oerr := r.openChunk(); oerr != nil {
+			return 0, oerr
+		}
+	}
+}
+
+func (r *rangeReader) Close() error {
+	r.closed = true
+	r.closeChunk()
+	return nil
 }
