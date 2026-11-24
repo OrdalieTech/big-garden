@@ -358,6 +358,11 @@ func applyDecoder(ctx context.Context, f *os.File, img Image, ref head.Ref, dec 
 	var ph ltx.PageHeader
 	data, old := make([]byte, pageSize), make([]byte, pageSize)
 	prev, grown, carried := uint32(0), uint32(0), uint32(0)
+	dropCache := snapshot && int64(hd.Commit)*pageSize > dropWindowBytes
+	var dropper writeDropper
+	if dropCache {
+		dropper = newWriteDropper(f)
+	}
 	for {
 		err := dec.DecodePage(&ph, data)
 		if err == io.EOF {
@@ -388,6 +393,12 @@ func applyDecoder(ctx context.Context, f *os.File, img Image, ref head.Ref, dec 
 		if ph.Pgno > count {
 			grown++
 		}
+		if dropCache {
+			dropper.advance(int64(ph.Pgno) * pageSize)
+		}
+	}
+	if dropCache {
+		dropper.finish(int64(hd.Commit) * pageSize)
 	}
 	if lock := ltx.LockPgno(pageSize); count < lock && lock <= hd.Commit {
 		grown++
