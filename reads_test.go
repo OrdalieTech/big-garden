@@ -847,7 +847,7 @@ func TestReadStaleWarmRestartAndSyncingState(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	openFollower := func(st store.Store) *Node {
-		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir,
+		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir, Key: testKey(),
 			Limits: Limits{EntityBytes: 8 << 20, CacheBytes: 64 << 20, Recoveries: 1,
 				StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
 		cfg, err := cfg.validate()
@@ -997,7 +997,7 @@ func TestReadStaleCrashSalvage(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	openFollower := func() *Node {
-		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir,
+		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir, Key: testKey(),
 			Limits: Limits{EntityBytes: 8 << 20, CacheBytes: 64 << 20, Recoveries: 1,
 				StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
 		cfg, err := cfg.validate()
@@ -1102,7 +1102,7 @@ func TestReadStaleCloseDuringDeltaCatchUpPreservesWarm(t *testing.T) {
 
 	cacheDir := t.TempDir()
 	openFollower := func(st store.Store) *Node {
-		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir,
+		cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: cacheDir, Key: testKey(),
 			Limits: Limits{EntityBytes: 8 << 20, CacheBytes: 64 << 20, Recoveries: 1,
 				StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
 		cfg, err := cfg.validate()
@@ -1242,7 +1242,7 @@ func TestReadStaleReplaceShedsIdleSiblingToStayAvailable(t *testing.T) {
 	// CacheBytes=5 MiB with EntityBytes=4 MiB: each activation reserves ~1.25 MiB
 	// (PageCount*4KiB + 1 MiB). Wait: make sibling+sirene+newSirene > CacheBytes
 	// while sirene+newSirene <= CacheBytes by using EntityBytes=2 MiB and CacheBytes=3 MiB.
-	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: t.TempDir(),
+	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: "follower", CacheDir: t.TempDir(), Key: testKey(),
 		Limits: Limits{EntityBytes: 2 << 20, CacheBytes: 3 << 20, Recoveries: 1,
 			StorageAttemptTimeout: 2 * time.Second, CommitTimeout: 5 * time.Second}}
 	cfg, err := cfg.validate()

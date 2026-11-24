@@ -80,13 +80,19 @@ func plaintextOnly(t *testing.T) {
 	}
 }
 
+// testKey is the namespace key of the sealed lane (GARDEN_TEST_SEALED, D36), where every test
+// runs again in a sealed namespace, and nil otherwise.
+func testKey() []byte {
+	if os.Getenv("GARDEN_TEST_SEALED") != "" {
+		return bytes.Repeat([]byte{0x5e}, 32)
+	}
+	return nil
+}
+
 func testNode(t *testing.T, mem store.Store, nodeID string, mod func(*Limits)) *Node {
 	t.Helper()
 	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: nodeID, CacheDir: t.TempDir(),
-		Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}
-	if os.Getenv("GARDEN_TEST_SEALED") != "" { // every test again in a sealed namespace (D36)
-		cfg.Key = bytes.Repeat([]byte{0x5e}, 32)
-	}
+		Key: testKey(), Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}
 	if b, err := strconv.Atoi(os.Getenv("GARDEN_TEST_BATCH")); err == nil { // =1: every core test again on the unbatched path
 		cfg.Limits.BatchMax = b
 	}

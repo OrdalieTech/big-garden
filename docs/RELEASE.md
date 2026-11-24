@@ -1,3 +1,16 @@
+# Milestone v0.5.0 (2026-11-24)
+
+v0.4.0 plus what multi-GiB entities and read-heavy consumers need, each recorded as a decision:
+
+- **Multi-GiB entities (D39).** Multipart parts sized to stay within 500 parts, an activation reserves its own size instead of `4 × EntityBytes`, `Limits.SQLiteCacheBytes` and `Limits.MmapBytes`, TEMP objects and `Tx.Prepare` (`*Stmt`) inside a mutation; timeouts no longer overflow above 8.59 GiB and a chunked `Open` resumes.
+- **Bounded-staleness reads (D40).** `Node.ReadStale` serves a follower's local image while its proof is younger than `maxAge`, never waits on S3, refreshes in the background and catches up in place from the LTX deltas (`Result.Stale`, `Result.Syncing`); warm files and their sidecars survive a restart, a crash or a SIGKILL.
+- **Streaming restore, a local store and key-addressed calls (D41).** A cold activation streams its snapshot into the database without a spool; `Config.LocalDir` runs a Node on a directory instead of a bucket; `ReadKey`, `Write`, `Remove`, `View.QueryRow` and `Tx.QueryRow`; `Route.Bytes` gives an entity's size before activating it.
+- **Dependencies.** modernc.org/sqlite v1.63.0 (SQLite stays 3.54.1) with the libc v1.80.1 and memory v1.12.1 it pins, aws-sdk-go-v2 v1.48.0 and service/s3 v1.116.0, lz4 v4.1.34 (research.lock.json).
+
+API: 17 exported types and 41 callables; 8,246 production lines in 28 files, 6 direct modules (budgets amended by D42). Additive for callers: no signature changed, `Config`, `Limits`, `Result` and `Route` gain fields.
+
+Evidence at the tagged commit, Go 1.27.4: `go vet ./...` and `go test ./...`; the root, kit and examples on local RustFS (`GARDEN_TEST_S3=1`); the root again sealed (`GARDEN_TEST_SEALED=1`) and unbatched (`GARDEN_TEST_BATCH=1`) on RustFS; `-race` on the D39-D41 tests; `qual footprint` passes. The sealed lane needed its keys in the D40 tests' own Nodes (they opened keyless followers on a sealed namespace). `TestHeadDropsItsCandidate`, a heap-growth bound, fails about one run in three in the sealed lane, at v0.4.0 too (2 of 6 runs alone); its cause is not investigated yet. Monogram runs its full suite and qualification on this commit before the tag. Still not the PLAN §22 production release, for the reasons v0.1.0 lists.
+
 # Milestone v0.4.0 (2026-11-16)
 
 v0.3.0 plus files through the kit router (D38): `Router.MutateFile` stores a file on the entity's owner and runs a `FileHandler` with its Blob there, `Transport.ForwardFile` and `Router.ServeFile` carry the bytes between Nodes. Breaking for `Transport` implementations, which gain `ForwardFile`; the core API and the formats are unchanged.

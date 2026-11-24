@@ -22,7 +22,7 @@ import (
 // find the warm tier an earlier one left there (D21).
 func warmNode(t *testing.T, mem store.Store, id, dir string, mod func(*Limits)) *Node {
 	t.Helper()
-	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: id, CacheDir: dir,
+	cfg := Config{S3: s3.New(s3.Options{}), Bucket: "b", Prefix: "p", NodeID: id, CacheDir: dir, Key: testKey(),
 		Limits: Limits{EntityBytes: 8 << 20, StorageAttemptTimeout: 200 * time.Millisecond, CommitTimeout: time.Second}}
 	if mod != nil {
 		mod(&cfg.Limits)
@@ -92,6 +92,7 @@ func takeOver(t *testing.T, n *Node, key string) {
 }
 
 func TestWarmTier(t *testing.T) {
+	plaintextOnly(t)
 	mem := storetest.NewMem()
 	dir := t.TempDir()
 	a := warmNode(t, mem, "a", dir, nil)

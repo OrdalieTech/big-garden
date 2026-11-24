@@ -23,12 +23,12 @@ import (
 // consumer binary sizes.
 func footprint(args []string) error {
 	fs := flag.NewFlagSet("footprint", flag.ContinueOnError)
-	maxFiles := fs.Int("max-production-files", 25, "")
-	maxLOC := fs.Int("max-production-loc", 6500, "") // 6,000, amended by DECISIONS D35
-	maxDirect := fs.Int("max-direct-modules", 5, "")
+	maxFiles := fs.Int("max-production-files", 28, "") // 25, amended by DECISIONS D42
+	maxLOC := fs.Int("max-production-loc", 8300, "")   // 6,000, amended by DECISIONS D35 and D42
+	maxDirect := fs.Int("max-direct-modules", 6, "")   // 5, plus golang.org/x/sys (DECISIONS D42)
 	maxRuntime := fs.Int("max-runtime-modules", 30, "")
 	maxTypes := fs.Int("max-exported-types", 18, "")
-	maxCallables := fs.Int("max-exported-callables", 31, "") // 30, plus Tx.File (DECISIONS D33)
+	maxCallables := fs.Int("max-exported-callables", 41, "") // 30, plus Tx.File (D33), D39-D41 (DECISIONS D42)
 	maxBinary := fs.Int64("max-binary-mib", 35, "stripped consumer binary target")
 	out := fs.String("out", "artifacts/footprint", "")
 	if err := fs.Parse(args); err != nil {
