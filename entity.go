@@ -26,7 +26,7 @@ import (
 // pages of PROTOCOL §6 step 7 and §9); it is derived from h and reset with it.
 type entity struct {
 	mu          gate
-	rw          sync.RWMutex // separates concurrent ReadStale (RLock) from file/head swaps and mutations (Lock); always acquired inside mu
+	rw          rwGate // separates concurrent ReadStale (rlock) from file/head swaps and mutations (Lock); always acquired inside mu
 	key         string
 	h           *head.Head
 	etag        string
@@ -74,6 +74,99 @@ func (g gate) lock(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// rwGate is a writer-preferring read-write lock whose read acquisition
+// respects ctx.Done() so ReadStale never blocks past its caller deadline.
+type rwGate struct {
+	mu      sync.Mutex
+	readers int
+	writer  bool
+	wWait   int
+	rCh     chan struct{}
+	wCh     chan struct{}
+}
+
+func (g *rwGate) RLock() { _ = g.rlock(context.Background()) }
+
+func (g *rwGate) rlock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for {
+		g.mu.Lock()
+		if !g.writer && g.wWait == 0 {
+			g.readers++
+			g.mu.Unlock()
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			g.mu.Unlock()
+			return err
+		}
+		ch := g.rCh
+		if ch == nil {
+			ch = make(chan struct{})
+			g.rCh = ch
+		}
+		g.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (g *rwGate) RUnlock() {
+	g.mu.Lock()
+	g.readers--
+	if g.readers < 0 {
+		g.mu.Unlock()
+		panic("garden: RUnlock of unlocked rwGate")
+	}
+	if g.readers == 0 && g.wCh != nil {
+		close(g.wCh)
+		g.wCh = nil
+	}
+	g.mu.Unlock()
+}
+
+func (g *rwGate) Lock() {
+	g.mu.Lock()
+	g.wWait++
+	for g.writer || g.readers > 0 {
+		ch := g.wCh
+		if ch == nil {
+			ch = make(chan struct{})
+			g.wCh = ch
+		}
+		g.mu.Unlock()
+		<-ch
+		g.mu.Lock()
+	}
+	g.wWait--
+	g.writer = true
+	g.mu.Unlock()
+}
+
+func (g *rwGate) Unlock() {
+	g.mu.Lock()
+	if !g.writer {
+		g.mu.Unlock()
+		panic("garden: Unlock of unlocked rwGate")
+	}
+	g.writer = false
+	if g.wWait > 0 {
+		if g.wCh != nil {
+			close(g.wCh)
+			g.wCh = nil
+		}
+	} else if g.rCh != nil {
+		close(g.rCh)
+		g.rCh = nil
+	}
+	g.mu.Unlock()
 }
 
 // candidate is one publication (PROTOCOL §2). pages goes with next.
