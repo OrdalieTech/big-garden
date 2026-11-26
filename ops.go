@@ -412,14 +412,18 @@ func (n *Node) ReadStale(ctx context.Context, ref Ref, schema uint32, maxAge tim
 		return Result{}, err
 	}
 	defer n.drop(e)
-	e.rw.RLock()
+	if err := e.rw.rlock(ctx); err != nil {
+		return Result{}, newError(CodeUnavailable, "context ended waiting for read lock", err)
+	}
 	if !e.roReady(ref) {
 		e.rw.RUnlock()
 		if !n.hasWarmHead(ref.Key, ref.Incarnation) || !n.attachWarm(ctx, e, ref) {
 			n.refreshAsync(e, ref, maxAge)
 			return Result{}, newError(CodeUnavailable, "entity activation in progress", nil)
 		}
-		e.rw.RLock()
+		if err := e.rw.rlock(ctx); err != nil {
+			return Result{}, newError(CodeUnavailable, "context ended waiting for read lock", err)
+		}
 		if !e.roReady(ref) {
 			e.rw.RUnlock()
 			n.refreshAsync(e, ref, maxAge)
@@ -638,7 +642,9 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 		e.behindSince.CompareAndSwap(0, time.Now().UnixNano())
 	}
 	// Case B: resident DB behind cur; download only the new delta suffix outside
-	// e.rw (serialized by n.recoveries), then take e.rw briefly to apply pages in place.
+	// e.rw (serialized by n.recoveries). When CacheBytes headroom allows, stage
+	// CatchUp onto a copy outside e.rw and swap pointers under a sub-ms e.rw.Lock();
+	// when headroom is tight, fall back to in-place CatchUp.
 	if oldDB != nil && oldDB.Published().Sequence < cur.Sequence {
 		refs := links(cur)
 		i := slices.IndexFunc(refs, func(r head.Ref) bool { return r.MaxSequence > oldDB.Published().Sequence })
@@ -653,39 +659,84 @@ func (n *Node) syncFollower(ctx context.Context, e *entity, ref Ref) error {
 				oerr = engine.CheckObjects(refs[i:], objs)
 			}
 			if oerr == nil {
-				e.rw.Lock()
-				if n.isClosed() || ctx.Err() != nil {
-					e.rw.Unlock()
-					done()
-					<-n.recoveries
-					return storeError(cmp.Or(ctx.Err(), context.Canceled))
-				}
-				n.removeSidecar(oldDB)
-				// All delta bytes are already local and verified; finish in-place apply
-				// without cancelling on shutdown so SIGTERM never destroys a resident DB.
-				newPages, cerr := oldDB.CatchUp(context.Background(), n.maxPages(), cur, refs[i:], objs)
-				if cerr == nil {
-					if e.pages != nil && oldH != nil && len(links(oldH)) >= i && slices.Equal(links(oldH)[:i], refs[:i]) {
-						e.pages = append(slices.Clone(e.pages[:i]), newPages...)
-					} else {
-						e.pages = nil
+				var stagedErr error
+				need := n.activationBytes(cur)
+				if n.reserveHeadroom(need) {
+					stagePath := filepath.Join(n.dir, head.NewID().String()+".db")
+					newDB, newPages, cerr := oldDB.CatchUpCopy(ctx, stagePath, n.maxPages(), cur, refs[i:], objs)
+					n.releaseHeadroom(need)
+					if cerr == nil {
+						e.rw.Lock()
+						if n.isClosed() || ctx.Err() != nil {
+							e.rw.Unlock()
+							newDB.Discard()
+							done()
+							<-n.recoveries
+							return storeError(cmp.Or(ctx.Err(), context.Canceled))
+						}
+						prev := e.db
+						if e.pages != nil && oldH != nil && len(links(oldH)) >= i && slices.Equal(links(oldH)[:i], refs[:i]) {
+							e.pages = append(slices.Clone(e.pages[:i]), newPages...)
+						} else {
+							e.pages = nil
+						}
+						e.db, e.h, e.etag = newDB, cur, obj.ETag
+						e.behindSince.Store(0)
+						e.setValid(issued)
+						e.bytes.Store(newDB.Bytes())
+						n.counters.activations.Add(1)
+						n.counters.catchUps.Add(1)
+						e.rw.Unlock()
+						if prev != nil {
+							prev.Discard()
+						}
+						n.writeSidecar(e)
+						done()
+						<-n.recoveries
+						return nil
 					}
-					e.h, e.etag = cur, obj.ETag
-					e.behindSince.Store(0)
-					e.setValid(issued)
-					e.bytes.Store(oldDB.Bytes())
-					n.counters.activations.Add(1)
-					n.counters.catchUps.Add(1)
-					e.rw.Unlock()
-					n.writeSidecar(e)
-					done()
-					<-n.recoveries
-					return nil
+					if n.isClosed() || ctx.Err() != nil {
+						done()
+						<-n.recoveries
+						return storeError(cmp.Or(ctx.Err(), context.Canceled))
+					}
+					stagedErr = cerr
 				}
-				// CatchUp already removed the dirty file.
-				e.clearLocked()
-				oldDB = nil
-				e.rw.Unlock()
+				if !errors.Is(stagedErr, engine.ErrCorrupt) {
+					e.rw.Lock()
+					if n.isClosed() || ctx.Err() != nil {
+						e.rw.Unlock()
+						done()
+						<-n.recoveries
+						return storeError(cmp.Or(ctx.Err(), context.Canceled))
+					}
+					n.removeSidecar(oldDB)
+					// All delta bytes are already local and verified; finish in-place apply
+					// without cancelling on shutdown so SIGTERM never destroys a resident DB.
+					newPages, cerr := oldDB.CatchUp(context.Background(), n.maxPages(), cur, refs[i:], objs)
+					if cerr == nil {
+						if e.pages != nil && oldH != nil && len(links(oldH)) >= i && slices.Equal(links(oldH)[:i], refs[:i]) {
+							e.pages = append(slices.Clone(e.pages[:i]), newPages...)
+						} else {
+							e.pages = nil
+						}
+						e.h, e.etag = cur, obj.ETag
+						e.behindSince.Store(0)
+						e.setValid(issued)
+						e.bytes.Store(oldDB.Bytes())
+						n.counters.activations.Add(1)
+						n.counters.catchUps.Add(1)
+						e.rw.Unlock()
+						n.writeSidecar(e)
+						done()
+						<-n.recoveries
+						return nil
+					}
+					// CatchUp already removed the dirty file.
+					e.clearLocked()
+					oldDB = nil
+					e.rw.Unlock()
+				}
 			}
 			done()
 			<-n.recoveries

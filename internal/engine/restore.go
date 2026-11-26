@@ -253,6 +253,77 @@ func (d *DB) CatchUp(ctx context.Context, maxPages uint32, h *head.Head, refs []
 	return pages, nil
 }
 
+// CatchUpCopy stages a copy of d's settled read-only file at stagePath and
+// applies the delta suffix refs/objs onto the copy without closing or mutating
+// d, so concurrent ReadConcurrent callers on d stay unblocked. On any error
+// stagePath is removed and d remains intact.
+func (d *DB) CatchUpCopy(ctx context.Context, stagePath string, maxPages uint32, h *head.Head, refs []head.Ref, objs []io.ReaderAt) (*DB, []uint32, error) {
+	if len(refs) == 0 || len(refs) != len(objs) || h.PageCount > maxPages {
+		return nil, nil, errors.New("engine: invalid catch-up objects or page limit")
+	}
+	src, err := os.OpenFile(d.path, os.O_RDONLY|NoFollow, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	dst, err := os.OpenFile(stagePath, os.O_RDWR|os.O_CREATE|os.O_EXCL|NoFollow, 0o600)
+	if err != nil {
+		src.Close()
+		return nil, nil, err
+	}
+	err = copyFileCtx(ctx, dst, src)
+	err = errors.Join(err, src.Close())
+	img := d.pub
+	pages := make([]uint32, len(refs))
+	if err == nil {
+		for i, ref := range refs {
+			if img, pages[i], err = apply(ctx, dst, img, ref, objs[i], i == 0); err != nil {
+				break
+			}
+		}
+	}
+	if err == nil && (img != Image{h.Sequence, h.PageCount, h.DatabaseChecksum}) {
+		err = fmt.Errorf("%w: caught-up image %+v differs from the head", ErrCorrupt, img)
+	}
+	if err = errors.Join(err, dst.Close()); err != nil {
+		removeFiles(stagePath)
+		return nil, nil, err
+	}
+	reopened, err := open(ctx, d.drv, stagePath, maxPages)
+	if err != nil {
+		removeFiles(stagePath)
+		return nil, nil, err
+	}
+	m, err := reopened.Meta()
+	if err == nil && (m.Namespace != h.Namespace || m.Key != h.Key || m.Incarnation != h.Incarnation ||
+		m.Schema != h.Schema || m.Sequence != h.Sequence) {
+		err = fmt.Errorf("%w: _state_meta does not match the head after catch-up", ErrCorrupt)
+	}
+	if err != nil {
+		reopened.Discard()
+		return nil, nil, err
+	}
+	reopened.pub = img
+	return reopened, pages, nil
+}
+
+// copyFileCtx copies src into dst in 32 MiB chunks (allowing kernel
+// copy_file_range while honoring ctx cancellation between chunks).
+func copyFileCtx(ctx context.Context, dst, src *os.File) error {
+	const chunk = 32 << 20
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := io.CopyN(dst, src, chunk)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
 // Rebase rewrites the identity in the metadata row of an imported image
 // (PROTOCOL §11 Import step 3); the caller's next Mutate then commits the
 // import receipt at the following sequence.

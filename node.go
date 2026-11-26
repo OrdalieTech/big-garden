@@ -771,6 +771,25 @@ func (n *Node) unreserveFor(e *entity, need int64) {
 	n.mu.Unlock()
 }
 
+// reserveHeadroom reserves need bytes from unused CacheBytes headroom without
+// evicting warm files or parking other resident entities.
+func (n *Node) reserveHeadroom(need int64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	_, used, _ := n.scan(time.Time{}, nil)
+	if n.reserved+used+n.warmBytes()+n.staging.Load()+need > n.cfg.Limits.CacheBytes {
+		return false
+	}
+	n.reserved += need
+	return true
+}
+
+func (n *Node) releaseHeadroom(need int64) {
+	n.mu.Lock()
+	n.reserved -= need
+	n.mu.Unlock()
+}
+
 // Close stops admissions, settles and discards every resident entity, and
 // deletes the session cache dir (PROTOCOL §7). It never closes the S3 client.
 func (n *Node) Close(ctx context.Context) error {
